@@ -330,9 +330,69 @@ pub fn synthetic_watts(ts: i64, rng: &mut Lcg, cloud_factor: f64) -> f64 {
     (peak * shape * shape * cloud_factor * jitter).max(0.0)
 }
 
+/// Which days of a synthetic history the recorder was actually up for.
+///
+/// Real Home Assistant histories are not solid blocks: restarts, purges and SD card
+/// trouble leave holes, and a report has to survive them. The plans here let the tests
+/// and the demo database reproduce that on purpose.
+#[derive(Debug, Clone, Default)]
+pub struct Outages {
+    /// Whole days, counted from the start of the run, with no data at all.
+    pub missing_days: Vec<i64>,
+    /// Half-open ranges of days `[start, end)` with no data at all.
+    pub missing_ranges: Vec<(i64, i64)>,
+    /// Hours of the day the sensor never reports, e.g. an inverter that sleeps at night.
+    pub missing_hours: Vec<i64>,
+}
+
+impl Outages {
+    /// An unbroken history.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// A plausibly messy history: a scattering of lost days and one long outage.
+    pub fn spotty(days: i64) -> Self {
+        Self {
+            missing_days: (0..days).filter(|day| day % 11 == 4).collect(),
+            missing_ranges: vec![(days / 3, days / 3 + 9)],
+            missing_hours: Vec::new(),
+        }
+    }
+
+    /// Whether a given day of the run carries any data.
+    pub fn covers(&self, day: i64) -> bool {
+        !self.missing_days.contains(&day)
+            && !self
+                .missing_ranges
+                .iter()
+                .any(|(start, end)| (*start..*end).contains(&day))
+    }
+
+    fn covers_hour(&self, hour: i64) -> bool {
+        !self.missing_hours.contains(&hour)
+    }
+
+    /// How many of the first `days` days carry data.
+    pub fn covered_days(&self, days: i64) -> i64 {
+        (0..days).filter(|day| self.covers(*day)).count() as i64
+    }
+}
+
 /// Fill `conn` with hourly long-term statistics covering `days` days of a synthetic solar
 /// year starting at `start_ts`, returning the entity's `metadata_id`.
 pub fn insert_synthetic_year(conn: &Connection, start_ts: i64, days: i64, seed: u64) -> i64 {
+    insert_synthetic_history(conn, start_ts, days, seed, &Outages::none())
+}
+
+/// The same, with the recorder down for the days the outage plan names.
+pub fn insert_synthetic_history(
+    conn: &Connection,
+    start_ts: i64,
+    days: i64,
+    seed: u64,
+    outages: &Outages,
+) -> i64 {
     let metadata_id = insert_statistic_meta(conn, ENTITY, Some("W"));
     let mut rng = Lcg::new(seed);
     conn.execute_batch("BEGIN").expect("begin transaction");
@@ -343,7 +403,13 @@ pub fn insert_synthetic_year(conn: &Connection, start_ts: i64, days: i64, seed: 
         } else {
             0.85 + 0.15 * rng.next_unit()
         };
+        if !outages.covers(day) {
+            continue;
+        }
         for hour in 0..24 {
+            if !outages.covers_hour(hour) {
+                continue;
+            }
             let start = start_ts + day * 86_400 + hour * 3_600;
             // Average the hour, the way Home Assistant's hourly statistics do.
             let mean = (0..6)
@@ -366,9 +432,19 @@ pub fn insert_synthetic_year(conn: &Connection, start_ts: i64, days: i64, seed: 
 
 /// A modern-schema database holding `days` days of synthetic hourly statistics.
 pub fn synthetic_year_database(start: &str, days: i64, seed: u64) -> Connection {
+    synthetic_history_database(start, days, seed, &Outages::none())
+}
+
+/// The same, with outages.
+pub fn synthetic_history_database(
+    start: &str,
+    days: i64,
+    seed: u64,
+    outages: &Outages,
+) -> Connection {
     let conn = Connection::open_in_memory().expect("open in-memory database");
     create_schema(&conn, Flavour::Modern);
-    insert_synthetic_year(&conn, ts(start), days, seed);
+    insert_synthetic_history(&conn, ts(start), days, seed, outages);
     conn
 }
 
@@ -410,6 +486,41 @@ mod tests {
         assert!(
             winter_noon < noon,
             "winter noon {winter_noon} W should be below summer noon {noon} W"
+        );
+    }
+
+    #[test]
+    fn outage_plans_say_which_days_survive() {
+        let plan = Outages {
+            missing_days: vec![3, 4],
+            missing_ranges: vec![(10, 13)],
+            missing_hours: vec![0, 1],
+        };
+        assert!(plan.covers(2));
+        assert!(!plan.covers(3));
+        assert!(!plan.covers(11));
+        assert!(plan.covers(13), "the range end is exclusive");
+        assert_eq!(plan.covered_days(20), 15);
+        assert!(Outages::none().covers(0));
+        assert_eq!(Outages::none().covered_days(30), 30);
+    }
+
+    #[test]
+    fn a_spotty_history_really_has_holes_in_it() {
+        let days = 200;
+        let plan = Outages::spotty(days);
+        let dense = synthetic_year_database("2025-01-01 00:00:00", days, 1);
+        let spotty = synthetic_history_database("2025-01-01 00:00:00", days, 1, &plan);
+
+        let rows = |conn: &Connection| {
+            conn.query_row::<i64, _, _>("SELECT COUNT(*) FROM statistics", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(rows(&dense), days * 24);
+        assert_eq!(rows(&spotty), plan.covered_days(days) * 24);
+        assert!(
+            plan.covered_days(days) < days - 20,
+            "not enough was removed"
         );
     }
 

@@ -68,9 +68,17 @@ pub struct Args {
     #[arg(long, value_enum, default_value_t = Metric::Exceedance)]
     pub metric: Metric,
 
-    /// Columns with fewer readings than this are drawn as "not enough data".
+    /// Hours backed by fewer distinct days than this are drawn as "not enough data".
+    ///
+    /// Days, not readings: one chatty morning is one day of evidence however many rows
+    /// the recorder wrote.
     #[arg(long, value_name = "N", default_value_t = 3)]
-    pub min_samples: u64,
+    pub min_days: u32,
+
+    /// Report outages longer than this. The default of a full day keeps inverters that
+    /// go offline every night from filling the report with nightly "gaps".
+    #[arg(long, value_name = "HOURS", default_value_t = 24.0)]
+    pub gap_threshold_hours: f64,
 
     /// Cells below this probability are left blank.
     #[arg(long, value_name = "P", default_value_t = 0.005)]
@@ -123,6 +131,8 @@ pub struct Config {
     /// Exclusive upper bound as a UTC timestamp.
     pub to: Option<i64>,
     pub clamp_negative: bool,
+    /// Outages at least this long are reported.
+    pub gap_threshold_seconds: i64,
 }
 
 impl Args {
@@ -172,6 +182,11 @@ impl Args {
             "--max-gap must be positive, got {}",
             self.max_gap
         );
+        ensure!(
+            self.gap_threshold_hours.is_finite() && self.gap_threshold_hours > 0.0,
+            "--gap-threshold-hours must be a positive number, got {}",
+            self.gap_threshold_hours
+        );
         if let Some(scale) = self.scale {
             ensure!(
                 scale.is_finite() && scale != 0.0,
@@ -204,6 +219,7 @@ impl Args {
             from,
             to,
             clamp_negative: !self.keep_negative,
+            gap_threshold_seconds: (self.gap_threshold_hours * 3_600.0).round() as i64,
         })
     }
 }
@@ -236,6 +252,8 @@ mod tests {
         assert_eq!(args.source, SourceKind::Auto);
         assert_eq!(args.stat, ValueColumn::Mean);
         assert_eq!(args.max_gap, 900);
+        assert_eq!(args.min_days, 3);
+        assert_eq!(args.gap_threshold_hours, 24.0);
         assert_eq!(args.out, PathBuf::from("pv-probability.html"));
         assert!(!args.keep_negative);
 
@@ -243,6 +261,7 @@ mod tests {
         assert!(config.clamp_negative);
         assert_eq!(config.from, None);
         assert_eq!(config.to, None);
+        assert_eq!(config.gap_threshold_seconds, 24 * 3_600);
     }
 
     #[test]
@@ -290,6 +309,8 @@ mod tests {
         assert!(args(&["--max-gap", "0"]).resolve().is_err());
         assert!(args(&["--levels", "2"]).resolve().is_err());
         assert!(args(&["--levels", "17"]).resolve().is_err());
+        assert!(args(&["--gap-threshold-hours", "0"]).resolve().is_err());
+        assert!(args(&["--gap-threshold-hours", "-6"]).resolve().is_err());
         assert!(args(&["--scale", "0"]).resolve().is_err());
         assert!(args(&["--threads", "0"]).resolve().is_err());
     }
@@ -305,6 +326,15 @@ mod tests {
         assert!(args(&["--min-probability", "0"]).resolve().is_ok());
         assert!(args(&["--scale", "1000"]).resolve().is_ok());
         assert!(args(&["--levels", "12"]).resolve().is_ok());
+        assert_eq!(
+            args(&["--gap-threshold-hours", "6"])
+                .resolve()
+                .unwrap()
+                .gap_threshold_seconds,
+            6 * 3_600
+        );
+        // A day count of zero is legitimate: it means "show me everything".
+        assert!(args(&["--min-days", "0"]).resolve().is_ok());
     }
 
     #[test]

@@ -26,6 +26,35 @@ pub const HEAT_DARK: [&str; DEFAULT_LEVELS] = [
     "#db503c", "#ed534e",
 ];
 
+/// Steps on the coverage strip's scale, above "nothing recorded".
+pub const COVERAGE_LEVELS: usize = 5;
+
+/// How much of a facet's calendar an hour was observed on, for a light surface.
+///
+/// Deliberately neutral grey: coverage is a second, secondary encoding sitting under the
+/// same plot as the likelihood heat, and a hue there would read as another probability.
+pub const COVERAGE_LIGHT: [&str; COVERAGE_LEVELS] =
+    ["#e8e7e0", "#d3d2c8", "#b9b8ac", "#9d9b8f", "#7e7c72"];
+
+/// The same scale stepped for a dark surface.
+pub const COVERAGE_DARK: [&str; COVERAGE_LEVELS] =
+    ["#2c2c2a", "#3d3d3a", "#52514e", "#6a6963", "#898781"];
+
+/// Which coverage step a share of the calendar lands on, or `None` for nothing observed.
+pub fn coverage_level(observed: u32, possible: u32) -> Option<usize> {
+    if observed == 0 {
+        return None;
+    }
+    if possible == 0 {
+        // Nothing to compare against; show it as fully covered rather than inventing a
+        // fraction, because the day count in the tooltip is the real answer.
+        return Some(COVERAGE_LEVELS - 1);
+    }
+    let share = (f64::from(observed) / f64::from(possible)).clamp(0.0, 1.0);
+    let index = (share * COVERAGE_LEVELS as f64).ceil() as usize;
+    Some(index.clamp(1, COVERAGE_LEVELS) - 1)
+}
+
 /// Interpolate the reference ramp to `levels` steps.
 ///
 /// The ramps above are authored at ten steps; asking for more or fewer resamples them
@@ -170,6 +199,86 @@ mod tests {
                 pair[0],
                 pair[1]
             );
+        }
+    }
+
+    #[test]
+    fn the_coverage_ramps_are_monotone_in_both_themes() {
+        for pair in COVERAGE_LIGHT.windows(2) {
+            assert!(
+                luminance(pair[0]) > luminance(pair[1]),
+                "{} should be lighter than {}",
+                pair[0],
+                pair[1]
+            );
+        }
+        for pair in COVERAGE_DARK.windows(2) {
+            assert!(
+                luminance(pair[0]) < luminance(pair[1]),
+                "{} should be darker than {}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    /// How far apart a colour's channels are: near zero is grey, large is saturated.
+    fn channel_spread(hex: &str) -> u8 {
+        let (r, g, b) = parse_hex(hex);
+        r.max(g).max(b) - r.min(g).min(b)
+    }
+
+    #[test]
+    fn the_coverage_ramp_stays_far_less_saturated_than_the_heat_ramp() {
+        // Coverage sits directly under the heatmap, so it must never read as another
+        // likelihood. These are the palette's warm greys: a hint of warmth, no hue.
+        let coverage_max = COVERAGE_LIGHT
+            .iter()
+            .chain(COVERAGE_DARK.iter())
+            .map(|hex| channel_spread(hex))
+            .max()
+            .expect("the ramps are not empty");
+        let heat_min = HEAT_LIGHT
+            .iter()
+            .chain(HEAT_DARK.iter())
+            .map(|hex| channel_spread(hex))
+            .min()
+            .expect("the ramps are not empty");
+
+        assert!(
+            coverage_max <= 20,
+            "coverage is too colourful ({coverage_max})"
+        );
+        assert!(
+            heat_min > coverage_max * 2,
+            "the heat ramp ({heat_min}) must be unmistakably more saturated than the \
+             coverage ramp ({coverage_max})"
+        );
+    }
+
+    #[test]
+    fn coverage_levels_follow_the_share_of_the_calendar() {
+        assert_eq!(coverage_level(0, 30), None, "nothing observed");
+        assert_eq!(coverage_level(1, 30), Some(0), "a sliver");
+        assert_eq!(
+            coverage_level(30, 30),
+            Some(COVERAGE_LEVELS - 1),
+            "all of it"
+        );
+        assert_eq!(coverage_level(15, 30), Some(2), "half way up the scale");
+        // More days than the calendar allows (pooled years) still tops out.
+        assert_eq!(coverage_level(90, 30), Some(COVERAGE_LEVELS - 1));
+        // Without a denominator the day count in the tooltip is the answer.
+        assert_eq!(coverage_level(4, 0), Some(COVERAGE_LEVELS - 1));
+    }
+
+    #[test]
+    fn coverage_levels_never_decrease_with_coverage() {
+        let mut previous = 0;
+        for observed in 1..=30 {
+            let level = coverage_level(observed, 30).unwrap();
+            assert!(level >= previous, "level fell at {observed} days");
+            previous = level;
         }
     }
 

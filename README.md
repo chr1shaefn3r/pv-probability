@@ -21,8 +21,10 @@ carries a table view of the same numbers under each plot.
 
 ![The same report in the dark theme](docs/example-dark.png)
 
-*(The screenshots are generated from the synthetic demo database described below, not from
-real production data.)*
+*(The screenshots come from the synthetic `spotty` demo database described below - five
+months of history with outages in it - not from real production data. The "History" block
+and the grey strip under each plot are what that partial history looks like; see
+[Partial history and outages](#partial-history-and-outages).)*
 
 ## Quick start
 
@@ -39,10 +41,11 @@ scp homeassistant.local:/config/home-assistant_v2.db ha.db
 # 4. Open pv-probability.html in a browser
 ```
 
-No Home Assistant to hand? Generate a synthetic one:
+No Home Assistant to hand? Generate a synthetic one, either solid or full of holes:
 
 ```sh
-cargo run --release --example demo_database -- demo.db 730
+cargo run --release --example demo_database -- demo.db 730 dense
+cargo run --release --example demo_database -- demo.db 165 spotty   # 5 months, outages
 cargo run --release -- --db demo.db --entity sensor.solar_power --tz Europe/Berlin
 ```
 
@@ -90,6 +93,46 @@ timestamps, `states.entity_id`) are detected automatically.
 
 If the entity name is wrong, the error lists the ids in the database that look similar.
 
+## Partial history and outages
+
+This is written for a real recorder database, which is rarely a tidy block of years. Less
+than a year of history, and holes in the middle of it, are the normal case.
+
+**What the tool does about it**
+
+* **Months you have no data for are simply absent** from the report - not drawn empty, not
+  guessed at. The header names any that are missing from a span that could have contained
+  them.
+* **Evidence is counted in distinct local days, never in readings.** One sunny morning can
+  be six readings from the hourly statistics table or six hundred from `states`; it is one
+  day of evidence either way. Any (month, hour) column backed by fewer than `--min-days`
+  days (default 3) is **hatched rather than coloured**, so a single February morning cannot
+  masquerade as a settled 100%.
+* **Hours the recorder never covered are hatched differently** from hours it covered only
+  briefly, so "we know nothing about 03:00" is distinguishable from "we have two days of
+  03:00".
+* **A coverage strip under every heatmap** shows, hour by hour, how many distinct days back
+  that column, shaded on a neutral grey scale and exact on hover. The panel caption states
+  the same thing for the month as a whole ("26 of 31 days").
+* **The header reports the real span and the outages in it**: how many days carry data, how
+  many were recorded right through the day, how many outages longer than
+  `--gap-threshold-hours` (default 24) interrupted it, and how long the worst one was. The
+  same summary goes to stdout, with every outage listed under `-v`.
+
+**What it cannot do about it**
+
+Every percentage is conditional on the time that was actually recorded. If the recorder was
+down through a sunny week in July, that week is not represented at all, and July's numbers
+describe the days that survived rather than July. No amount of arithmetic fixes that; the
+coverage strip and the outage summary are there so you can see when it applies.
+
+Two knobs are worth knowing:
+
+* `--min-days 1` shows everything, however thin. `--min-days 10` is strict.
+* `--gap-threshold-hours 6` catches shorter outages. The default of 24 exists because many
+  inverters report `unavailable` all night, and a 14 hour nightly hole would otherwise fill
+  the report with "outages". If your sensor reports 0 W at night instead, lower it.
+
 ## How the numbers are computed
 
 * **Time-weighted, not row-weighted.** Every reading is weighted by how long it was in
@@ -109,9 +152,9 @@ If the entity name is wrong, the error lists the ids in the database that look s
   `P(watts inside the bucket)` instead, where each column sums to 100%.
 * **The exceedance axis starts one step up.** "At least 0 W" is true whenever the hour was
   observed at all, so drawing it would paint a certainty band across the night.
-* **Thin columns are marked, not guessed.** An hour with fewer than `--min-samples`
-  readings is hatched rather than coloured, so a single sunny February morning cannot
-  masquerade as a 100% certainty.
+* **Thin columns are marked, not guessed.** Evidence is counted in distinct local days, so
+  an hour backed by fewer than `--min-days` of them is hatched rather than coloured however
+  many rows the recorder wrote. See [Partial history and outages](#partial-history-and-outages).
 * **Facets pool across years.** Every June in the database contributes to the June
   heatmap; that is the point of asking about likelihood. Narrow the window with `--from` /
   `--to` if you want a single season.
@@ -135,7 +178,8 @@ pv-probability --db <FILE> --entity <ENTITY_ID> [OPTIONS]
 | `--tz <TZ>` | machine zone | IANA timezone for the hour axis, e.g. `Europe/Berlin` |
 | `--from <YYYY-MM-DD>` / `--to <YYYY-MM-DD>` | all data | Local date window, `--to` exclusive |
 | `--metric <exceedance\|density>` | `exceedance` | Cell meaning |
-| `--min-samples <N>` | `3` | Below this, a column is drawn as "not enough data" |
+| `--min-days <N>` | `3` | Hours backed by fewer distinct days are hatched, not coloured |
+| `--gap-threshold-hours <H>` | `24` | Outages at least this long are reported |
 | `--min-probability <P>` | `0.005` | Cells below this are left blank |
 | `--gamma <G>` | `0.6` | Ramp shaping; below 1 lifts rare-but-real cells into view |
 | `--levels <N>` | `10` | Colour steps on the likelihood scale (3-16) |
@@ -178,14 +222,14 @@ leave cores free.
 ## Development
 
 ```sh
-cargo test                                        # 130+ unit and integration tests
+cargo test                                        # 175+ unit and integration tests
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all
 ```
 
 The test suite never touches a real Home Assistant: `src/source/testdb.rs` builds
 synthetic recorder databases in both schema generations, including a reproducible
-synthetic solar year used by `tests/end_to_end.rs`. GitHub Actions runs formatting, clippy
+synthetic solar year - with or without outages - used by `tests/end_to_end.rs`. GitHub Actions runs formatting, clippy
 and the whole suite on every push to `main` and on every pull request
 (`.github/workflows/ci.yml`).
 
@@ -198,6 +242,7 @@ Layout:
 | `src/model.rs` | `Sample`, `BucketSpec`, the additive `Grid` |
 | `src/source/` | Schema probing and the statistics / states readers |
 | `src/aggregate.rs` | Parallel folding, exceedance and density |
+| `src/coverage.rs` | Outage detection and what the history really covers |
 | `src/render/` | Colour scale, per-facet SVG, the HTML page |
 | `examples/demo_database.rs` | Writes a synthetic recorder database |
 

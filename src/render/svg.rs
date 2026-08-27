@@ -7,7 +7,7 @@
 
 use std::fmt::Write as _;
 
-use crate::aggregate::Facet;
+use crate::aggregate::{ColumnStatus, Facet};
 use crate::model::{BucketSpec, HOURS_PER_DAY, Metric};
 use crate::render::color;
 use crate::render::{escape, format_percent, format_watts};
@@ -19,8 +19,13 @@ const PLOT_HEIGHT: f64 = 260.0;
 const MARGIN_LEFT: f64 = 46.0;
 const MARGIN_RIGHT: f64 = 8.0;
 const MARGIN_TOP: f64 = 10.0;
-const MARGIN_BOTTOM: f64 = 34.0;
+const MARGIN_BOTTOM: f64 = 54.0;
 const PLOT_WIDTH: f64 = CELL_WIDTH * HOURS_PER_DAY as f64;
+/// Gap between the plot's baseline and the coverage strip. Wide enough that the strip's
+/// label clears the bottom tick of the watt axis.
+const STRIP_GAP: f64 = 11.0;
+/// Height of the coverage strip under the hour axis.
+const STRIP_HEIGHT: f64 = 7.0;
 
 /// Id of the shared "not enough data" hatch pattern defined once per page.
 pub const NO_DATA_PATTERN_ID: &str = "pv-no-data";
@@ -187,16 +192,26 @@ pub fn facet_svg(facet: &Facet, buckets: &BucketSpec, options: &SvgOptions) -> S
             continue;
         };
 
-        if !column.sufficient {
+        if !column.status.is_sufficient() {
+            let (class, note) = match column.status {
+                ColumnStatus::Empty => (
+                    "no-data",
+                    format!("{} {hour:02}:00 - never recorded", facet.label),
+                ),
+                _ => (
+                    "thin-data",
+                    format!(
+                        "{} {hour:02}:00 - only {} of {} days recorded, too thin to trust",
+                        facet.label, column.days, facet.possible_days
+                    ),
+                ),
+            };
             let _ = write!(
                 svg,
-                "<rect class=\"no-data\" x=\"{x:.1}\" y=\"{MARGIN_TOP:.1}\" \
+                "<rect class=\"{class}\" x=\"{x:.1}\" y=\"{MARGIN_TOP:.1}\" \
                  width=\"{CELL_WIDTH:.1}\" height=\"{PLOT_HEIGHT:.1}\" \
                  fill=\"url(#{NO_DATA_PATTERN_ID})\"><title>{}</title></rect>",
-                escape(&format!(
-                    "{} {hour:02}:00 - not enough data ({} readings)",
-                    facet.label, column.samples
-                ))
+                escape(&note)
             );
             continue;
         }
@@ -215,7 +230,10 @@ pub fn facet_svg(facet: &Facet, buckets: &BucketSpec, options: &SvgOptions) -> S
     }
     svg.push_str("</g>");
 
+    svg.push_str(&coverage_strip(facet));
+
     // Axis frame and hour labels.
+    let labels_y = strip_top() + STRIP_HEIGHT + 12.0;
     let _ = write!(
         svg,
         "<g class=\"axis\"><line x1=\"{MARGIN_LEFT:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\"/>\
@@ -229,17 +247,68 @@ pub fn facet_svg(facet: &Facet, buckets: &BucketSpec, options: &SvgOptions) -> S
         let x = MARGIN_LEFT + (hour as f64 + 0.5) * CELL_WIDTH;
         let _ = write!(
             svg,
-            "<text class=\"tick\" x=\"{x:.1}\" y=\"{:.1}\" text-anchor=\"middle\">{hour:02}</text>",
-            MARGIN_TOP + PLOT_HEIGHT + 14.0
+            "<text class=\"tick\" x=\"{x:.1}\" y=\"{labels_y:.1}\" text-anchor=\"middle\">{hour:02}</text>"
         );
     }
     let _ = write!(
         svg,
         "<text class=\"axis-title\" x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"middle\">hour of day</text>",
         MARGIN_LEFT + PLOT_WIDTH / 2.0,
-        MARGIN_TOP + PLOT_HEIGHT + 28.0
+        labels_y + 13.0
     );
     svg.push_str("</g></svg>");
+    svg
+}
+
+/// Top edge of the coverage strip, in user units.
+fn strip_top() -> f64 {
+    MARGIN_TOP + PLOT_HEIGHT + STRIP_GAP
+}
+
+/// The row under the hour axis showing how many days back each hour.
+///
+/// The heatmap says how likely the power was; this says how much history that claim
+/// rests on. Without it a month assembled from three days looks exactly like a month
+/// assembled from sixty.
+fn coverage_strip(facet: &Facet) -> String {
+    let mut svg = String::with_capacity(2 * 1024);
+    let top = strip_top();
+    let _ = write!(
+        svg,
+        "<g class=\"coverage\"><text class=\"strip-label\" x=\"{:.1}\" y=\"{:.1}\" \
+         text-anchor=\"end\">days</text>",
+        MARGIN_LEFT - 5.0,
+        top + STRIP_HEIGHT
+    );
+
+    for hour in 0..HOURS_PER_DAY {
+        let x = MARGIN_LEFT + hour as f64 * CELL_WIDTH;
+        let Some(column) = facet.columns.get(hour) else {
+            continue;
+        };
+        let class = match color::coverage_level(column.days, facet.possible_days) {
+            Some(level) => format!("cov{level}"),
+            None => "cov-none".to_string(),
+        };
+        let note = if facet.possible_days > 0 {
+            format!(
+                "{} {hour:02}:00 - recorded on {} of {} days",
+                facet.label, column.days, facet.possible_days
+            )
+        } else {
+            format!(
+                "{} {hour:02}:00 - recorded on {} days",
+                facet.label, column.days
+            )
+        };
+        let _ = write!(
+            svg,
+            "<rect class=\"{class}\" x=\"{x:.1}\" y=\"{top:.1}\" width=\"{CELL_WIDTH:.1}\" \
+             height=\"{STRIP_HEIGHT:.1}\"><title>{}</title></rect>",
+            escape(&note)
+        );
+    }
+    svg.push_str("</g>");
     svg
 }
 
@@ -299,6 +368,22 @@ mod tests {
     }
 
     fn facet_from(columns: Vec<Vec<f64>>, sufficient: bool) -> Facet {
+        facet_with_status(
+            columns,
+            if sufficient {
+                ColumnStatus::Sufficient
+            } else {
+                ColumnStatus::Thin
+            },
+        )
+    }
+
+    fn facet_with_status(columns: Vec<Vec<f64>>, status: ColumnStatus) -> Facet {
+        let days = match status {
+            ColumnStatus::Empty => 0,
+            ColumnStatus::Thin => 2,
+            ColumnStatus::Sufficient => 20,
+        };
         let columns = columns
             .into_iter()
             .enumerate()
@@ -307,7 +392,8 @@ mod tests {
                 values,
                 weight_seconds: 3_600.0,
                 samples: 10,
-                sufficient,
+                days,
+                status,
             })
             .collect::<Vec<_>>();
         Facet {
@@ -316,6 +402,8 @@ mod tests {
             short_label: "Jun".to_string(),
             weight_seconds: 3_600.0 * columns.len() as f64,
             samples: 10 * columns.len() as u64,
+            days,
+            possible_days: 30,
             columns,
         }
     }
@@ -426,15 +514,51 @@ mod tests {
         assert!(!svg.contains("inf"), "{svg}");
     }
 
+    /// Number of heat cells drawn, ignoring the coverage strip's `cov*` rectangles.
+    fn cell_rects(svg: &str) -> usize {
+        svg.matches("<rect class=\"c").count() - svg.matches("<rect class=\"cov").count()
+    }
+
     #[test]
-    fn facets_without_enough_data_are_hatched_instead_of_coloured() {
+    fn thinly_evidenced_columns_are_hatched_instead_of_coloured() {
         let buckets = BucketSpec::new(50.0, 200.0).unwrap();
-        let facet = facet_from(vec![vec![1.0, 0.8, 0.4, 0.1, 0.0]; 24], false);
+        let facet = facet_with_status(vec![vec![1.0, 0.8, 0.4, 0.1, 0.0]; 24], ColumnStatus::Thin);
+        let svg = facet_svg(&facet, &buckets, &options());
+
+        assert_eq!(svg.matches("class=\"thin-data\"").count(), 24);
+        assert!(svg.contains("too thin to trust"));
+        assert!(svg.contains("only 2 of 30 days"));
+        assert_eq!(cell_rects(&svg), 0, "no likelihood may be drawn");
+    }
+
+    #[test]
+    fn never_recorded_columns_are_marked_differently_from_thin_ones() {
+        let buckets = BucketSpec::new(50.0, 200.0).unwrap();
+        let facet = facet_with_status(vec![vec![0.0; 5]; 24], ColumnStatus::Empty);
         let svg = facet_svg(&facet, &buckets, &options());
 
         assert_eq!(svg.matches("class=\"no-data\"").count(), 24);
-        assert!(svg.contains("not enough data"));
-        assert!(!svg.contains("class=\"c9\""));
+        assert!(svg.contains("never recorded"));
+        assert!(
+            !svg.contains("thin-data"),
+            "an unrecorded hour is not a thin one"
+        );
+    }
+
+    #[test]
+    fn the_coverage_strip_reports_a_cell_per_hour() {
+        let buckets = BucketSpec::new(50.0, 200.0).unwrap();
+        let facet = facet_from(vec![vec![1.0, 0.8, 0.4, 0.1, 0.0]; 24], true);
+        let svg = facet_svg(&facet, &buckets, &options());
+
+        assert_eq!(svg.matches("<rect class=\"cov").count(), HOURS_PER_DAY);
+        assert!(svg.contains("recorded on 20 of 30 days"));
+        assert!(svg.contains(">days</text>"), "the strip labels itself");
+
+        // An hour nobody recorded gets the empty step, not a shaded one.
+        let facet = facet_with_status(vec![vec![0.0; 5]; 24], ColumnStatus::Empty);
+        let svg = facet_svg(&facet, &buckets, &options());
+        assert_eq!(svg.matches("class=\"cov-none\"").count(), HOURS_PER_DAY);
     }
 
     #[test]
@@ -444,10 +568,7 @@ mod tests {
         let buckets = BucketSpec::new(50.0, 200.0).unwrap();
         let facet = facet_from(vec![vec![1.0, 0.0, 0.0, 0.0, 0.0]; 24], true);
         let svg = facet_svg(&facet, &buckets, &options());
-        assert!(
-            !svg.contains("<rect class=\"c"),
-            "bucket 0 must not be drawn: {svg}"
-        );
+        assert_eq!(cell_rects(&svg), 0, "bucket 0 must not be drawn: {svg}");
         assert!(
             svg.contains(">50 W</text>"),
             "the axis should start at 50 W"
@@ -457,7 +578,7 @@ mod tests {
         let mut density = options();
         density.metric = Metric::Density;
         let svg = facet_svg(&facet, &buckets, &density);
-        assert!(svg.contains("<rect class=\"c"));
+        assert_eq!(cell_rects(&svg), HOURS_PER_DAY);
         assert!(svg.contains(">0 W</text>"));
     }
 

@@ -2,13 +2,14 @@
 //! without touching a real instance.
 //!
 //! ```text
-//! cargo run --release --example demo_database -- demo.db 730
+//! cargo run --release --example demo_database -- demo.db 730 dense
+//! cargo run --release --example demo_database -- demo.db 200 spotty
 //! cargo run --release -- --db demo.db --entity sensor.solar_power --tz Europe/Berlin
 //! ```
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 
 use pv_probability::source::testdb::{self, ENTITY};
@@ -22,6 +23,12 @@ fn main() -> Result<()> {
         .parse()
         .context("the second argument is the number of days to generate")?;
 
+    let outages = match args.next().as_deref().unwrap_or("dense") {
+        "dense" => testdb::Outages::none(),
+        "spotty" => testdb::Outages::spotty(days),
+        other => bail!("the third argument is `dense` or `spotty`, not {other:?}"),
+    };
+
     if path.exists() {
         std::fs::remove_file(&path)
             .with_context(|| format!("failed to replace {}", path.display()))?;
@@ -29,11 +36,18 @@ fn main() -> Result<()> {
     let conn =
         Connection::open(&path).with_context(|| format!("failed to create {}", path.display()))?;
     testdb::create_schema(&conn, testdb::Flavour::Modern);
-    testdb::insert_synthetic_year(&conn, testdb::ts("2023-01-01 00:00:00"), days, 0xC0FFEE);
+    testdb::insert_synthetic_history(
+        &conn,
+        testdb::ts("2023-01-01 00:00:00"),
+        days,
+        0xC0FFEE,
+        &outages,
+    );
 
     println!(
-        "wrote {} with {days} days of hourly statistics for {ENTITY}",
-        path.display()
+        "wrote {} with {} of {days} days of hourly statistics for {ENTITY}",
+        path.display(),
+        outages.covered_days(days)
     );
     Ok(())
 }

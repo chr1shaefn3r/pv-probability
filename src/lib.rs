@@ -10,6 +10,7 @@
 
 pub mod aggregate;
 pub mod cli;
+pub mod coverage;
 pub mod model;
 pub mod render;
 pub mod source;

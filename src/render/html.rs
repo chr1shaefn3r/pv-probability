@@ -5,7 +5,10 @@ use std::fmt::Write as _;
 
 use rayon::prelude::*;
 
+use chrono_tz::Tz;
+
 use crate::aggregate::{Analysis, Facet};
+use crate::coverage::{Coverage, Gap};
 use crate::model::{BucketSpec, HOURS_PER_DAY, Metric};
 use crate::render::color;
 use crate::render::svg::{NO_DATA_PATTERN_ID, SvgOptions, axis_ticks, facet_svg};
@@ -18,6 +21,10 @@ pub struct PageOptions {
     pub entity: String,
     /// Facts about the run: source table, timezone, date range and so on.
     pub metadata: Vec<(String, String)>,
+    /// What the recorder actually covered, and where the outages are.
+    pub coverage: Option<Coverage>,
+    /// Timezone the coverage dates are stated in.
+    pub tz: Tz,
     pub levels: usize,
     pub gamma: f64,
     pub min_probability: f64,
@@ -28,6 +35,8 @@ impl Default for PageOptions {
         Self {
             entity: String::new(),
             metadata: Vec::new(),
+            coverage: None,
+            tz: Tz::UTC,
             levels: color::DEFAULT_LEVELS,
             gamma: 0.6,
             min_probability: 0.005,
@@ -69,6 +78,9 @@ pub fn page(analysis: &Analysis, options: &PageOptions) -> String {
     );
 
     html.push_str(&metadata_list(analysis, options));
+    if let Some(coverage) = &options.coverage {
+        html.push_str(&coverage_section(coverage, analysis, options.tz));
+    }
     html.push_str(&legend(analysis, options));
 
     if analysis.facets.is_empty() {
@@ -121,9 +133,9 @@ fn metadata_list(analysis: &Analysis, options: &PageOptions) -> String {
     }
     let _ = write!(
         html,
-        "<div><dt>Observed</dt><dd>{} over {} readings</dd></div>",
-        escape(&format_duration(analysis.total_weight_seconds)),
-        analysis.total_samples
+        "<div><dt>Observed</dt><dd>{} days</dd></div>\
+         <div><dt>Readings</dt><dd>{}</dd></div>",
+        analysis.observed_days, analysis.total_samples
     );
     let _ = write!(
         html,
@@ -157,11 +169,30 @@ fn legend(analysis: &Analysis, options: &PageOptions) -> String {
         "</ul><ul class=\"scale extra\">\
          <li><span class=\"swatch blank\" aria-hidden=\"true\"></span>\
          <span class=\"swatch-label\">below {}</span></li>\
-         <li><span class=\"swatch hatched\" aria-hidden=\"true\"></span>\
-         <span class=\"swatch-label\">fewer than {} readings</span></li></ul>\
+         <li><span class=\"swatch hatched thin\" aria-hidden=\"true\"></span>\
+         <span class=\"swatch-label\">fewer than {} days recorded</span></li>\
+         <li><span class=\"swatch hatched empty\" aria-hidden=\"true\"></span>\
+         <span class=\"swatch-label\">never recorded</span></li>\
+         </ul><ul class=\"scale extra\">\
+         <li><span class=\"swatch-label\">days recorded per hour</span></li>\
+         <li><span class=\"swatch cov-none\" aria-hidden=\"true\"></span>\
+         <span class=\"swatch-label\">none</span></li>\
+         {}\
+         </ul>\
          <p class=\"note\">{}</p></section>",
         escape(&format_percent(options.min_probability)),
-        analysis.min_samples,
+        analysis.min_days,
+        (0..color::COVERAGE_LEVELS)
+            .map(|level| format!(
+                "<li><span class=\"swatch cov{level}\" aria-hidden=\"true\"></span>\
+                 <span class=\"swatch-label\">{}</span></li>",
+                if level + 1 == color::COVERAGE_LEVELS {
+                    "most days".to_string()
+                } else {
+                    format!("{}%", (level + 1) * 100 / color::COVERAGE_LEVELS)
+                }
+            ))
+            .collect::<String>(),
         escape(&match analysis.metric {
             Metric::Exceedance => format!(
                 "Read a column upwards: the height at which the colour fades is roughly the \
@@ -178,6 +209,123 @@ fn legend(analysis: &Analysis, options: &PageOptions) -> String {
     html
 }
 
+/// The header block that says what the recorder really covered.
+///
+/// A report built from a handful of scattered days is not wrong, but it means something
+/// different from one built from two solid years, and the reader cannot tell the two
+/// apart from the heatmaps alone.
+fn coverage_section(coverage: &Coverage, analysis: &Analysis, tz: Tz) -> String {
+    let (first, last) = coverage.local_dates(tz);
+    let dates = match (first, last) {
+        (Some(first), Some(last)) => format!("{first} to {last}"),
+        _ => "an unknown span".to_string(),
+    };
+
+    let mut html = String::from("<section class=\"coverage-summary\">");
+    let _ = write!(
+        html,
+        "<h2>History</h2><p>Covers <strong>{}</strong> ({} days), with data on \
+         <strong>{} of them</strong> ({} of the span){}.</p>",
+        escape(&dates),
+        coverage.span_days,
+        coverage.observed_days,
+        escape(&format_percent(coverage.day_fraction())),
+        // A local day picks up data as soon as one of its hours does, so say how many
+        // were recorded properly rather than in passing.
+        if coverage.full_days < coverage.observed_days {
+            format!(", {} of them right through the day", coverage.full_days)
+        } else {
+            String::new()
+        }
+    );
+
+    let threshold = format_duration(coverage.gap_threshold_seconds as f64);
+    if coverage.gaps.is_empty() {
+        let _ = write!(
+            html,
+            "<p>No outage longer than {} interrupts it.</p>",
+            escape(&threshold)
+        );
+    } else {
+        let longest = coverage
+            .longest_gap()
+            .expect("a non-empty gap list has a longest");
+        let _ = write!(
+            html,
+            "<p>{} outage{} longer than {} ({} missing in total). The longest ran {}.</p>",
+            coverage.gaps.len(),
+            if coverage.gaps.len() == 1 { "" } else { "s" },
+            escape(&threshold),
+            escape(&format_duration(coverage.missing_seconds() as f64)),
+            escape(&describe_gap(longest, tz))
+        );
+    }
+
+    if !coverage.missing_facets.is_empty() {
+        let _ = write!(
+            html,
+            "<p>No data at all for {}.</p>",
+            escape(&coverage.missing_facets.join(", "))
+        );
+    }
+
+    if !coverage.covers_full_year() {
+        let _ = write!(
+            html,
+            "<p class=\"caution\">Less than a year of history: each {} rests on a single \
+             season rather than an average of several, and the {}s that are absent simply \
+             have not been recorded yet.</p>",
+            analysis.grouping, analysis.grouping
+        );
+    }
+    if coverage.is_sparse() {
+        html.push_str(
+            "<p class=\"caution\">Large parts of the span were never recorded, so treat \
+             the percentages as indicative.</p>",
+        );
+    }
+    if coverage.needs_caution() {
+        let _ = write!(
+            html,
+            "<p>Every percentage below is conditional on the time that was actually \
+             recorded: a sunny week the recorder missed is not represented at all. The \
+             strip under each plot shows how many days back each hour, and hours backed by \
+             fewer than {} days are hatched rather than coloured.</p>",
+            analysis.min_days
+        );
+    }
+    html.push_str("</section>");
+    html
+}
+
+/// "3 d 4 h from 2025-07-03 to 2025-07-06".
+fn describe_gap(gap: &Gap, tz: Tz) -> String {
+    let format = |ts: i64| {
+        chrono::DateTime::from_timestamp(ts, 0)
+            .map(|utc| utc.with_timezone(&tz).format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_else(|| "?".to_string())
+    };
+    format!(
+        "{} from {} to {}",
+        format_duration(gap.seconds() as f64),
+        format(gap.start_ts),
+        format(gap.end_ts)
+    )
+}
+
+/// The caption line under a facet's name: how much calendar it rests on.
+fn facet_stats(facet: &Facet) -> String {
+    if facet.possible_days > 0 {
+        format!(
+            "{} of {} days",
+            facet.days.min(facet.possible_days.max(facet.days)),
+            facet.possible_days
+        )
+    } else {
+        format!("{} days", facet.days)
+    }
+}
+
 fn facet_section(
     facet: &Facet,
     buckets: &BucketSpec,
@@ -188,10 +336,9 @@ fn facet_section(
     let _ = write!(
         html,
         "<figure class=\"facet\"><figcaption><span class=\"facet-name\">{}</span>\
-         <span class=\"facet-stats\">{} over {} readings</span></figcaption>",
+         <span class=\"facet-stats\">{}</span></figcaption>",
         escape(&facet.label),
-        escape(&format_duration(facet.weight_seconds)),
-        facet.samples
+        escape(&facet_stats(facet))
     );
     html.push_str(&facet_svg(facet, buckets, options));
     html.push_str(&facet_table(facet, buckets, metric, options));
@@ -243,7 +390,7 @@ fn facet_table(
             let sufficient = facet
                 .columns
                 .get(hour)
-                .is_some_and(|column| column.sufficient);
+                .is_some_and(|column| column.status.is_sufficient());
             let cell = if sufficient {
                 format_percent(facet.value(hour, bucket))
             } else {
@@ -253,7 +400,12 @@ fn facet_table(
         }
         html.push_str("</tr>");
     }
-    html.push_str("</tbody></table></div></details>");
+    html.push_str("<tr class=\"days-row\"><th scope=\"row\">days</th>");
+    for hour in 0..HOURS_PER_DAY {
+        let days = facet.columns.get(hour).map_or(0, |column| column.days);
+        let _ = write!(html, "<td>{days}</td>");
+    }
+    html.push_str("</tr></tbody></table></div></details>");
     html
 }
 
@@ -292,6 +444,9 @@ fn stylesheet(levels: usize) -> String {
     for (index, colour) in light.iter().enumerate() {
         let _ = writeln!(css, "  --heat-{index}: {colour};");
     }
+    for (index, colour) in color::COVERAGE_LIGHT.iter().enumerate() {
+        let _ = writeln!(css, "  --cov-{index}: {colour};");
+    }
     css.push_str("}\n@media (prefers-color-scheme: dark) {\n  :root {\n");
     css.push_str(
         "    --surface: #1a1a19;\n    --plane: #0d0d0d;\n    --ink: #ffffff;\n\
@@ -301,12 +456,21 @@ fn stylesheet(levels: usize) -> String {
     for (index, colour) in dark.iter().enumerate() {
         let _ = writeln!(css, "    --heat-{index}: {colour};");
     }
+    for (index, colour) in color::COVERAGE_DARK.iter().enumerate() {
+        let _ = writeln!(css, "    --cov-{index}: {colour};");
+    }
     css.push_str("  }\n}\n");
 
     for index in 0..levels {
         let _ = writeln!(
             css,
             ".cells .c{index} {{ fill: var(--heat-{index}); }}\n.swatch.s{index} {{ background: var(--heat-{index}); }}"
+        );
+    }
+    for index in 0..color::COVERAGE_LEVELS {
+        let _ = writeln!(
+            css,
+            ".coverage .cov{index} {{ fill: var(--cov-{index}); }}\n.swatch.cov{index} {{ background: var(--cov-{index}); }}"
         );
     }
 
@@ -347,6 +511,7 @@ h2 { font-size: 0.85rem; font-weight: 600; margin: 0 0 0.6rem; color: var(--ink-
 .swatch.hatched {
   background: repeating-linear-gradient(45deg, var(--surface) 0 3px, var(--grid) 3px 5px);
 }
+.swatch.hatched.empty { opacity: 0.4; }
 .note { margin: 0.6rem 0 0; font-size: 0.78rem; color: var(--ink-muted); max-width: 72ch; }
 .facets {
   display: grid;
@@ -370,8 +535,23 @@ h2 { font-size: 0.85rem; font-weight: 600; margin: 0 0 0.6rem; color: var(--ink-
 .facet-plot .axis line { stroke: var(--axis); stroke-width: 1; }
 .facet-plot .tick { fill: var(--ink-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
 .facet-plot .axis-title { fill: var(--ink-muted); font-size: 10px; }
-.facet-plot .no-data { stroke: none; }
+.facet-plot .no-data { stroke: none; opacity: 0.4; }
+.facet-plot .thin-data { stroke: none; opacity: 0.9; }
 .facet-plot .hatch { stroke: var(--grid); stroke-width: 2; }
+.facet-plot .strip-label { fill: var(--ink-muted); font-size: 9px; }
+.facet-plot .coverage rect { stroke: none; }
+.facet-plot .cov-none { fill: none; }
+.coverage-summary {
+  margin: 1.25rem 0 0;
+  padding: 0.85rem 1rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.coverage-summary p { margin: 0 0 0.35rem; color: var(--ink-secondary); max-width: 78ch; }
+.coverage-summary p:last-child { margin-bottom: 0; }
+.coverage-summary .caution { color: var(--ink); }
+.swatch.cov-none { background: var(--surface); }
 .table-view { margin-top: 0.5rem; font-size: 0.75rem; }
 .table-view summary { cursor: pointer; color: var(--ink-muted); }
 .table-scroll { overflow-x: auto; margin-top: 0.5rem; }
@@ -394,7 +574,7 @@ mod tests {
     use chrono_tz::Tz::UTC;
 
     use crate::aggregate::{analyse, build_grid};
-    use crate::model::{Grid, Grouping, Sample};
+    use crate::model::{DayWindow, Grid, Grouping, Sample};
 
     fn analysis(metric: Metric) -> Analysis {
         let buckets = BucketSpec::new(500.0, 2_000.0).unwrap();
@@ -405,7 +585,7 @@ mod tests {
             })
             .collect();
         let grid = build_grid(&samples, Grouping::Month, buckets, UTC);
-        analyse(&grid, metric, 1)
+        analyse(&grid, metric, 1, &[])
     }
 
     fn options() -> PageOptions {
@@ -492,7 +672,12 @@ mod tests {
     #[test]
     fn an_analysis_without_data_says_so() {
         let buckets = BucketSpec::new(50.0, 200.0).unwrap();
-        let empty = analyse(&Grid::new(Grouping::Month, buckets), Metric::Exceedance, 1);
+        let empty = analyse(
+            &Grid::new(Grouping::Month, buckets, DayWindow::empty()),
+            Metric::Exceedance,
+            1,
+            &[],
+        );
         let html = page(&empty, &options());
         assert!(html.contains("nothing to plot"));
         assert!(!html.contains("class=\"facet-plot\""));

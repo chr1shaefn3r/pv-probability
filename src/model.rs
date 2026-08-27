@@ -4,6 +4,8 @@ use std::fmt;
 
 use anyhow::{Result, ensure};
 
+use crate::timeutil::DayNumber;
+
 /// One power reading that was in effect over the half-open UTC interval
 /// `[start_ts, end_ts)`.
 ///
@@ -202,34 +204,105 @@ impl BucketSpec {
     }
 }
 
+/// The span of local calendar days a grid can record, used to size its day bitset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DayWindow {
+    origin: DayNumber,
+    len: usize,
+}
+
+/// A recorder database spanning more than this is not something anyone has; the cap
+/// keeps the bitset from being sized by a corrupt timestamp.
+const MAX_WINDOW_DAYS: usize = 40 * 366;
+
+impl DayWindow {
+    /// A window covering `first..=last`, both local day numbers.
+    pub fn new(first: DayNumber, last: DayNumber) -> Self {
+        let len = last
+            .saturating_sub(first)
+            .saturating_add(1)
+            .max(1)
+            .min(MAX_WINDOW_DAYS as i32) as usize;
+        Self { origin: first, len }
+    }
+
+    /// The window covering a UTC timestamp span, as seen in `tz`.
+    pub fn from_span(first_ts: i64, last_ts: i64, tz: chrono_tz::Tz) -> Self {
+        let (first, last) = (
+            crate::timeutil::local_day(first_ts.min(last_ts), tz),
+            crate::timeutil::local_day(last_ts.max(first_ts), tz),
+        );
+        Self::new(first, last)
+    }
+
+    /// A single-day window, for grids that never see data.
+    pub fn empty() -> Self {
+        Self { origin: 0, len: 1 }
+    }
+
+    pub fn origin(&self) -> DayNumber {
+        self.origin
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Position of a day in the window, clamped to its ends.
+    ///
+    /// Clamping rather than dropping keeps a stray timestamp from silently vanishing
+    /// from the day counts; it lands on the nearest day the window can represent.
+    fn offset(&self, day: DayNumber) -> usize {
+        (day.saturating_sub(self.origin).max(0) as usize).min(self.len - 1)
+    }
+
+    fn words(&self) -> usize {
+        self.len.div_ceil(64)
+    }
+}
+
 /// Accumulated observation weight per facet, hour of day and watt bucket.
 ///
 /// Weights are seconds: a reading contributes the number of seconds it was in effect to
-/// the hour(s) it covered. Grids are additive, which is what lets rayon fold disjoint
-/// chunks of samples independently and merge the results.
+/// the hour(s) it covered. Alongside them the grid records *which local days* touched
+/// each column, as a bitset — that is the honest measure of how much independent
+/// evidence a column has, and unlike a reading count it does not change when the sensor
+/// reports every 30 seconds instead of once an hour.
+///
+/// Grids are additive (weights sum, day bitsets union), which is what lets rayon fold
+/// disjoint chunks of samples independently and merge the results.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Grid {
     grouping: Grouping,
     buckets: BucketSpec,
+    days: DayWindow,
     /// facet × hour × bucket
     weights: Vec<f64>,
     /// facet × hour, total weight regardless of bucket
     column_weight: Vec<f64>,
     /// facet × hour, number of source readings that touched the column
     column_samples: Vec<u64>,
+    /// facet × hour × ceil(window / 64), one bit per local day observed
+    day_bits: Vec<u64>,
 }
 
 pub const HOURS_PER_DAY: usize = 24;
 
 impl Grid {
-    pub fn new(grouping: Grouping, buckets: BucketSpec) -> Self {
+    pub fn new(grouping: Grouping, buckets: BucketSpec, days: DayWindow) -> Self {
         let columns = grouping.facet_count() * HOURS_PER_DAY;
         Self {
             grouping,
             buckets,
+            days,
             weights: vec![0.0; columns * buckets.len()],
             column_weight: vec![0.0; columns],
             column_samples: vec![0; columns],
+            day_bits: vec![0; columns * days.words()],
         }
     }
 
@@ -241,12 +314,17 @@ impl Grid {
         &self.buckets
     }
 
+    pub fn day_window(&self) -> DayWindow {
+        self.days
+    }
+
     fn column_index(&self, facet: usize, hour: usize) -> usize {
         facet * HOURS_PER_DAY + hour
     }
 
-    /// Add `seconds` of observation time at `watts` to one facet/hour column.
-    pub fn add(&mut self, facet: usize, hour: usize, watts: f64, seconds: f64) {
+    /// Add `seconds` of observation time at `watts`, recorded on local day `day`, to one
+    /// facet/hour column.
+    pub fn add(&mut self, facet: usize, hour: usize, watts: f64, seconds: f64, day: DayNumber) {
         if facet >= self.grouping.facet_count() || hour >= HOURS_PER_DAY {
             return;
         }
@@ -258,6 +336,10 @@ impl Grid {
         self.weights[column * self.buckets.len() + bucket] += seconds;
         self.column_weight[column] += seconds;
         self.column_samples[column] += 1;
+
+        let offset = self.days.offset(day);
+        let words = self.days.words();
+        self.day_bits[column * words + offset / 64] |= 1u64 << (offset % 64);
     }
 
     /// Element-wise sum, used to merge the partial grids produced by rayon workers.
@@ -280,6 +362,10 @@ impl Grid {
             .zip(other.column_samples.iter())
         {
             *target += value;
+        }
+        // Days are a set, not a count: a day seen by both halves is still one day.
+        for (target, value) in self.day_bits.iter_mut().zip(other.day_bits.iter()) {
+            *target |= value;
         }
         self
     }
@@ -307,6 +393,82 @@ impl Grid {
             .get(self.column_index(facet, hour))
             .copied()
             .unwrap_or(0)
+    }
+
+    /// Distinct local days on which one facet/hour column was observed.
+    pub fn column_days(&self, facet: usize, hour: usize) -> u32 {
+        self.column_day_words(facet, hour)
+            .map(|words| words.iter().map(|word| word.count_ones()).sum())
+            .unwrap_or(0)
+    }
+
+    /// Distinct local days on which a facet was observed at any hour.
+    ///
+    /// A day that contributed to several hours still counts once, so this reads as
+    /// "days of June we have any data for".
+    pub fn facet_days(&self, facet: usize) -> u32 {
+        self.union_days(facet..facet + 1)
+    }
+
+    /// Distinct local days observed anywhere in the grid.
+    pub fn observed_days(&self) -> u32 {
+        self.union_days(0..self.grouping.facet_count())
+    }
+
+    /// Days that were observed for at least `min_hours` different hours.
+    ///
+    /// A local day picks up a bit as soon as one hour of it was recorded, and an hour of
+    /// spill-over from a neighbouring UTC day is enough to do that. Counting how many
+    /// hours of a day were really covered separates "we have this day" from "we have a
+    /// sliver of this day".
+    pub fn days_covering_hours(&self, min_hours: u32) -> u32 {
+        let words = self.days.words();
+        let mut hours_per_day = vec![0u32; self.days.len()];
+        for column in 0..self.grouping.facet_count() * HOURS_PER_DAY {
+            let start = column * words;
+            let Some(bits) = self.day_bits.get(start..start + words) else {
+                continue;
+            };
+            for (word_index, word) in bits.iter().enumerate() {
+                let mut remaining = *word;
+                while remaining != 0 {
+                    let bit = remaining.trailing_zeros() as usize;
+                    remaining &= remaining - 1;
+                    if let Some(count) = hours_per_day.get_mut(word_index * 64 + bit) {
+                        *count += 1;
+                    }
+                }
+            }
+        }
+        hours_per_day
+            .iter()
+            .filter(|hours| **hours >= min_hours.max(1))
+            .count() as u32
+    }
+
+    fn union_days(&self, facets: std::ops::Range<usize>) -> u32 {
+        let words = self.days.words();
+        let mut union = vec![0u64; words];
+        for facet in facets {
+            for hour in 0..HOURS_PER_DAY {
+                let Some(column) = self.column_day_words(facet, hour) else {
+                    continue;
+                };
+                for (target, value) in union.iter_mut().zip(column.iter()) {
+                    *target |= value;
+                }
+            }
+        }
+        union.iter().map(|word| word.count_ones()).sum()
+    }
+
+    fn column_day_words(&self, facet: usize, hour: usize) -> Option<&[u64]> {
+        if facet >= self.grouping.facet_count() || hour >= HOURS_PER_DAY {
+            return None;
+        }
+        let words = self.days.words();
+        let start = self.column_index(facet, hour) * words;
+        self.day_bits.get(start..start + words)
     }
 
     /// The bucket weights of one facet/hour column.
@@ -346,7 +508,13 @@ mod tests {
             iso_week,
             iso_year: 2024,
             year: 2024,
+            day: 739_000,
         }
+    }
+
+    /// A window wide enough for any day number a test uses.
+    fn window() -> DayWindow {
+        DayWindow::new(0, 3_650)
     }
 
     #[test]
@@ -441,10 +609,10 @@ mod tests {
     #[test]
     fn grid_accumulates_weight_per_cell_and_column() {
         let spec = BucketSpec::new(50.0, 200.0).unwrap();
-        let mut grid = Grid::new(Grouping::Month, spec);
-        grid.add(5, 12, 120.0, 600.0);
-        grid.add(5, 12, 130.0, 300.0);
-        grid.add(5, 13, 20.0, 100.0);
+        let mut grid = Grid::new(Grouping::Month, spec, window());
+        grid.add(5, 12, 120.0, 600.0, 10);
+        grid.add(5, 12, 130.0, 300.0, 10);
+        grid.add(5, 13, 20.0, 100.0, 10);
 
         assert_eq!(grid.cell_weight(5, 12, 2), 900.0);
         assert_eq!(grid.column_weight(5, 12), 900.0);
@@ -456,31 +624,101 @@ mod tests {
     }
 
     #[test]
+    fn a_day_counts_once_however_chatty_the_sensor_is() {
+        let spec = BucketSpec::new(50.0, 200.0).unwrap();
+        let mut grid = Grid::new(Grouping::Month, spec, window());
+        // A sensor reporting every ten seconds for one hour of one day.
+        for _ in 0..360 {
+            grid.add(5, 12, 120.0, 10.0, 42);
+        }
+        assert_eq!(
+            grid.column_samples(5, 12),
+            360,
+            "readings are still counted"
+        );
+        assert_eq!(grid.column_days(5, 12), 1, "but it is one day of evidence");
+
+        // A second day, however few readings it carries, doubles the evidence.
+        grid.add(5, 12, 120.0, 3_600.0, 43);
+        assert_eq!(grid.column_days(5, 12), 2);
+    }
+
+    #[test]
+    fn facet_and_total_day_counts_do_not_double_count_hours() {
+        let spec = BucketSpec::new(50.0, 200.0).unwrap();
+        let mut grid = Grid::new(Grouping::Month, spec, window());
+        for hour in 0..HOURS_PER_DAY {
+            grid.add(5, hour, 120.0, 3_600.0, 42);
+        }
+        grid.add(6, 12, 120.0, 3_600.0, 60);
+
+        assert_eq!(grid.column_days(5, 0), 1);
+        assert_eq!(grid.facet_days(5), 1, "one day, twenty four hours");
+        assert_eq!(grid.facet_days(6), 1);
+        assert_eq!(grid.observed_days(), 2);
+        assert_eq!(grid.facet_days(0), 0);
+    }
+
+    #[test]
+    fn days_are_counted_by_how_much_of_them_was_recorded() {
+        let spec = BucketSpec::new(50.0, 200.0).unwrap();
+        let mut grid = Grid::new(Grouping::Month, spec, window());
+        // One day recorded all the way through ...
+        for hour in 0..HOURS_PER_DAY {
+            grid.add(5, hour, 120.0, 3_600.0, 10);
+        }
+        // ... and one that only caught an hour, the way a timezone offset spills a
+        // sliver of one day into the next.
+        grid.add(5, 1, 120.0, 3_600.0, 11);
+
+        assert_eq!(grid.observed_days(), 2, "both days carry something");
+        assert_eq!(grid.days_covering_hours(1), 2);
+        assert_eq!(grid.days_covering_hours(20), 1, "only one is a real day");
+        assert_eq!(grid.days_covering_hours(0), 2, "zero behaves like one");
+    }
+
+    #[test]
+    fn days_outside_the_window_clamp_instead_of_vanishing() {
+        let spec = BucketSpec::new(50.0, 200.0).unwrap();
+        let mut grid = Grid::new(Grouping::Month, spec, DayWindow::new(100, 109));
+        grid.add(5, 12, 120.0, 60.0, 50); // before the window
+        grid.add(5, 12, 120.0, 60.0, 105); // inside
+        grid.add(5, 12, 120.0, 60.0, 900); // after the window
+
+        assert_eq!(grid.column_days(5, 12), 3);
+        assert_eq!(grid.total_weight(), 180.0);
+    }
+
+    #[test]
     fn grid_ignores_out_of_range_and_zero_weight_additions() {
         let spec = BucketSpec::new(50.0, 200.0).unwrap();
-        let mut grid = Grid::new(Grouping::Month, spec);
-        grid.add(12, 0, 100.0, 60.0); // no 13th month
-        grid.add(0, 24, 100.0, 60.0); // no 25th hour
-        grid.add(0, 0, 100.0, 0.0); // zero duration
-        grid.add(0, 0, 100.0, f64::NAN); // non-finite duration
+        let mut grid = Grid::new(Grouping::Month, spec, window());
+        grid.add(12, 0, 100.0, 60.0, 1); // no 13th month
+        grid.add(0, 24, 100.0, 60.0, 1); // no 25th hour
+        grid.add(0, 0, 100.0, 0.0, 1); // zero duration
+        grid.add(0, 0, 100.0, f64::NAN, 1); // non-finite duration
         assert_eq!(grid.total_weight(), 0.0);
         assert_eq!(grid.total_samples(), 0);
+        assert_eq!(grid.observed_days(), 0);
         assert!(grid.non_empty_facets().is_empty());
     }
 
     #[test]
     fn grids_merge_element_wise() {
         let spec = BucketSpec::new(50.0, 200.0).unwrap();
-        let mut left = Grid::new(Grouping::Month, spec);
-        left.add(0, 0, 60.0, 100.0);
-        let mut right = Grid::new(Grouping::Month, spec);
-        right.add(0, 0, 60.0, 50.0);
-        right.add(1, 5, 10.0, 25.0);
+        let mut left = Grid::new(Grouping::Month, spec, window());
+        left.add(0, 0, 60.0, 100.0, 7);
+        let mut right = Grid::new(Grouping::Month, spec, window());
+        right.add(0, 0, 60.0, 50.0, 7);
+        right.add(1, 5, 10.0, 25.0, 8);
 
         let merged = left.merge(right);
         assert_eq!(merged.cell_weight(0, 0, 1), 150.0);
         assert_eq!(merged.column_samples(0, 0), 2);
         assert_eq!(merged.cell_weight(1, 5, 0), 25.0);
         assert_eq!(merged.total_weight(), 175.0);
+        // Both halves saw day 7, so the union is still one day.
+        assert_eq!(merged.column_days(0, 0), 1);
+        assert_eq!(merged.observed_days(), 2);
     }
 }

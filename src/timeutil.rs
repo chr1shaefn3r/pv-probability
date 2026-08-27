@@ -18,6 +18,12 @@ pub struct LocalParts {
     pub iso_year: i32,
     /// Calendar year.
     pub year: i32,
+    /// The local calendar day, counted from the common era.
+    ///
+    /// This is how the aggregation tells "one reading a minute for one morning" from
+    /// "one reading an hour across sixty days": what makes an observation independent
+    /// evidence is the day it happened on, not how chatty the sensor was.
+    pub day: DayNumber,
 }
 
 /// Resolve a timezone name. `None` or `"local"` means "figure out the machine's zone".
@@ -67,9 +73,16 @@ pub fn tz_name_from_zoneinfo_path(path: &str) -> Option<String> {
     }
 }
 
+/// A local calendar day, counted from the common era, as produced by
+/// [`chrono::Datelike::num_days_from_ce`].
+pub type DayNumber = i32;
+
 /// Local wall-clock properties of a UTC unix timestamp.
 pub fn local_parts(ts: i64, tz: Tz) -> LocalParts {
-    let local = utc_datetime(ts).with_timezone(&tz);
+    parts_of(&utc_datetime(ts).with_timezone(&tz))
+}
+
+fn parts_of(local: &DateTime<Tz>) -> LocalParts {
     let iso = local.iso_week();
     LocalParts {
         hour: local.hour() as u8,
@@ -77,7 +90,21 @@ pub fn local_parts(ts: i64, tz: Tz) -> LocalParts {
         iso_week: iso.week() as u8,
         iso_year: iso.year(),
         year: local.year(),
+        day: local.date_naive().num_days_from_ce(),
     }
+}
+
+/// The local calendar day a UTC instant falls on.
+pub fn local_day(ts: i64, tz: Tz) -> DayNumber {
+    utc_datetime(ts)
+        .with_timezone(&tz)
+        .date_naive()
+        .num_days_from_ce()
+}
+
+/// Turn a day number back into a date, for labels.
+pub fn day_to_date(day: DayNumber) -> Option<NaiveDate> {
+    NaiveDate::from_num_days_from_ce_opt(day)
 }
 
 fn utc_datetime(ts: i64) -> DateTime<Utc> {
@@ -108,17 +135,7 @@ where
         // Always at least one second, so the loop is guaranteed to make progress.
         let step = (3600 - into_hour).max(1);
         let next = (cursor + step).min(end);
-        let iso = local.iso_week();
-        f(
-            LocalParts {
-                hour: local.hour() as u8,
-                month: local.month() as u8,
-                iso_week: iso.week() as u8,
-                iso_year: iso.year(),
-                year: local.year(),
-            },
-            (next - cursor) as f64,
-        );
+        f(parts_of(&local), (next - cursor) as f64);
         cursor = next;
     }
 }
@@ -209,6 +226,44 @@ mod tests {
         let parts = local_parts(ts("2024-12-21 10:30:00"), Berlin);
         assert_eq!(parts.hour, 11);
         assert_eq!(parts.month, 12);
+    }
+
+    #[test]
+    fn the_local_day_follows_the_local_calendar_not_utc() {
+        // 22:30 UTC on 20 June is already 21 June in Berlin.
+        let late = local_parts(ts("2024-06-20 22:30:00"), Berlin);
+        let next_morning = local_parts(ts("2024-06-21 06:00:00"), Berlin);
+        assert_eq!(late.day, next_morning.day, "both are 21 June locally");
+        assert_eq!(
+            day_to_date(late.day),
+            Some(NaiveDate::from_ymd_opt(2024, 6, 21).unwrap())
+        );
+
+        // In UTC the same instants are two different days.
+        assert_ne!(
+            local_parts(ts("2024-06-20 22:30:00"), UTC).day,
+            local_parts(ts("2024-06-21 06:00:00"), UTC).day
+        );
+    }
+
+    #[test]
+    fn day_numbers_advance_by_one_per_calendar_day() {
+        let first = local_day(ts("2024-02-28 12:00:00"), UTC);
+        assert_eq!(local_day(ts("2024-02-29 12:00:00"), UTC), first + 1);
+        assert_eq!(local_day(ts("2024-03-01 12:00:00"), UTC), first + 2);
+        assert_eq!(day_to_date(first + 1).unwrap().to_string(), "2024-02-29");
+    }
+
+    #[test]
+    fn every_slice_of_one_local_day_reports_the_same_day_number() {
+        // A whole local day in Berlin, crossing midnight UTC.
+        let start = ts("2024-06-20 22:00:00");
+        let mut days = Vec::new();
+        for_each_hour_slice(start, start + 86_400, Berlin, |parts, _| {
+            days.push(parts.day)
+        });
+        days.dedup();
+        assert_eq!(days.len(), 1, "one local day should produce one day number");
     }
 
     #[test]
