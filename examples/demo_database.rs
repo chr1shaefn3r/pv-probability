@@ -1,0 +1,39 @@
+//! Write a synthetic Home Assistant recorder database, so the tool can be tried out
+//! without touching a real instance.
+//!
+//! ```text
+//! cargo run --release --example demo_database -- demo.db 730
+//! cargo run --release -- --db demo.db --entity sensor.solar_power --tz Europe/Berlin
+//! ```
+
+use std::path::PathBuf;
+
+use anyhow::{Context, Result};
+use rusqlite::Connection;
+
+use pv_probability::source::testdb::{self, ENTITY};
+
+fn main() -> Result<()> {
+    let mut args = std::env::args().skip(1);
+    let path = PathBuf::from(args.next().unwrap_or_else(|| "demo.db".to_string()));
+    let days: i64 = args
+        .next()
+        .unwrap_or_else(|| "730".to_string())
+        .parse()
+        .context("the second argument is the number of days to generate")?;
+
+    if path.exists() {
+        std::fs::remove_file(&path)
+            .with_context(|| format!("failed to replace {}", path.display()))?;
+    }
+    let conn =
+        Connection::open(&path).with_context(|| format!("failed to create {}", path.display()))?;
+    testdb::create_schema(&conn, testdb::Flavour::Modern);
+    testdb::insert_synthetic_year(&conn, testdb::ts("2023-01-01 00:00:00"), days, 0xC0FFEE);
+
+    println!(
+        "wrote {} with {days} days of hourly statistics for {ENTITY}",
+        path.display()
+    );
+    Ok(())
+}

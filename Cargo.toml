@@ -1,0 +1,25 @@
+[package]
+name = "pv-probability"
+version = "0.1.0"
+edition = "2024"
+# let-chains in edition 2024 need 1.88.
+rust-version = "1.88"
+description = "Turn a Home Assistant recorder database into per-month/week solar power likelihood flame graphs"
+license = "MIT"
+repository = "https://github.com/chr1shaefn3r/pv-probability"
+readme = "README.md"
+keywords = ["solar", "photovoltaic", "home-assistant", "statistics", "visualization"]
+categories = ["command-line-utilities", "visualization"]
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+chrono-tz = "0.10"
+clap = { version = "4", features = ["derive"] }
+rayon = "1.10"
+rusqlite = { version = "0.40", features = ["bundled"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

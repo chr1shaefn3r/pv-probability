@@ -1,0 +1,6 @@
+/target
+*.html
+!/docs/*.html
+*.db
+*.db-wal
+*.db-shm
