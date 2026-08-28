@@ -10,7 +10,7 @@ use pv_probability::aggregate::{analyse, build_grid, suggest_max_watts};
 use pv_probability::cli::{self, Args};
 use pv_probability::coverage::{Coverage, possible_days_per_facet};
 use pv_probability::model::BucketSpec;
-use pv_probability::render::{PageOptions, format_duration, format_watts, page};
+use pv_probability::render::{PageOptions, describe_window, format_duration, format_watts, page};
 use pv_probability::source::catalog;
 use pv_probability::source::{self, LoadOptions, LoadedSamples, SourceKind};
 
@@ -151,6 +151,8 @@ fn run() -> Result<()> {
             levels: args.levels,
             gamma: args.gamma,
             min_probability: args.min_probability,
+            reliable_watts: args.reliable_watts,
+            reliable_probability: args.reliable_probability,
         },
     );
     fs::write(&args.out, &html)
@@ -164,6 +166,10 @@ fn run() -> Result<()> {
         format_duration(analysis.total_weight_seconds),
         html.len() as f64 / 1024.0,
         started.elapsed()
+    );
+    println!(
+        "reliable window: {}",
+        describe_window(&analysis.overall_window(args.reliable_watts, args.reliable_probability))
     );
     if let Some(coverage) = &coverage {
         println!("{}", coverage_line(coverage, config.tz));

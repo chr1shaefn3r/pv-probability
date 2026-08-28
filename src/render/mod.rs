@@ -4,7 +4,7 @@ pub mod color;
 pub mod html;
 pub mod svg;
 
-pub use html::{PageOptions, page};
+pub use html::{PageOptions, describe_window, page};
 
 /// Escape text for inclusion in HTML or SVG markup.
 pub fn escape(text: &str) -> String {

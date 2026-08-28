@@ -193,6 +193,26 @@ impl BucketSpec {
         }
     }
 
+    /// The first bucket whose lower edge is at least `watts`.
+    ///
+    /// Rounds **up**, unlike [`BucketSpec::index`]: asking "how likely is 120 W?" with
+    /// 50 W steps is answered from the "at least 150 W" row, because the "at least
+    /// 100 W" row would count time spent at 110 W as if it had met the request. The
+    /// caller states the bucket's [`BucketSpec::lower_edge`] back to the reader, so the
+    /// rounding is never silent.
+    pub fn bucket_at_least(&self, watts: f64) -> usize {
+        if watts.is_nan() || watts <= 0.0 {
+            return 0;
+        }
+        let raw = (watts / self.step).ceil();
+        // Written as a negated comparison so that infinity lands in the top bucket.
+        if raw < (self.n_buckets - 1) as f64 {
+            raw as usize
+        } else {
+            self.n_buckets - 1
+        }
+    }
+
     /// Lower edge of a bucket in watts.
     pub fn lower_edge(&self, index: usize) -> f64 {
         index as f64 * self.step
@@ -478,6 +498,58 @@ impl Grid {
         &self.weights[start..start + self.buckets.len()]
     }
 
+    /// The bucket weights of one hour of day, summed over every facet.
+    ///
+    /// This is the "whole record" column: pooling the seconds rather than averaging the
+    /// facets' percentages weights each month by how much of it was actually recorded,
+    /// which is what "across the whole history" honestly means.
+    pub fn pooled_column(&self, hour: usize) -> Vec<f64> {
+        let mut pooled = vec![0.0; self.buckets.len()];
+        if hour >= HOURS_PER_DAY {
+            return pooled;
+        }
+        for facet in 0..self.grouping.facet_count() {
+            for (target, value) in pooled.iter_mut().zip(self.column(facet, hour).iter()) {
+                *target += value;
+            }
+        }
+        pooled
+    }
+
+    /// Total weight of one hour of day over every facet, in seconds.
+    pub fn pooled_column_weight(&self, hour: usize) -> f64 {
+        (0..self.grouping.facet_count())
+            .map(|facet| self.column_weight(facet, hour))
+            .sum()
+    }
+
+    /// Readings that contributed to one hour of day over every facet.
+    pub fn pooled_column_samples(&self, hour: usize) -> u64 {
+        (0..self.grouping.facet_count())
+            .map(|facet| self.column_samples(facet, hour))
+            .sum()
+    }
+
+    /// Distinct local days on which one hour of day was observed, over every facet.
+    ///
+    /// A union rather than a sum: no day belongs to two months, but a week that straddles
+    /// a year boundary shares its facet with the same week of the next year.
+    pub fn pooled_column_days(&self, hour: usize) -> u32 {
+        if hour >= HOURS_PER_DAY {
+            return 0;
+        }
+        let mut union = vec![0u64; self.days.words()];
+        for facet in 0..self.grouping.facet_count() {
+            let Some(column) = self.column_day_words(facet, hour) else {
+                continue;
+            };
+            for (target, value) in union.iter_mut().zip(column.iter()) {
+                *target |= value;
+            }
+        }
+        union.iter().map(|word| word.count_ones()).sum()
+    }
+
     /// Total weight over the whole grid, in seconds.
     pub fn total_weight(&self) -> f64 {
         self.column_weight.iter().sum()
@@ -597,6 +669,26 @@ mod tests {
     }
 
     #[test]
+    fn asking_for_at_least_some_watts_rounds_up() {
+        let spec = BucketSpec::new(50.0, 200.0).unwrap();
+        // An exact multiple is answered by its own row ...
+        assert_eq!(spec.bucket_at_least(100.0), 2);
+        assert_eq!(spec.lower_edge(spec.bucket_at_least(100.0)), 100.0);
+        // ... and anything in between by the row above, never the one below.
+        assert_eq!(spec.bucket_at_least(101.0), 3);
+        assert_eq!(spec.bucket_at_least(120.0), 3);
+        assert_eq!(spec.bucket_at_least(1.0), 1);
+        // Nothing at all is bucket zero, which every reading meets.
+        assert_eq!(spec.bucket_at_least(0.0), 0);
+        assert_eq!(spec.bucket_at_least(-50.0), 0);
+        assert_eq!(spec.bucket_at_least(f64::NAN), 0);
+        // Above the axis there is only the open-ended top bucket to answer from.
+        assert_eq!(spec.bucket_at_least(200.0), 4);
+        assert_eq!(spec.bucket_at_least(9_999.0), 4);
+        assert_eq!(spec.bucket_at_least(f64::INFINITY), 4);
+    }
+
+    #[test]
     fn bucket_spec_handles_a_step_that_does_not_divide_the_maximum() {
         let spec = BucketSpec::new(300.0, 1000.0).unwrap();
         // 0, 300, 600, 900, 1200+ => the axis rounds up past the requested maximum.
@@ -701,6 +793,45 @@ mod tests {
         assert_eq!(grid.total_samples(), 0);
         assert_eq!(grid.observed_days(), 0);
         assert!(grid.non_empty_facets().is_empty());
+    }
+
+    #[test]
+    fn pooled_columns_sum_the_facets_of_one_hour() {
+        let spec = BucketSpec::new(50.0, 200.0).unwrap();
+        let mut grid = Grid::new(Grouping::Month, spec, window());
+        grid.add(5, 12, 120.0, 600.0, 10); // June
+        grid.add(6, 12, 120.0, 300.0, 40); // July, same hour
+        grid.add(6, 12, 20.0, 100.0, 41);
+        grid.add(6, 13, 20.0, 900.0, 41); // a different hour entirely
+
+        let pooled = grid.pooled_column(12);
+        assert_eq!(pooled[2], 900.0, "both months' 120 W time");
+        assert_eq!(pooled[0], 100.0);
+        assert_eq!(grid.pooled_column_weight(12), 1_000.0);
+        assert_eq!(grid.pooled_column_samples(12), 3);
+        assert_eq!(grid.pooled_column_days(12), 3);
+
+        // The hour with a single facet behind it is simply that facet.
+        assert_eq!(grid.pooled_column(13), grid.column(6, 13).to_vec());
+        assert_eq!(grid.pooled_column_days(13), 1);
+
+        // Nothing was recorded at 03:00, and there is no 25th hour.
+        assert_eq!(grid.pooled_column_weight(3), 0.0);
+        assert_eq!(grid.pooled_column_days(3), 0);
+        assert_eq!(grid.pooled_column(24), vec![0.0; spec.len()]);
+        assert_eq!(grid.pooled_column_days(24), 0);
+    }
+
+    #[test]
+    fn a_day_pooled_across_facets_is_still_one_day() {
+        let spec = BucketSpec::new(50.0, 200.0).unwrap();
+        // Week 1 of two consecutive years shares a facet, and the same calendar day
+        // cannot be counted twice however many facets touched it.
+        let mut grid = Grid::new(Grouping::Week, spec, window());
+        grid.add(0, 9, 120.0, 600.0, 7);
+        grid.add(1, 9, 120.0, 600.0, 7);
+        assert_eq!(grid.pooled_column_days(9), 1);
+        assert_eq!(grid.pooled_column_weight(9), 1_200.0);
     }
 
     #[test]

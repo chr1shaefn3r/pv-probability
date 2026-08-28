@@ -140,6 +140,76 @@ fn exceedance_curves_fall_off_monotonically_everywhere() {
 }
 
 #[test]
+fn summer_can_be_counted_on_for_more_of_the_day_than_winter() {
+    let conn = database();
+    let (_, analysis) = run(&conn, Grouping::Month, Metric::Exceedance);
+
+    let window = |month: usize| {
+        let facet = analysis.facet(month).expect("a month with data");
+        analysis.window(&facet.columns, 100.0, 1.0)
+    };
+    let june = window(5);
+    let december = window(11);
+
+    let (first, last) = june.hours().expect("June always makes 100 W around noon");
+    assert!(
+        first <= 9 && last >= 15,
+        "June's window was {first}..={last}"
+    );
+    assert!(june.contiguous, "the sun does not switch off at lunchtime");
+
+    let december_hours = december.span_hours();
+    assert!(
+        december_hours < june.span_hours(),
+        "December ({december_hours} h) should be shorter than June ({} h)",
+        june.span_hours()
+    );
+
+    // The whole record can only promise what its worst month promises.
+    let overall = analysis.overall_window(100.0, 1.0);
+    let (first, last) = overall.hours().expect("midday works all year round");
+    assert!(
+        first >= june.earliest.unwrap() && last <= june.latest.unwrap(),
+        "the pooled window {first}..={last} must sit inside June's"
+    );
+    for facet in &analysis.facets {
+        let month = analysis.window(&facet.columns, 100.0, 1.0);
+        let (month_first, month_last) = month.hours().unwrap_or((0, 23));
+        assert!(
+            month_first <= first && month_last >= last,
+            "{} promises {month_first}..={month_last}, less than the whole record's \
+             {first}..={last}",
+            facet.label
+        );
+    }
+}
+
+#[test]
+fn a_threshold_the_array_never_reaches_has_no_window_at_all() {
+    let conn = database();
+    let (_, analysis) = run(&conn, Grouping::Month, Metric::Exceedance);
+
+    // The synthetic array peaks around 7.5 kW at midsummer, so 20 kW is out of reach
+    // everywhere - and the answer to that is "never", not a window of one lucky hour.
+    let overall = analysis.overall_window(20_000.0, 1.0);
+    assert!(overall.is_empty());
+    assert!(
+        overall.contiguous,
+        "an empty window is trivially contiguous"
+    );
+    for facet in &analysis.facets {
+        assert!(
+            analysis.window(&facet.columns, 20_000.0, 1.0).is_empty(),
+            "{} claimed 20 kW",
+            facet.label
+        );
+    }
+
+    // Relaxing the certainty cannot conjure power that was never recorded either.
+    assert!(analysis.overall_window(20_000.0, 0.5).is_empty());
+}
+
+#[test]
 fn the_week_grouping_covers_the_whole_year() {
     let conn = database();
     let (_, analysis) = run(&conn, Grouping::Week, Metric::Exceedance);
@@ -177,6 +247,12 @@ fn the_report_is_a_self_contained_html_file() {
     assert_eq!(html.matches("<details class=\"table-view\"").count(), 12);
     assert!(html.contains("June"));
     assert!(html.contains("December"));
+    assert!(html.contains("<h2>Reliable window</h2>"));
+    assert_eq!(
+        html.matches("class=\"window-line\"").count(),
+        12,
+        "every month states its own window inside its table"
+    );
     assert!(html.contains(ENTITY));
     assert!(!html.contains("http://") && !html.contains("https://"));
     assert!(!html.contains("<script"));

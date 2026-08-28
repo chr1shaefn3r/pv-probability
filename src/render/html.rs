@@ -7,7 +7,7 @@ use rayon::prelude::*;
 
 use chrono_tz::Tz;
 
-use crate::aggregate::{Analysis, Facet};
+use crate::aggregate::{Analysis, Facet, ReliableWindow};
 use crate::coverage::{Coverage, Gap};
 use crate::model::{BucketSpec, HOURS_PER_DAY, Metric};
 use crate::render::color;
@@ -28,6 +28,10 @@ pub struct PageOptions {
     pub levels: usize,
     pub gamma: f64,
     pub min_probability: f64,
+    /// Power the "reliable window" block asks about.
+    pub reliable_watts: f64,
+    /// How much of the observed time has to reach it, 1.0 being "always".
+    pub reliable_probability: f64,
 }
 
 impl Default for PageOptions {
@@ -40,9 +44,16 @@ impl Default for PageOptions {
             levels: color::DEFAULT_LEVELS,
             gamma: 0.6,
             min_probability: 0.005,
+            reliable_watts: DEFAULT_RELIABLE_WATTS,
+            reliable_probability: DEFAULT_RELIABLE_PROBABILITY,
         }
     }
 }
+
+/// Defaults for the reliable window, shared with the command line so the two cannot
+/// drift apart.
+pub const DEFAULT_RELIABLE_WATTS: f64 = 100.0;
+pub const DEFAULT_RELIABLE_PROBABILITY: f64 = 1.0;
 
 /// Render the complete HTML document.
 pub fn page(analysis: &Analysis, options: &PageOptions) -> String {
@@ -57,7 +68,20 @@ pub fn page(analysis: &Analysis, options: &PageOptions) -> String {
     let facets: Vec<String> = analysis
         .facets
         .par_iter()
-        .map(|facet| facet_section(facet, &analysis.buckets, analysis.metric, &svg_options))
+        .map(|facet| {
+            let window = analysis.window(
+                &facet.columns,
+                options.reliable_watts,
+                options.reliable_probability,
+            );
+            facet_section(
+                facet,
+                &analysis.buckets,
+                analysis.metric,
+                &svg_options,
+                &window,
+            )
+        })
         .collect();
 
     let title = format!("Solar power likelihood - {}", options.entity);
@@ -100,6 +124,7 @@ pub fn page(analysis: &Analysis, options: &PageOptions) -> String {
     }
 
     html.push_str(&legend(analysis, options));
+    html.push_str(&reliable_section(analysis, options));
     if let Some(coverage) = &options.coverage {
         html.push_str(&coverage_section(coverage, analysis, options.tz));
     }
@@ -264,6 +289,165 @@ fn legend(analysis: &Analysis, options: &PageOptions) -> String {
     html
 }
 
+/// The block that answers "when can I actually count on the panels?".
+///
+/// It sits after the key because it is a conclusion drawn from the plots, and before the
+/// History block because the reader wants the answer before the caveats about the data
+/// behind it.
+fn reliable_section(analysis: &Analysis, options: &PageOptions) -> String {
+    let window = analysis.overall_window(options.reliable_watts, options.reliable_probability);
+    let criterion = window_criterion(window.probability);
+    let power = format_watts(window.watts);
+
+    let mut html = String::from("<section class=\"reliable-window\"><h2>Reliable window</h2>");
+    match window.hours() {
+        Some((earliest, latest)) => {
+            let _ = write!(
+                html,
+                "<p>Earliest <strong>{}</strong>, latest <strong>{}</strong>: across the whole \
+                 record at least <strong>{}</strong> is available {} of those hours. The window \
+                 runs from {} to the end of the {} hour.</p>",
+                escape(&hour_label(earliest)),
+                escape(&hour_label(latest)),
+                escape(&power),
+                escape(&criterion),
+                escape(&hour_label(earliest)),
+                escape(&hour_label(latest))
+            );
+            if !window.contiguous {
+                html.push_str(
+                    "<p>Not every hour in between clears it, so the window is a span rather \
+                     than an unbroken block; the tables show which hours fall short.</p>",
+                );
+            }
+        }
+        None => {
+            let _ = write!(
+                html,
+                "<p>No hour of the day reaches <strong>{}</strong> {} across the whole record.</p>",
+                escape(&power),
+                escape(&criterion)
+            );
+        }
+    }
+
+    let short: Vec<&str> = analysis
+        .facets
+        .iter()
+        .filter(|facet| {
+            analysis
+                .window(
+                    &facet.columns,
+                    options.reliable_watts,
+                    options.reliable_probability,
+                )
+                .is_empty()
+        })
+        .map(|facet| facet.label.as_str())
+        .collect();
+    if !analysis.facets.is_empty() {
+        if short.is_empty() {
+            let _ = write!(
+                html,
+                "<p>Every {} in the record reaches it at some hour.</p>",
+                analysis.grouping
+            );
+        } else if short.len() == analysis.facets.len() {
+            let _ = write!(
+                html,
+                "<p>No {} in the record reaches it at any hour.</p>",
+                analysis.grouping
+            );
+        } else {
+            let _ = write!(
+                html,
+                "<p>Never reached at any hour in {}.</p>",
+                escape(&join_names(&short))
+            );
+        }
+        // The whole record can fall short while every single month clears the bar, because
+        // the months need not clear it at the same hour. Say so rather than leaving the
+        // reader to reconcile the two.
+        if window.is_empty() && short.len() < analysis.facets.len() {
+            let _ = write!(
+                html,
+                "<p>The {}s that do reach it manage it at different hours, and this figure \
+                 pools the whole record: an hour counts only when the record as a whole \
+                 clears the bar.</p>",
+                analysis.grouping
+            );
+        }
+    }
+
+    let mut note = String::new();
+    if window.watts > options.reliable_watts {
+        let _ = write!(
+            note,
+            "Rounded up from the {} asked for to the {} bucket edge, so the claim is never \
+             overstated. ",
+            format_watts(options.reliable_watts),
+            power
+        );
+    }
+    if window.probability >= 1.0 {
+        let _ = write!(
+            note,
+            "One recorded hour below {power} rules that hour of the day out entirely - lower \
+             the bar to see a gentler answer. "
+        );
+    }
+    let _ = write!(
+        note,
+        "Hours backed by fewer than {} days are not considered, and each {} has its own window \
+         inside its table above.",
+        analysis.min_days, analysis.grouping
+    );
+    let _ = write!(html, "<p class=\"note\">{}</p></section>", escape(&note));
+    html
+}
+
+/// One line summary of a window, for the terminal.
+///
+/// The same wording as the report, so the line printed after a run and the block in the
+/// page cannot say different things.
+pub fn describe_window(window: &ReliableWindow) -> String {
+    let criterion = window_criterion(window.probability);
+    let power = format_watts(window.watts);
+    match window.hours() {
+        Some((earliest, latest)) => format!(
+            "{} to the end of the {} hour - at least {power} {criterion}",
+            hour_label(earliest),
+            hour_label(latest)
+        ),
+        None => format!("none - no hour reaches {power} {criterion}"),
+    }
+}
+
+/// How certain "reliable" has to be, as the sentence fragment both blocks share.
+fn window_criterion(probability: f64) -> String {
+    if probability >= 1.0 {
+        "in every recorded minute".to_string()
+    } else {
+        format!(
+            "for at least {} of the recorded time",
+            format_percent(probability)
+        )
+    }
+}
+
+fn hour_label(hour: usize) -> String {
+    format!("{hour:02}:00")
+}
+
+/// "June", "June and July", "June, July and August".
+fn join_names(names: &[&str]) -> String {
+    match names {
+        [] => String::new(),
+        [only] => (*only).to_string(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
 /// The header block that says what the recorder really covered.
 ///
 /// A report built from a handful of scattered days is not wrong, but it means something
@@ -386,6 +570,7 @@ fn facet_section(
     buckets: &BucketSpec,
     metric: Metric,
     options: &SvgOptions,
+    window: &ReliableWindow,
 ) -> String {
     let mut html = String::with_capacity(16 * 1024);
     let _ = write!(
@@ -396,9 +581,34 @@ fn facet_section(
         escape(&facet_stats(facet))
     );
     html.push_str(&facet_svg(facet, buckets, options));
-    html.push_str(&facet_table(facet, buckets, metric, options));
+    html.push_str(&facet_table(facet, buckets, metric, options, window));
     html.push_str("</figure>");
     html
+}
+
+/// The facet's own reliable window, the first thing inside its expandable area.
+///
+/// It lives in the fold rather than under the plot because it is a sentence, not a
+/// figure to scan across twelve panels, and the reader who opens a month for its numbers
+/// is exactly the one who wants it.
+fn facet_window_line(window: &ReliableWindow) -> String {
+    let criterion = window_criterion(window.probability);
+    let power = format_watts(window.watts);
+    let text = match window.hours() {
+        Some((earliest, latest)) => {
+            let mut text = format!(
+                "At least {power} {criterion} from {} to the end of the {} hour.",
+                hour_label(earliest),
+                hour_label(latest)
+            );
+            if !window.contiguous {
+                text.push_str(" Some hours in between fall short.");
+            }
+            text
+        }
+        None => format!("No hour reaches {power} {criterion}."),
+    };
+    format!("<p class=\"window-line\">{}</p>", escape(&text))
 }
 
 /// The table twin of a facet: the same probabilities as text, at the gridline levels.
@@ -407,6 +617,7 @@ fn facet_table(
     buckets: &BucketSpec,
     metric: Metric,
     options: &SvgOptions,
+    window: &ReliableWindow,
 ) -> String {
     let bottom = buckets.lower_edge(options.first_bucket(buckets));
     let thresholds = axis_ticks(bottom, buckets.top_watts());
@@ -414,10 +625,11 @@ fn facet_table(
     let mut html = String::with_capacity(4 * 1024);
     let _ = write!(
         html,
-        "<details class=\"table-view\"><summary>{} as a table</summary>\
+        "<details class=\"table-view\"><summary>{} as a table</summary>{}\
          <div class=\"table-scroll\"><table><caption>{}</caption><thead><tr>\
          <th scope=\"col\">Power</th>",
         escape(&facet.label),
+        facet_window_line(window),
         escape(&match metric {
             Metric::Exceedance => format!(
                 "{}: probability of at least the given power, by hour of day",
@@ -688,6 +900,21 @@ h2 { font-size: 0.85rem; font-weight: 600; margin: 0 0 0.6rem; color: var(--ink-
 .facet-plot .strip-label { fill: var(--ink-muted); font-size: 9px; }
 .facet-plot .coverage rect { stroke: none; }
 .facet-plot .cov-none { fill: none; }
+.reliable-window {
+  margin: 1.25rem 0 0;
+  padding: 0.85rem 1rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.reliable-window p { margin: 0 0 0.35rem; color: var(--ink-secondary); max-width: 78ch; }
+.reliable-window p strong { color: var(--ink); font-variant-numeric: tabular-nums; }
+.reliable-window p:last-child { margin-bottom: 0; }
+.window-line {
+  margin: 0.5rem 0 0;
+  color: var(--ink-secondary);
+  font-variant-numeric: tabular-nums;
+}
 .coverage-summary {
   margin: 1.25rem 0 0;
   padding: 0.85rem 1rem;
@@ -722,6 +949,7 @@ mod tests {
 
     use crate::aggregate::{analyse, build_grid};
     use crate::model::{DayWindow, Grid, Grouping, Sample};
+    use crate::timeutil::parse_ha_datetime;
 
     fn analysis(metric: Metric) -> Analysis {
         let buckets = BucketSpec::new(500.0, 2_000.0).unwrap();
@@ -865,6 +1093,155 @@ mod tests {
             at("class=\"coverage-summary\"") < at("class=\"page-footer\""),
             "the footer stays at the bottom"
         );
+    }
+
+    /// One month that is reliably sunny mid-morning to mid-afternoon and one that never
+    /// gets anywhere near it, so the block has something to say in both directions.
+    fn summer_and_winter() -> Analysis {
+        let buckets = BucketSpec::new(500.0, 2_000.0).unwrap();
+        let mut samples = Vec::new();
+        let mut day = |start: i64, hours: std::ops::Range<i64>, watts: f64| {
+            for offset in 0..3 {
+                let midnight = start + offset * 86_400;
+                for hour in hours.clone() {
+                    let from = midnight + hour * 3_600;
+                    samples.push(Sample::new(from, from + 3_600, watts));
+                }
+            }
+        };
+        day(
+            parse_ha_datetime("2024-06-10 00:00:00").unwrap(),
+            9..17,
+            1_500.0,
+        );
+        day(
+            parse_ha_datetime("2024-12-10 00:00:00").unwrap(),
+            11..14,
+            800.0,
+        );
+
+        let grid = build_grid(&samples, Grouping::Month, buckets, UTC);
+        analyse(&grid, Metric::Exceedance, 3, &[])
+    }
+
+    #[test]
+    fn the_reliable_window_sits_between_the_key_and_the_history() {
+        let html = page(&analysis(Metric::Exceedance), &options_with_coverage());
+        let at = |needle: &str| {
+            html.find(needle)
+                .unwrap_or_else(|| panic!("missing {needle}"))
+        };
+
+        assert!(
+            at("class=\"legend\"") < at("class=\"reliable-window\""),
+            "the window follows the key"
+        );
+        assert!(
+            at("class=\"reliable-window\"") < at("class=\"coverage-summary\""),
+            "and comes before the history"
+        );
+        assert!(html.contains("<h2>Reliable window</h2>"));
+    }
+
+    #[test]
+    fn the_window_block_names_the_hours_and_the_criterion() {
+        let mut options = options();
+        options.reliable_watts = 1_000.0;
+        let html = page(&summer_and_winter(), &options);
+
+        assert!(html.contains("Earliest <strong>09:00</strong>"));
+        assert!(html.contains("latest <strong>16:00</strong>"));
+        assert!(
+            html.contains("in every recorded minute"),
+            "the default asks for certainty, and says so"
+        );
+        assert!(
+            html.contains("to the end of the 16:00 hour"),
+            "the last hour is inclusive and the wording has to make that plain"
+        );
+        // December drags the middle of the day down, which the block must not hide.
+        assert!(html.contains("Not every hour in between clears it"));
+    }
+
+    #[test]
+    fn the_facets_that_never_reach_the_threshold_are_named() {
+        let mut options = options();
+        options.reliable_watts = 1_000.0;
+        let html = page(&summer_and_winter(), &options);
+        assert!(
+            html.contains("Never reached at any hour in December."),
+            "the month that falls short has to be named"
+        );
+        assert!(!html.contains("in June and December"));
+
+        // With a threshold both months clear, nobody is singled out.
+        options.reliable_watts = 500.0;
+        let html = page(&summer_and_winter(), &options);
+        assert!(html.contains("Every month in the record reaches it"));
+    }
+
+    #[test]
+    fn a_threshold_nothing_reaches_is_stated_rather_than_left_blank() {
+        let mut options = options();
+        options.reliable_watts = 1_000.0;
+        options.reliable_probability = 1.0;
+        let analysis = summer_and_winter();
+        // Only December, where the panels never come close.
+        let december = analysis.facet(11).expect("December has data");
+        let window = analysis.window(&december.columns, 1_000.0, 1.0);
+        assert!(window.is_empty());
+
+        let html = page(&analysis, &options);
+        assert!(html.contains("No hour reaches 1 kW in every recorded minute."));
+        assert!(!html.contains("00:00 to the end of the 00:00"));
+    }
+
+    #[test]
+    fn each_facet_states_its_window_above_its_table() {
+        let mut options = options();
+        options.reliable_watts = 1_000.0;
+        let html = page(&summer_and_winter(), &options);
+
+        let details = html
+            .find("<details class=\"table-view\"")
+            .expect("the expandable area");
+        let line = html.find("class=\"window-line\"").expect("the window line");
+        let table = html.find("<div class=\"table-scroll\"").expect("the table");
+        assert!(
+            details < line,
+            "the line lives inside the fold, not above it"
+        );
+        assert!(line < table, "and it comes first once the fold is open");
+        assert!(
+            html.contains(
+                "At least 1 kW in every recorded minute from 09:00 to the end of the 16:00 hour."
+            ),
+            "June's own window reads as a sentence"
+        );
+        // One line per facet, and no stray copy under the plot.
+        assert_eq!(html.matches("class=\"window-line\"").count(), 2);
+    }
+
+    #[test]
+    fn a_gentler_question_says_so_everywhere_it_is_asked() {
+        let mut options = options();
+        options.reliable_watts = 1_000.0;
+        options.reliable_probability = 0.5;
+        let html = page(&summer_and_winter(), &options);
+
+        assert!(html.contains("for at least 50% of the recorded time"));
+        assert!(!html.contains("in every recorded minute"));
+        // Half the time is a low enough bar for the middle of the day to qualify again.
+        assert!(!html.contains("Not every hour in between clears it"));
+    }
+
+    #[test]
+    fn a_threshold_between_two_buckets_is_reported_at_the_edge_it_used() {
+        let mut options = options();
+        options.reliable_watts = 600.0; // 500 W buckets: answered from the 1 kW row
+        let html = page(&summer_and_winter(), &options);
+        assert!(html.contains("Rounded up from the 600 W asked for to the 1 kW bucket edge"));
+        assert!(html.contains("At least 1 kW in every recorded minute"));
     }
 
     #[test]

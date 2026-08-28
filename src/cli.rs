@@ -8,6 +8,7 @@ use clap::Parser;
 
 use crate::model::{Grouping, Metric};
 use crate::render::color;
+use crate::render::html;
 use crate::source::SourceKind;
 use crate::source::schema::ValueColumn;
 use crate::timeutil::{parse_local_date, resolve_timezone};
@@ -89,6 +90,20 @@ pub struct Args {
     /// go offline every night from filling the report with nightly "gaps".
     #[arg(long, value_name = "HOURS", default_value_t = 24.0)]
     pub gap_threshold_hours: f64,
+
+    /// Power the "reliable window" block asks about, in watts.
+    ///
+    /// The report states the earliest and latest hour that reaches it; the value is
+    /// rounded up to a bucket edge so the answer is never overstated.
+    #[arg(long, value_name = "WATTS", default_value_t = html::DEFAULT_RELIABLE_WATTS)]
+    pub reliable_watts: f64,
+
+    /// How much of the recorded time has to reach --reliable-watts, 1 being "always".
+    ///
+    /// One cloudy hour is enough to rule an hour of the day out at the default of 1;
+    /// 0.9 asks the gentler question when nothing qualifies.
+    #[arg(long, value_name = "P", default_value_t = html::DEFAULT_RELIABLE_PROBABILITY)]
+    pub reliable_probability: f64,
 
     /// Cells below this probability are left blank.
     #[arg(long, value_name = "P", default_value_t = 0.005)]
@@ -209,6 +224,18 @@ impl Args {
             self.min_probability
         );
         ensure!(
+            self.reliable_watts.is_finite() && self.reliable_watts > 0.0,
+            "--reliable-watts must be a positive number, got {}",
+            self.reliable_watts
+        );
+        ensure!(
+            self.reliable_probability.is_finite()
+                && self.reliable_probability > 0.0
+                && self.reliable_probability <= 1.0,
+            "--reliable-probability must be greater than 0 and at most 1, got {}",
+            self.reliable_probability
+        );
+        ensure!(
             self.gamma.is_finite() && self.gamma > 0.0,
             "--gamma must be a positive number, got {}",
             self.gamma
@@ -303,6 +330,11 @@ mod tests {
         assert_eq!(args.max_gap, 900);
         assert_eq!(args.min_days, 3);
         assert_eq!(args.gap_threshold_hours, 24.0);
+        assert_eq!(args.reliable_watts, 100.0);
+        assert_eq!(
+            args.reliable_probability, 1.0,
+            "\"always\" is the default question"
+        );
         assert_eq!(args.out, PathBuf::from("pv-probability.html"));
         assert!(!args.keep_negative);
 
@@ -384,6 +416,11 @@ mod tests {
         assert!(args(&["--levels", "17"]).resolve().is_err());
         assert!(args(&["--gap-threshold-hours", "0"]).resolve().is_err());
         assert!(args(&["--gap-threshold-hours", "-6"]).resolve().is_err());
+        assert!(args(&["--reliable-watts", "0"]).resolve().is_err());
+        assert!(args(&["--reliable-watts", "-100"]).resolve().is_err());
+        assert!(args(&["--reliable-probability", "0"]).resolve().is_err());
+        assert!(args(&["--reliable-probability", "1.5"]).resolve().is_err());
+        assert!(args(&["--reliable-probability", "-0.5"]).resolve().is_err());
         assert!(args(&["--scale", "0"]).resolve().is_err());
         assert!(args(&["--threads", "0"]).resolve().is_err());
     }
@@ -399,6 +436,12 @@ mod tests {
         assert!(args(&["--min-probability", "0"]).resolve().is_ok());
         assert!(args(&["--scale", "1000"]).resolve().is_ok());
         assert!(args(&["--levels", "12"]).resolve().is_ok());
+        assert!(args(&["--reliable-watts", "2500"]).resolve().is_ok());
+        assert!(args(&["--reliable-probability", "0.9"]).resolve().is_ok());
+        assert!(
+            args(&["--reliable-probability", "1"]).resolve().is_ok(),
+            "certainty is a legitimate thing to ask for"
+        );
         assert_eq!(
             args(&["--gap-threshold-hours", "6"])
                 .resolve()

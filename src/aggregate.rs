@@ -173,6 +173,8 @@ pub struct Analysis {
     pub min_days: u32,
     /// Facets that carry data, in calendar order.
     pub facets: Vec<Facet>,
+    /// The same 24 columns computed over every facet at once - the whole record.
+    pub overall: Vec<Column>,
     pub total_weight_seconds: f64,
     pub total_samples: u64,
     /// Distinct local days observed anywhere.
@@ -182,6 +184,107 @@ pub struct Analysis {
 impl Analysis {
     pub fn facet(&self, index: usize) -> Option<&Facet> {
         self.facets.iter().find(|facet| facet.index == index)
+    }
+
+    /// The earliest and latest hour that reaches `watts` with probability `probability`,
+    /// over an arbitrary set of columns.
+    pub fn window(&self, columns: &[Column], watts: f64, probability: f64) -> ReliableWindow {
+        reliable_window(columns, &self.buckets, self.metric, watts, probability)
+    }
+
+    /// The same window over the whole record rather than a single facet.
+    pub fn overall_window(&self, watts: f64, probability: f64) -> ReliableWindow {
+        self.window(&self.overall, watts, probability)
+    }
+}
+
+/// The span of hours that can be counted on for a given amount of power.
+///
+/// "Counted on" is deliberately strict: at the default probability of 1.0 a single
+/// recorded hour below the threshold disqualifies that hour of day for good.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReliableWindow {
+    /// The bucket edge the answer is really about, after rounding the request up.
+    pub watts: f64,
+    /// How much of the observed time had to reach it.
+    pub probability: f64,
+    /// First and last qualifying hour of day, if any hour qualifies at all.
+    pub earliest: Option<usize>,
+    pub latest: Option<usize>,
+    /// Whether every hour between the two also qualifies.
+    pub contiguous: bool,
+}
+
+impl ReliableWindow {
+    /// Whether no hour of day qualified.
+    pub fn is_empty(&self) -> bool {
+        self.earliest.is_none()
+    }
+
+    /// The window as a pair, or `None` when nothing qualified.
+    pub fn hours(&self) -> Option<(usize, usize)> {
+        self.earliest.zip(self.latest)
+    }
+
+    /// Number of qualifying hours the window spans, ends included.
+    pub fn span_hours(&self) -> usize {
+        self.hours()
+            .map_or(0, |(earliest, latest)| latest - earliest + 1)
+    }
+}
+
+/// Floating point slack. A reverse cumulative sum of many weights need not land exactly
+/// on 1.0, and an hour that really was above the threshold every recorded second must
+/// not be rejected over the last bit of a double.
+const PROBABILITY_EPSILON: f64 = 1e-9;
+
+/// Find the earliest and latest hour of day whose probability of at least `watts`
+/// reaches `probability`.
+///
+/// Columns the `--min-days` rule considers too thin never qualify: two sunny mornings
+/// are not a guarantee, and the same rule that keeps them out of the heatmap has to keep
+/// them out of a claim as strong as this one.
+pub fn reliable_window(
+    columns: &[Column],
+    buckets: &BucketSpec,
+    metric: Metric,
+    watts: f64,
+    probability: f64,
+) -> ReliableWindow {
+    let bucket = buckets.bucket_at_least(watts);
+    let target = probability - PROBABILITY_EPSILON;
+
+    let qualifies = |column: &Column| {
+        column.status.is_sufficient() && exceedance(column, metric, bucket) >= target
+    };
+
+    let earliest = columns.iter().position(qualifies);
+    let latest = columns.iter().rposition(qualifies);
+    let contiguous = match (earliest, latest) {
+        (Some(first), Some(last)) => columns[first..=last].iter().all(qualifies),
+        _ => true,
+    };
+
+    ReliableWindow {
+        watts: buckets.lower_edge(bucket),
+        probability,
+        earliest,
+        latest,
+        contiguous,
+    }
+}
+
+/// `P(watts >= the bucket's lower edge)` for a column, whichever metric it holds.
+///
+/// Exceedance columns already carry it; density columns are summed from the bucket
+/// upwards, so the window means the same thing under `--metric density`.
+fn exceedance(column: &Column, metric: Metric, bucket: usize) -> f64 {
+    match metric {
+        Metric::Exceedance => column.values.get(bucket).copied().unwrap_or(0.0),
+        Metric::Density => column
+            .values
+            .get(bucket..)
+            .map_or(0.0, |tail| tail.iter().sum()),
     }
 }
 
@@ -219,12 +322,27 @@ pub fn analyse(grid: &Grid, metric: Metric, min_days: u32, possible_days: &[u32]
     let mut facets = facets;
     facets.sort_by_key(|facet| facet.index);
 
+    let overall: Vec<Column> = (0..HOURS_PER_DAY)
+        .map(|hour| {
+            column_from_weights(
+                hour,
+                &grid.pooled_column(hour),
+                grid.pooled_column_weight(hour),
+                grid.pooled_column_samples(hour),
+                grid.pooled_column_days(hour),
+                metric,
+                min_days,
+            )
+        })
+        .collect();
+
     Analysis {
         grouping,
         buckets,
         metric,
         min_days,
         facets,
+        overall,
         total_weight_seconds: grid.total_weight(),
         total_samples: grid.total_samples(),
         observed_days: grid.observed_days(),
@@ -238,11 +356,30 @@ fn column_probabilities(
     metric: Metric,
     min_days: u32,
 ) -> Column {
-    let weights = grid.column(facet, hour);
-    let total = grid.column_weight(facet, hour);
-    let samples = grid.column_samples(facet, hour);
-    let days = grid.column_days(facet, hour);
+    column_from_weights(
+        hour,
+        grid.column(facet, hour),
+        grid.column_weight(facet, hour),
+        grid.column_samples(facet, hour),
+        grid.column_days(facet, hour),
+        metric,
+        min_days,
+    )
+}
 
+/// Turn one column of accumulated seconds into probabilities.
+///
+/// Taking the weights rather than a grid position lets the pooled "whole record" column
+/// go through exactly the same arithmetic as a single facet's.
+fn column_from_weights(
+    hour: usize,
+    weights: &[f64],
+    total: f64,
+    samples: u64,
+    days: u32,
+    metric: Metric,
+    min_days: u32,
+) -> Column {
     let values = if total > 0.0 {
         match metric {
             Metric::Exceedance => {
@@ -556,6 +693,192 @@ mod tests {
         assert_eq!(analysis.observed_days, 2);
         // Without a calendar to compare against, the facet reports none.
         assert_eq!(analysis.facets[0].possible_days, 0);
+    }
+
+    /// One hand-built hour column where `share` of the observed time was above 200 W and
+    /// the rest at zero, backed by `days` distinct days.
+    fn column(hour: usize, share: f64, days: u32) -> Column {
+        let mut weights = vec![0.0; spec().len()];
+        weights[0] = 1_000.0 * (1.0 - share);
+        weights[spec().len() - 1] = 1_000.0 * share;
+        column_from_weights(hour, &weights, 1_000.0, 24, days, Metric::Exceedance, 3)
+    }
+
+    /// A day of columns: `shares[hour]` of the time above 200 W, every hour well evidenced.
+    fn day(shares: &[f64; HOURS_PER_DAY]) -> Vec<Column> {
+        shares
+            .iter()
+            .enumerate()
+            .map(|(hour, share)| column(hour, *share, 30))
+            .collect()
+    }
+
+    fn shares(qualifying: std::ops::Range<usize>) -> [f64; HOURS_PER_DAY] {
+        let mut shares = [0.0; HOURS_PER_DAY];
+        for hour in qualifying {
+            shares[hour] = 1.0;
+        }
+        shares
+    }
+
+    fn window_of(columns: &[Column], watts: f64, probability: f64) -> ReliableWindow {
+        reliable_window(columns, &spec(), Metric::Exceedance, watts, probability)
+    }
+
+    #[test]
+    fn the_reliable_window_is_the_first_and_last_hour_that_always_delivers() {
+        let columns = day(&shares(9..17));
+        let window = window_of(&columns, 100.0, 1.0);
+
+        assert_eq!(window.earliest, Some(9));
+        assert_eq!(
+            window.latest,
+            Some(16),
+            "the last qualifying hour, inclusive"
+        );
+        assert!(window.contiguous);
+        assert!(!window.is_empty());
+        assert_eq!(window.span_hours(), 8);
+        assert_eq!(window.watts, 100.0);
+        assert_eq!(window.probability, 1.0);
+    }
+
+    #[test]
+    fn one_shortfall_is_enough_to_disqualify_an_hour() {
+        // 10:00 was above the threshold 99.9% of the recorded time - and that is not
+        // "always", which is the whole point of the strict default.
+        let mut shares = shares(9..17);
+        shares[10] = 0.999;
+        let columns = day(&shares);
+
+        let strict = window_of(&columns, 100.0, 1.0);
+        assert_eq!(strict.hours(), Some((9, 16)));
+        assert!(
+            !strict.contiguous,
+            "the window has a hole at 10:00 and must say so"
+        );
+
+        // Relaxing the question closes the hole.
+        let relaxed = window_of(&columns, 100.0, 0.99);
+        assert!(relaxed.contiguous);
+    }
+
+    #[test]
+    fn a_record_that_never_reaches_the_threshold_has_no_window() {
+        let columns = day(&[0.5; HOURS_PER_DAY]);
+        let window = window_of(&columns, 100.0, 1.0);
+
+        assert!(window.is_empty());
+        assert_eq!(window.earliest, None);
+        assert_eq!(window.latest, None);
+        assert_eq!(window.span_hours(), 0);
+        assert!(window.contiguous, "an empty window is trivially contiguous");
+
+        // The same columns answer a gentler question happily.
+        assert_eq!(window_of(&columns, 100.0, 0.5).hours(), Some((0, 23)));
+    }
+
+    #[test]
+    fn thinly_evidenced_hours_cannot_be_counted_on() {
+        let mut columns = day(&shares(9..17));
+        // A single sunny 08:00 is not a promise, so it must not widen the window.
+        columns[8] = column(8, 1.0, 1);
+        assert_eq!(columns[8].status, ColumnStatus::Thin);
+        assert_eq!(window_of(&columns, 100.0, 1.0).earliest, Some(9));
+
+        // Nor is an hour the recorder never covered.
+        let mut columns = day(&shares(9..17));
+        columns[17] = column_from_weights(17, &[0.0; 5], 0.0, 0, 0, Metric::Exceedance, 3);
+        assert_eq!(window_of(&columns, 100.0, 1.0).latest, Some(16));
+    }
+
+    #[test]
+    fn the_threshold_rounds_up_to_a_bucket_the_data_can_answer() {
+        let columns = day(&shares(9..17));
+        // 120 W is answered from the 150 W row: the 100 W row would count time spent at
+        // 110 W as if it had met the request.
+        let window = window_of(&columns, 120.0, 1.0);
+        assert_eq!(window.watts, 150.0, "the effective edge is reported back");
+        assert_eq!(window.hours(), Some((9, 16)));
+    }
+
+    #[test]
+    fn the_window_means_the_same_thing_under_the_density_metric() {
+        let mut weights = vec![0.0; spec().len()];
+        weights[2] = 400.0; // 100-150 W
+        weights[3] = 600.0; // 150-200 W
+        let hour = |metric| column_from_weights(9, &weights, 1_000.0, 24, 30, metric, 3);
+        let mut density: Vec<Column> = (0..HOURS_PER_DAY)
+            .map(|hour| column_from_weights(hour, &[0.0; 5], 0.0, 0, 0, Metric::Density, 3))
+            .collect();
+        density[9] = hour(Metric::Density);
+
+        let mut exceedance = density.clone();
+        exceedance[9] = hour(Metric::Exceedance);
+
+        // All of the time is at or above 100 W, only 60% of it at or above 150 W.
+        for (metric, columns) in [
+            (Metric::Density, &density),
+            (Metric::Exceedance, &exceedance),
+        ] {
+            let at = |watts, probability| {
+                reliable_window(columns, &spec(), metric, watts, probability).hours()
+            };
+            assert_eq!(at(100.0, 1.0), Some((9, 9)), "{metric}");
+            assert_eq!(at(150.0, 1.0), None, "{metric}");
+            assert_eq!(at(150.0, 0.6), Some((9, 9)), "{metric}");
+        }
+    }
+
+    #[test]
+    fn the_overall_columns_pool_every_facet() {
+        let mut grid = Grid::new(Grouping::Month, spec(), DayWindow::new(0, 400));
+        // June is reliable at 12:00, December only half the time.
+        for day in 0..10 {
+            grid.add(5, 12, 180.0, 3_600.0, day);
+            grid.add(11, 12, 180.0, 1_800.0, 300 + day);
+            grid.add(11, 12, 0.0, 1_800.0, 300 + day);
+        }
+        let analysis = analyse(&grid, Metric::Exceedance, 3, &[]);
+
+        assert_eq!(analysis.overall.len(), HOURS_PER_DAY);
+        let pooled = &analysis.overall[12];
+        assert_eq!(
+            pooled.weight_seconds,
+            10.0 * 7_200.0,
+            "both months' seconds"
+        );
+        assert_eq!(pooled.days, 20);
+        assert_eq!(pooled.status, ColumnStatus::Sufficient);
+        assert!(
+            (pooled.values[3] - 0.75).abs() < 1e-12,
+            "three quarters of the pooled time was at 180 W: {:?}",
+            pooled.values
+        );
+
+        // A month that falls short pulls the whole record down with it, which is what
+        // makes the pooled figure the intersection of the facets at 100%.
+        assert_eq!(analysis.facet(5).unwrap().value(12, 3), 1.0);
+        assert!(analysis.overall_window(150.0, 1.0).is_empty());
+        assert_eq!(
+            analysis
+                .window(&analysis.facet(5).unwrap().columns, 150.0, 1.0)
+                .hours(),
+            Some((12, 12)),
+            "June on its own is reliable"
+        );
+    }
+
+    #[test]
+    fn the_overall_column_reaches_certainty_only_when_every_facet_does() {
+        let mut grid = Grid::new(Grouping::Month, spec(), DayWindow::new(0, 400));
+        for day in 0..10 {
+            grid.add(5, 12, 180.0, 3_600.0, day);
+            grid.add(11, 12, 180.0, 3_600.0, 300 + day);
+        }
+        let analysis = analyse(&grid, Metric::Exceedance, 3, &[]);
+        assert_eq!(analysis.overall_window(150.0, 1.0).hours(), Some((12, 12)));
+        assert_eq!(analysis.overall_window(200.0, 1.0).hours(), None);
     }
 
     #[test]
