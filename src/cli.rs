@@ -24,8 +24,18 @@ pub struct Args {
     pub db: PathBuf,
 
     /// Entity to analyse, e.g. sensor.solar_power.
-    #[arg(long, value_name = "ENTITY_ID")]
-    pub entity: String,
+    #[arg(
+        long,
+        value_name = "ENTITY_ID",
+        required_unless_present = "list_entities"
+    )]
+    pub entity: Option<String>,
+
+    /// List the statistics this database holds and exit, power sensors first.
+    ///
+    /// Takes an optional word to filter the ids by, e.g. `--list-entities solar`.
+    #[arg(long, value_name = "FILTER", num_args = 0..=1, default_missing_value = "")]
+    pub list_entities: Option<String>,
 
     /// One heatmap per calendar month or per ISO week.
     #[arg(long, value_enum, default_value_t = Grouping::Month)]
@@ -136,6 +146,11 @@ pub struct Config {
 }
 
 impl Args {
+    /// The entity to analyse. Only absent in listing mode, which clap enforces.
+    pub fn entity(&self) -> &str {
+        self.entity.as_deref().unwrap_or_default()
+    }
+
     /// Check everything that cannot be expressed in the clap declaration and resolve the
     /// timezone-dependent values.
     pub fn resolve(&self) -> Result<Config> {
@@ -231,6 +246,12 @@ mod tests {
 
     use crate::timeutil::parse_ha_datetime;
 
+    fn parse(argv: &[&str]) -> Result<Args, clap::Error> {
+        let mut all = vec!["pv-probability"];
+        all.extend_from_slice(argv);
+        Args::try_parse_from(all)
+    }
+
     fn args(extra: &[&str]) -> Args {
         let mut argv = vec![
             "pv-probability",
@@ -266,8 +287,32 @@ mod tests {
 
     #[test]
     fn required_arguments_are_required() {
-        assert!(Args::try_parse_from(["pv-probability"]).is_err());
-        assert!(Args::try_parse_from(["pv-probability", "--db", "ha.db"]).is_err());
+        assert!(parse(&[]).is_err());
+        assert!(parse(&["--db", "ha.db"]).is_err(), "--entity is required");
+    }
+
+    #[test]
+    fn listing_makes_the_entity_optional() {
+        let args = parse(&["--db", "ha.db", "--list-entities"]).expect("no entity needed");
+        assert_eq!(
+            args.list_entities.as_deref(),
+            Some(""),
+            "an empty filter is everything"
+        );
+        assert_eq!(args.entity, None);
+
+        let args = parse(&["--db", "ha.db", "--list-entities", "solar"]).unwrap();
+        assert_eq!(args.list_entities.as_deref(), Some("solar"));
+
+        // Both together are fine: the listing simply wins.
+        let args = parse(&["--db", "ha.db", "--entity", "sensor.x", "--list-entities"]).unwrap();
+        assert_eq!(args.entity.as_deref(), Some("sensor.x"));
+        assert!(args.list_entities.is_some());
+
+        // Without the flag, nothing changes.
+        let args = parse(&["--db", "ha.db", "--entity", "sensor.x"]).unwrap();
+        assert_eq!(args.list_entities, None);
+        assert_eq!(args.entity(), "sensor.x");
     }
 
     #[test]

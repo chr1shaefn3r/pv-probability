@@ -49,6 +49,39 @@ cargo run --release --example demo_database -- demo.db 165 spotty   # 5 months, 
 cargo run --release -- --db demo.db --entity sensor.solar_power --tz Europe/Berlin
 ```
 
+## Finding the right entity
+
+Home Assistant usually exposes **two** sensors per device, and only one of them is any use
+here:
+
+| Sensor | Unit | `state_class` | What it holds | Plottable |
+|---|---|---|---|---|
+| `sensor.…_power` | `W` / `kW` | `measurement` | watts right now | **yes** |
+| `sensor.…_energy` | `kWh` | `total_increasing` | a running total | no |
+
+The recorder stores them differently: a measurement gets an hourly `mean`, a counter gets a
+`sum` and no mean at all, because the average of a running total means nothing. Point this
+tool at a counter and there is nothing for it to read - it says so, and names the power
+sensor to use instead.
+
+To see what your database holds:
+
+```sh
+pv-probability --db ha.db --list-entities          # everything, power sensors first
+pv-probability --db ha.db --list-entities solar    # only ids containing "solar"
+```
+
+```
+Power sensors this tool can plot:
+  sensor.solar_power   W     3408 rows  2023-01-01 to 2023-06-15
+
+Energy counters (cumulative totals - not plottable, see the README):
+  sensor.solar_energy  kWh   3408 rows  2023-01-01 to 2023-06-15
+```
+
+`--entity` is not needed when listing. Every error about an entity - unknown, empty, or the
+wrong kind - ends with the same shortlist, so the next command is always in front of you.
+
 ## Getting the database
 
 The tool only ever opens the file **read-only**, but SQLite still needs a consistent file.
@@ -91,7 +124,8 @@ within each hour instead, and `--stat min` the floor.
 Both the modern schema (epoch timestamps, `states_meta`) and the pre-2023 schema (text
 timestamps, `states.entity_id`) are detected automatically.
 
-If the entity name is wrong, the error lists the ids in the database that look similar.
+If the entity name is wrong - or right but unusable - the error says which, and lists the
+power sensors that would work. See [Finding the right entity](#finding-the-right-entity).
 
 ## Partial history and outages
 
@@ -169,6 +203,7 @@ pv-probability --db <FILE> --entity <ENTITY_ID> [OPTIONS]
 |---|---|---|
 | `--db <FILE>` | required | Copy of `home-assistant_v2.db`, opened read-only |
 | `--entity <ID>` | required | `sensor.solar_power`; also accepted as a `statistic_id` |
+| `--list-entities [FILTER]` | off | List what the database holds and exit, power sensors first |
 | `--group <month\|week>` | `month` | One heatmap per calendar month or per ISO week |
 | `--step-watts <W>` | `50` | Height of one power bucket |
 | `--max-watts <W>` | auto | Top of the power axis; everything above lands in the top bucket |
@@ -222,7 +257,7 @@ leave cores free.
 ## Development
 
 ```sh
-cargo test                                        # 175+ unit and integration tests
+cargo test                                        # 195+ unit and integration tests
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all
 ```
@@ -240,7 +275,7 @@ Layout:
 | `src/cli.rs` | Command line surface and validation |
 | `src/timeutil.rs` | Timezone resolution, DST-safe hour splitting |
 | `src/model.rs` | `Sample`, `BucketSpec`, the additive `Grid` |
-| `src/source/` | Schema probing and the statistics / states readers |
+| `src/source/` | Schema probing, the statistics / states readers, the entity catalogue |
 | `src/aggregate.rs` | Parallel folding, exceedance and density |
 | `src/coverage.rs` | Outage detection and what the history really covers |
 | `src/render/` | Colour scale, per-facet SVG, the HTML page |

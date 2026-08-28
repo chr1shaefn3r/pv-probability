@@ -1,7 +1,7 @@
 use std::fs;
 use std::time::Instant;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use chrono::DateTime;
 use chrono_tz::Tz;
 use clap::Parser;
@@ -11,9 +11,22 @@ use pv_probability::cli::Args;
 use pv_probability::coverage::{Coverage, possible_days_per_facet};
 use pv_probability::model::BucketSpec;
 use pv_probability::render::{PageOptions, format_duration, format_watts, page};
+use pv_probability::source::catalog;
 use pv_probability::source::{self, LoadOptions, LoadedSamples, SourceKind};
 
-fn main() -> Result<()> {
+fn main() {
+    if let Err(error) = run() {
+        // A diagnostic is the whole point of most of these errors, so print it plainly
+        // rather than letting anyhow follow it with a backtrace.
+        eprintln!("Error: {error}");
+        for cause in error.chain().skip(1) {
+            eprintln!("  caused by: {cause}");
+        }
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
     let args = Args::parse();
     let config = args.resolve()?;
 
@@ -26,10 +39,29 @@ fn main() -> Result<()> {
 
     let started = Instant::now();
     let conn = source::open_database(&args.db)?;
+
+    if let Some(filter) = &args.list_entities {
+        let candidates = catalog::list_statistics(&conn, Some(filter))?;
+        if candidates.is_empty() {
+            println!(
+                "No statistics in {}{}.",
+                args.db.display(),
+                if filter.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(" matching {filter:?}")
+                }
+            );
+        } else {
+            print!("{}", catalog::format_listing(&candidates, config.tz, 40));
+        }
+        return Ok(());
+    }
+
     let loaded = source::load(
         &conn,
         &LoadOptions {
-            entity: &args.entity,
+            entity: args.entity(),
             source: args.source,
             value: args.stat,
             from: config.from,
@@ -37,6 +69,7 @@ fn main() -> Result<()> {
             max_gap: args.max_gap,
             scale: args.scale,
             clamp_negative: config.clamp_negative,
+            tz: config.tz,
         },
     )?;
     if args.verbose > 0 {
@@ -49,12 +82,22 @@ fn main() -> Result<()> {
     }
 
     if loaded.samples.is_empty() {
-        bail!(
-            "`{}` has no usable readings in `{}` for the selected range. \
-             Try a different --source, widen --from/--to, or check the entity name.",
-            args.entity,
-            loaded.source
-        );
+        return Err(source::explain_no_samples(
+            &conn,
+            &LoadOptions {
+                entity: args.entity(),
+                source: args.source,
+                value: args.stat,
+                from: config.from,
+                to: config.to,
+                max_gap: args.max_gap,
+                scale: args.scale,
+                clamp_negative: config.clamp_negative,
+                tz: config.tz,
+            },
+            &loaded,
+            config.tz,
+        ));
     }
 
     let max_watts = match args.max_watts {
@@ -101,7 +144,7 @@ fn main() -> Result<()> {
     let html = page(
         &analysis,
         &PageOptions {
-            entity: args.entity.clone(),
+            entity: args.entity().to_string(),
             metadata: metadata(&args, &loaded, config.tz),
             coverage: coverage.clone(),
             tz: config.tz,

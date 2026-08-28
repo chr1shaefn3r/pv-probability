@@ -30,6 +30,7 @@ fn options<'a>(entity: &'a str) -> LoadOptions<'a> {
         max_gap: 900,
         scale: None,
         clamp_negative: true,
+        tz: UTC,
     }
 }
 

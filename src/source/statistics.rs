@@ -25,6 +25,8 @@ pub struct Request<'a> {
     /// Explicit watt scaling; `None` derives it from the recorded unit.
     pub scale: Option<f64>,
     pub clamp_negative: bool,
+    /// Only used to state dates in error messages.
+    pub tz: chrono_tz::Tz,
 }
 
 /// Samples plus what was learned about them on the way.
@@ -53,15 +55,19 @@ pub fn row_count(conn: &Connection, table: StatisticsTable, metadata_id: i64) ->
 pub fn load(conn: &Connection, request: &Request<'_>) -> Result<Loaded> {
     let time = statistics_layout(conn, request.table, request.value)?;
     let meta = find_statistic(conn, request.statistic_id)?.ok_or_else(|| {
-        not_found_error(
-            "statistic",
-            request.statistic_id,
-            &schema::suggest_ids(
-                conn,
-                "statistics_meta",
-                "statistic_id",
+        anyhow::anyhow!(
+            "{}{}",
+            not_found_error(
+                "statistic",
                 request.statistic_id,
+                &schema::suggest_ids(
+                    conn,
+                    "statistics_meta",
+                    "statistic_id",
+                    request.statistic_id,
+                ),
             ),
+            crate::source::catalog::suggest_block(conn, request.statistic_id, request.tz)
         )
     })?;
 
@@ -165,6 +171,7 @@ mod tests {
             to: None,
             scale: None,
             clamp_negative: true,
+            tz: chrono_tz::Tz::UTC,
         }
     }
 

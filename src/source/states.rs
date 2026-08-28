@@ -26,6 +26,27 @@ pub struct Request<'a> {
     pub max_gap: i64,
     pub scale: Option<f64>,
     pub clamp_negative: bool,
+    /// Only used to state dates in error messages.
+    pub tz: chrono_tz::Tz,
+}
+
+/// Whether the raw states table knows this entity at all, in either layout.
+pub fn entity_exists(conn: &Connection, entity_id: &str) -> Result<bool> {
+    match states_layout(conn) {
+        Ok(StatesLayout::MetadataId { .. }) => {
+            Ok(find_state_metadata_id(conn, entity_id)?.is_some())
+        }
+        Ok(StatesLayout::InlineEntityId { .. }) => {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM (SELECT 1 FROM states WHERE entity_id = ?1 LIMIT 1)",
+                [entity_id],
+                |row| row.get(0),
+            )?;
+            Ok(count > 0)
+        }
+        // No states table at all: nothing to fall back to.
+        Err(_) => Ok(false),
+    }
 }
 
 /// Load raw states as time-weighted samples.
@@ -37,10 +58,19 @@ pub fn load(conn: &Connection, request: &Request<'_>) -> Result<Loaded> {
         StatesLayout::MetadataId { .. } => {
             let metadata_id =
                 find_state_metadata_id(conn, request.entity_id)?.ok_or_else(|| {
-                    not_found_error(
-                        "entity",
-                        request.entity_id,
-                        &schema::suggest_ids(conn, "states_meta", "entity_id", request.entity_id),
+                    anyhow::anyhow!(
+                        "{}{}",
+                        not_found_error(
+                            "entity",
+                            request.entity_id,
+                            &schema::suggest_ids(
+                                conn,
+                                "states_meta",
+                                "entity_id",
+                                request.entity_id
+                            ),
+                        ),
+                        crate::source::catalog::suggest_block(conn, request.entity_id, request.tz)
                     )
                 })?;
             (
@@ -143,6 +173,7 @@ mod tests {
             max_gap: 900,
             scale: None,
             clamp_negative: true,
+            tz: chrono_tz::Tz::UTC,
         }
     }
 

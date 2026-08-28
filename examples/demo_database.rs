@@ -36,16 +36,22 @@ fn main() -> Result<()> {
     let conn =
         Connection::open(&path).with_context(|| format!("failed to create {}", path.display()))?;
     testdb::create_schema(&conn, testdb::Flavour::Modern);
-    testdb::insert_synthetic_history(
+    let start = testdb::ts("2023-01-01 00:00:00");
+    testdb::insert_synthetic_history(&conn, start, days, 0xC0FFEE, &outages);
+    // A real integration exposes both, and picking the wrong one is the easiest mistake
+    // to make, so the demo database offers the same trap.
+    testdb::insert_synthetic_energy_counter(
         &conn,
-        testdb::ts("2023-01-01 00:00:00"),
+        "sensor.solar_energy",
+        start,
         days,
         0xC0FFEE,
         &outages,
     );
 
     println!(
-        "wrote {} with {} of {days} days of hourly statistics for {ENTITY}",
+        "wrote {} with {} of {days} days of hourly statistics for {ENTITY} \
+         (and a cumulative sensor.solar_energy counter beside it)",
         path.display(),
         outages.covered_days(days)
     );

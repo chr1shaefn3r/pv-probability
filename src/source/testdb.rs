@@ -127,12 +127,29 @@ pub fn create_schema(conn: &Connection, flavour: Flavour) {
         .expect("test schema is valid SQL");
 }
 
-/// Register a statistic and return its `metadata_id`.
+/// Register a measurement statistic (hourly means) and return its `metadata_id`.
 pub fn insert_statistic_meta(conn: &Connection, statistic_id: &str, unit: Option<&str>) -> i64 {
+    insert_statistic_meta_with_flags(conn, statistic_id, unit, true, false)
+}
+
+/// Register a statistic with explicit `has_mean` / `has_sum` flags.
+///
+/// Home Assistant sets `has_sum` for cumulative counters (energy in kWh) and `has_mean`
+/// for measurements (power in W), and writes a different set of columns for each. The
+/// flags are deliberately allowed to disagree with the rows in some tests: recent
+/// recorder releases replaced `has_mean` with `mean_type`, so the readers trust the data
+/// rather than the metadata.
+pub fn insert_statistic_meta_with_flags(
+    conn: &Connection,
+    statistic_id: &str,
+    unit: Option<&str>,
+    has_mean: bool,
+    has_sum: bool,
+) -> i64 {
     conn.execute(
         "INSERT INTO statistics_meta (statistic_id, source, unit_of_measurement, has_mean, has_sum, name)
-         VALUES (?1, 'recorder', ?2, 1, 0, NULL)",
-        rusqlite::params![statistic_id, unit],
+         VALUES (?1, 'recorder', ?2, ?3, ?4, NULL)",
+        rusqlite::params![statistic_id, unit, has_mean as i64, has_sum as i64],
     )
     .expect("insert statistics_meta");
     conn.last_insert_rowid()
@@ -180,6 +197,43 @@ pub fn insert_statistics_row(
                 rusqlite::params![text, metadata_id, text, mean, min, max],
             )
             .expect("insert statistics row");
+        }
+    }
+}
+
+/// Add one cumulative-counter row: `sum` and `state` populated, `mean` left NULL.
+///
+/// This is what Home Assistant writes for a `total_increasing` sensor such as an energy
+/// meter, and it is the shape that made the first real run of this tool fail.
+pub fn insert_statistics_sum_row(
+    conn: &Connection,
+    flavour: Flavour,
+    table: &str,
+    metadata_id: i64,
+    start_ts: i64,
+    sum: f64,
+) {
+    match flavour {
+        Flavour::Modern => {
+            conn.execute(
+                &format!(
+                    "INSERT INTO {table} (created_ts, metadata_id, start_ts, mean, min, max, state, sum) \
+                     VALUES (?1, ?2, ?3, NULL, NULL, NULL, ?4, ?4)"
+                ),
+                rusqlite::params![start_ts as f64, metadata_id, start_ts as f64, sum],
+            )
+            .expect("insert statistics sum row");
+        }
+        Flavour::Legacy => {
+            let text = format_utc(start_ts);
+            conn.execute(
+                &format!(
+                    "INSERT INTO {table} (created, metadata_id, start, mean, min, max, state, sum) \
+                     VALUES (?1, ?2, ?3, NULL, NULL, NULL, ?4, ?4)"
+                ),
+                rusqlite::params![text, metadata_id, text, sum],
+            )
+            .expect("insert statistics sum row");
         }
     }
 }
@@ -423,6 +477,55 @@ pub fn insert_synthetic_history(
                 metadata_id,
                 start,
                 Some(mean),
+            );
+        }
+    }
+    conn.execute_batch("COMMIT").expect("commit transaction");
+    metadata_id
+}
+
+/// Write a cumulative energy counter (kWh) alongside a power sensor, the way a real
+/// integration exposes both, and return its `metadata_id`.
+///
+/// The counter integrates the same synthetic solar curve, so the two entities describe
+/// the same array - one as instantaneous watts, one as a monotonic total.
+pub fn insert_synthetic_energy_counter(
+    conn: &Connection,
+    statistic_id: &str,
+    start_ts: i64,
+    days: i64,
+    seed: u64,
+    outages: &Outages,
+) -> i64 {
+    let metadata_id =
+        insert_statistic_meta_with_flags(conn, statistic_id, Some("kWh"), false, true);
+    let mut rng = Lcg::new(seed);
+    let mut total = 0.0;
+    conn.execute_batch("BEGIN").expect("begin transaction");
+    for day in 0..days {
+        let cloud_factor = if rng.next_unit() < 0.34 {
+            0.15 + 0.35 * rng.next_unit()
+        } else {
+            0.85 + 0.15 * rng.next_unit()
+        };
+        for hour in 0..24 {
+            let start = start_ts + day * 86_400 + hour * 3_600;
+            let watts = (0..6)
+                .map(|slot| synthetic_watts(start + slot * 600, &mut rng, cloud_factor))
+                .sum::<f64>()
+                / 6.0;
+            // An hour at this average power adds this many kilowatt hours to the total.
+            total += watts / 1_000.0;
+            if !outages.covers(day) {
+                continue;
+            }
+            insert_statistics_sum_row(
+                conn,
+                Flavour::Modern,
+                "statistics",
+                metadata_id,
+                start,
+                total,
             );
         }
     }

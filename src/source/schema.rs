@@ -185,6 +185,42 @@ pub fn states_layout(conn: &Connection) -> Result<StatesLayout> {
     }
 }
 
+/// How many rows of a statistic carry a non-NULL value in one column.
+///
+/// `COUNT(column)` skips NULLs, so this answers "does this entity actually hold means?"
+/// without trusting `has_mean` - a flag that recent recorder releases replaced with
+/// `mean_type`, and that lies about counters in any case.
+pub fn value_count(
+    conn: &Connection,
+    table: StatisticsTable,
+    metadata_id: i64,
+    value: ValueColumn,
+) -> Result<i64> {
+    let table_name = table.table_name();
+    if !table_exists(conn, table_name)? {
+        return Ok(0);
+    }
+    if !column_names(conn, table_name)?
+        .iter()
+        .any(|column| column == value.column_name())
+    {
+        return Ok(0);
+    }
+    let sql = format!(
+        "SELECT COUNT(\"{}\") FROM \"{table_name}\" WHERE metadata_id = ?1",
+        value.column_name()
+    );
+    let count = conn
+        .query_row(&sql, [metadata_id], |row| row.get(0))
+        .with_context(|| {
+            format!(
+                "failed to count {} values in {table_name}",
+                value.column_name()
+            )
+        })?;
+    Ok(count)
+}
+
 /// Metadata of a long-term statistic.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatisticMeta {
@@ -437,6 +473,61 @@ mod tests {
             not_found_error("statistic", "sensor.a", &["sensor.ab".to_string()]).to_string();
         assert!(with_hint.contains("did you mean"));
         assert!(with_hint.contains("sensor.ab"));
+    }
+
+    #[test]
+    fn value_counts_ignore_nulls() {
+        let db = testdb::modern_database();
+        let meta = find_statistic(&db, testdb::ENTITY).unwrap().unwrap();
+        // Four rows, one of which has a NULL mean.
+        assert_eq!(
+            value_count(
+                &db,
+                StatisticsTable::LongTerm,
+                meta.metadata_id,
+                ValueColumn::Mean
+            )
+            .unwrap(),
+            3
+        );
+        assert_eq!(
+            value_count(&db, StatisticsTable::LongTerm, 4_242, ValueColumn::Mean).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_counter_has_no_mean_values_at_all() {
+        let conn = Connection::open_in_memory().unwrap();
+        testdb::create_schema(&conn, testdb::Flavour::Modern);
+        let metadata_id = testdb::insert_statistic_meta_with_flags(
+            &conn,
+            "sensor.solar_energy",
+            Some("kWh"),
+            false,
+            true,
+        );
+        for hour in 0..5 {
+            testdb::insert_statistics_sum_row(
+                &conn,
+                testdb::Flavour::Modern,
+                "statistics",
+                metadata_id,
+                hour * 3_600,
+                hour as f64,
+            );
+        }
+        assert_eq!(
+            value_count(
+                &conn,
+                StatisticsTable::LongTerm,
+                metadata_id,
+                ValueColumn::Mean
+            )
+            .unwrap(),
+            0,
+            "an energy counter carries sums, never means"
+        );
     }
 
     #[test]
