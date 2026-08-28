@@ -7,7 +7,7 @@ use chrono_tz::Tz;
 use clap::Parser;
 
 use pv_probability::aggregate::{analyse, build_grid, suggest_max_watts};
-use pv_probability::cli::Args;
+use pv_probability::cli::{self, Args};
 use pv_probability::coverage::{Coverage, possible_days_per_facet};
 use pv_probability::model::BucketSpec;
 use pv_probability::render::{PageOptions, format_duration, format_watts, page};
@@ -157,7 +157,7 @@ fn run() -> Result<()> {
         .with_context(|| format!("failed to write {}", args.out.display()))?;
 
     println!(
-        "{} - {} facets from {} readings ({}), {:.0} kB, {:.2?}",
+        "wrote {}: {} facets from {} readings ({}), {:.0} kB, {:.2?}",
         args.out.display(),
         analysis.facets.len(),
         analysis.total_samples,
@@ -190,6 +190,9 @@ fn run() -> Result<()> {
             );
         }
     }
+
+    // The last line is the one worth copying.
+    println!("\n{}", cli::open_command(&args.out));
     Ok(())
 }
 

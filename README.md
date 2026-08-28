@@ -37,8 +37,15 @@ scp homeassistant.local:/config/home-assistant_v2.db ha.db
 
 # 3. Plot
 ./target/release/pv-probability --db ha.db --entity sensor.solar_power --tz Europe/Berlin
+```
 
-# 4. Open pv-probability.html in a browser
+It finishes by printing the command that opens the report, ready to paste:
+
+```
+wrote pv-probability.html: 12 facets from 17520 readings (730 d), 159 kB, 9.65ms
+covers 2023-01-01 to 2024-12-31 (731 days): 730 days observed, no outage over 24 h
+
+open /home/you/pv-probability.html
 ```
 
 No Home Assistant to hand? Generate a synthetic one, either solid or full of holes:
