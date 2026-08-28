@@ -69,11 +69,15 @@ pub fn page(analysis: &Analysis, options: &PageOptions) -> String {
     let _ = writeln!(html, "<style>\n{}\n</style>", stylesheet(options.levels));
     html.push_str("</head>\n<body>\n");
     html.push_str(&hidden_defs());
+    html.push_str(&theme_inputs());
+    html.push_str("<div class=\"page\">");
 
     let _ = write!(
         html,
-        "<header class=\"page-header\"><h1>{}</h1><p class=\"lede\">{}</p></header>",
+        "<header class=\"page-header\"><div class=\"heading\"><h1>{}</h1>{}</div>\
+         <p class=\"lede\">{}</p></header>",
         escape(&title),
+        theme_switch(),
         escape(&lede(analysis))
     );
 
@@ -97,9 +101,54 @@ pub fn page(analysis: &Analysis, options: &PageOptions) -> String {
     }
 
     html.push_str(&footer(analysis));
-    html.push_str("\n</body>\n</html>\n");
+    html.push_str("</div>\n</body>\n</html>\n");
     html
 }
+
+/// The radios that drive the colour theme.
+///
+/// They sit at the top of the body, before everything they style, because the stylesheet
+/// selects the page with `#id:checked ~ .page`. A sibling selector rather than `:has()`:
+/// this has worked in every browser since custom properties themselves, whereas `:has()`
+/// only reached Firefox at the end of 2023, and a report is often opened in whatever
+/// browser happens to be to hand. Either way the page needs no JavaScript.
+fn theme_inputs() -> String {
+    let mut html = String::new();
+    for (id, checked) in [
+        (THEME_AUTO_ID, true),
+        (THEME_LIGHT_ID, false),
+        (THEME_DARK_ID, false),
+    ] {
+        let _ = write!(
+            html,
+            "<input type=\"radio\" class=\"theme-input\" name=\"pv-theme\" id=\"{id}\"{}>",
+            if checked { " checked" } else { "" }
+        );
+    }
+    html
+}
+
+/// The visible switch. Labels can live anywhere, so the control sits in the header while
+/// the radios it drives stay at the top of the body.
+fn theme_switch() -> String {
+    let mut html = String::from(
+        "<fieldset class=\"theme-switch\"><legend class=\"visually-hidden\">Colour theme</legend>",
+    );
+    for (id, label) in [
+        (THEME_AUTO_ID, "Auto"),
+        (THEME_LIGHT_ID, "Light"),
+        (THEME_DARK_ID, "Dark"),
+    ] {
+        let _ = write!(html, "<label for=\"{id}\">{label}</label>");
+    }
+    html.push_str("</fieldset>");
+    html
+}
+
+/// Ids the stylesheet keys off; kept beside the markup that emits them.
+const THEME_AUTO_ID: &str = "pv-theme-auto";
+const THEME_LIGHT_ID: &str = "pv-theme-light";
+const THEME_DARK_ID: &str = "pv-theme-dark";
 
 fn lede(analysis: &Analysis) -> String {
     match analysis.metric {
@@ -430,36 +479,63 @@ fn hidden_defs() -> String {
     )
 }
 
-fn stylesheet(levels: usize) -> String {
-    let light = color::ramp(levels, false);
-    let dark = color::ramp(levels, true);
-    let mut css = String::with_capacity(4 * 1024);
-
-    css.push_str(
-        ":root {\n  color-scheme: light dark;\n\
-         \x20 --surface: #fcfcfb;\n  --plane: #f9f9f7;\n  --ink: #0b0b0b;\n\
-         \x20 --ink-secondary: #52514e;\n  --ink-muted: #898781;\n  --grid: #e1e0d9;\n\
-         \x20 --axis: #c3c2b7;\n  --border: rgba(11, 11, 11, 0.10);\n",
+/// The light palette, as CSS custom property declarations.
+fn light_tokens(levels: usize) -> String {
+    let mut css = String::from(
+        "  color-scheme: light;\n  --surface: #fcfcfb;\n  --plane: #f9f9f7;\n\
+         \x20 --ink: #0b0b0b;\n  --ink-secondary: #52514e;\n  --ink-muted: #898781;\n\
+         \x20 --grid: #e1e0d9;\n  --axis: #c3c2b7;\n  --border: rgba(11, 11, 11, 0.10);\n",
     );
-    for (index, colour) in light.iter().enumerate() {
+    for (index, colour) in color::ramp(levels, false).iter().enumerate() {
         let _ = writeln!(css, "  --heat-{index}: {colour};");
     }
     for (index, colour) in color::COVERAGE_LIGHT.iter().enumerate() {
         let _ = writeln!(css, "  --cov-{index}: {colour};");
     }
-    css.push_str("}\n@media (prefers-color-scheme: dark) {\n  :root {\n");
-    css.push_str(
-        "    --surface: #1a1a19;\n    --plane: #0d0d0d;\n    --ink: #ffffff;\n\
-         \x20   --ink-secondary: #c3c2b7;\n    --ink-muted: #898781;\n    --grid: #2c2c2a;\n\
-         \x20   --axis: #383835;\n    --border: rgba(255, 255, 255, 0.10);\n",
+    css
+}
+
+/// The dark palette, stepped for the dark surface rather than flipped.
+fn dark_tokens(levels: usize) -> String {
+    let mut css = String::from(
+        "  color-scheme: dark;\n  --surface: #1a1a19;\n  --plane: #0d0d0d;\n\
+         \x20 --ink: #ffffff;\n  --ink-secondary: #c3c2b7;\n  --ink-muted: #898781;\n\
+         \x20 --grid: #2c2c2a;\n  --axis: #383835;\n  --border: rgba(255, 255, 255, 0.10);\n",
     );
-    for (index, colour) in dark.iter().enumerate() {
-        let _ = writeln!(css, "    --heat-{index}: {colour};");
+    for (index, colour) in color::ramp(levels, true).iter().enumerate() {
+        let _ = writeln!(css, "  --heat-{index}: {colour};");
     }
     for (index, colour) in color::COVERAGE_DARK.iter().enumerate() {
-        let _ = writeln!(css, "    --cov-{index}: {colour};");
+        let _ = writeln!(css, "  --cov-{index}: {colour};");
     }
-    css.push_str("  }\n}\n");
+    css
+}
+
+fn stylesheet(levels: usize) -> String {
+    let mut css = String::with_capacity(8 * 1024);
+
+    // Light is the base, and the system preference swaps it. This pair drives the page
+    // chrome (the area behind an overscroll, for instance) and is what "Auto" means.
+    let _ = writeln!(css, ":root {{\n{}}}", light_tokens(levels));
+    let _ = writeln!(
+        css,
+        "@media (prefers-color-scheme: dark) {{\n  #{THEME_AUTO_ID}:checked ~ .page {{\n{}  }}\n\
+         \x20 :root {{\n{}  }}\n}}",
+        dark_tokens(levels),
+        dark_tokens(levels)
+    );
+    // An explicit choice overrides both, in either direction: these are more specific than
+    // `:root`, and apply whatever the system setting says.
+    let _ = writeln!(
+        css,
+        "#{THEME_LIGHT_ID}:checked ~ .page {{\n{}}}",
+        light_tokens(levels)
+    );
+    let _ = writeln!(
+        css,
+        "#{THEME_DARK_ID}:checked ~ .page {{\n{}}}",
+        dark_tokens(levels)
+    );
 
     for index in 0..levels {
         let _ = writeln!(
@@ -479,15 +555,71 @@ fn stylesheet(levels: usize) -> String {
 * { box-sizing: border-box; }
 body {
   margin: 0;
-  padding: 2rem clamp(1rem, 4vw, 3rem) 3rem;
   background: var(--plane);
   color: var(--ink);
   font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
   font-size: 15px;
   line-height: 1.5;
 }
+.page {
+  min-height: 100vh;
+  padding: 2rem clamp(1rem, 4vw, 3rem) 3rem;
+  background: var(--plane);
+  color: var(--ink);
+}
+.theme-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+}
 svg.defs { position: absolute; }
 h1 { font-size: 1.35rem; font-weight: 650; margin: 0 0 0.35rem; }
+.heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem 1.5rem;
+}
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+.theme-switch {
+  display: flex;
+  margin: 0;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+}
+.theme-switch label {
+  padding: 0.15rem 0.6rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  color: var(--ink-muted);
+  cursor: pointer;
+  user-select: none;
+}
+.theme-switch label:hover { color: var(--ink); }
+#pv-theme-auto:checked ~ .page label[for='pv-theme-auto'],
+#pv-theme-light:checked ~ .page label[for='pv-theme-light'],
+#pv-theme-dark:checked ~ .page label[for='pv-theme-dark'] {
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+#pv-theme-auto:focus-visible ~ .page label[for='pv-theme-auto'],
+#pv-theme-light:focus-visible ~ .page label[for='pv-theme-light'],
+#pv-theme-dark:focus-visible ~ .page label[for='pv-theme-dark'] {
+  outline: 2px solid var(--ink-secondary);
+  outline-offset: 1px;
+}
 h2 { font-size: 0.85rem; font-weight: 600; margin: 0 0 0.6rem; color: var(--ink-secondary); }
 .lede { margin: 0; max-width: 68ch; color: var(--ink-secondary); }
 .meta dl {
@@ -626,6 +758,51 @@ mod tests {
         assert!(!html.contains("https://"), "external reference in output");
         assert!(!html.contains("<script"), "the page needs no javascript");
         assert!(!html.contains("<link"), "no external stylesheet");
+    }
+
+    #[test]
+    fn the_theme_switch_offers_auto_light_and_dark() {
+        let html = page(&analysis(Metric::Exceedance), &options());
+
+        assert_eq!(html.matches("name=\"pv-theme\"").count(), 3);
+        assert!(
+            html.contains("id=\"pv-theme-auto\" checked"),
+            "auto is the default"
+        );
+        assert!(html.contains(">Light</label>"));
+        assert!(html.contains(">Dark</label>"));
+        assert!(html.contains("Colour theme"), "the group is labelled");
+        assert_eq!(html.matches("<label for=\"pv-theme-").count(), 3);
+        // Still no script: the switch is the stylesheet reacting to a checked radio.
+        assert!(!html.contains("<script"));
+    }
+
+    #[test]
+    fn an_explicit_choice_beats_the_system_setting_in_both_directions() {
+        let html = page(&analysis(Metric::Exceedance), &options());
+
+        // The system setting only decides while "Auto" is selected ...
+        assert!(
+            html.contains("#pv-theme-auto:checked ~ .page"),
+            "the system rule must be scoped to the auto choice"
+        );
+        // ... and either explicit choice overrides it, in both directions.
+        assert!(html.contains("#pv-theme-light:checked ~ .page"));
+        assert!(html.contains("#pv-theme-dark:checked ~ .page"));
+        assert!(
+            !html.contains(":has("),
+            "the switch must not depend on :has(), which is too new to rely on"
+        );
+    }
+
+    #[test]
+    fn the_radios_come_before_the_page_they_style() {
+        // A sibling selector only reaches forwards, so the inputs have to be first.
+        let html = page(&analysis(Metric::Exceedance), &options());
+        let first_input = html.find("class=\"theme-input\"").expect("the radios");
+        let wrapper = html.find("<div class=\"page\">").expect("the wrapper");
+        assert!(first_input < wrapper, "the radios must precede .page");
+        assert!(html.contains("</div>\n</body>"), "the wrapper is closed");
     }
 
     #[test]

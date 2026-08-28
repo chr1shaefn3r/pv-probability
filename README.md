@@ -16,8 +16,9 @@ and the height at which the colour fades is roughly the load you can start at th
 ![Monthly likelihood heatmaps, light theme](docs/example-light.png)
 
 The report is one self-contained HTML file: no JavaScript, no web fonts, no network
-access. It follows your system's light/dark setting, has hover tooltips on every cell, and
-carries a table view of the same numbers under each plot.
+access. It follows your system's light/dark setting - with an Auto / Light / Dark switch in
+the header to override it - has hover tooltips on every cell, and carries a table view of
+the same numbers under each plot.
 
 ![The same report in the dark theme](docs/example-dark.png)
 
