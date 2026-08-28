@@ -666,6 +666,15 @@ h2 { font-size: 0.85rem; font-weight: 600; margin: 0 0 0.6rem; color: var(--ink-
 .facet-plot .grid line { stroke: var(--grid); stroke-width: 1; }
 .facet-plot .axis line { stroke: var(--axis); stroke-width: 1; }
 .facet-plot .tick { fill: var(--ink-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.facet-plot .readout {
+  display: none;
+  fill: var(--ink);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+.facet-plot .cell:hover .readout { display: block; }
+.facet-plot .cell:hover rect { stroke: var(--ink); stroke-width: 1; paint-order: stroke; }
 .facet-plot .axis-title { fill: var(--ink-muted); font-size: 10px; }
 .facet-plot .no-data { stroke: none; opacity: 0.4; }
 .facet-plot .thin-data { stroke: none; opacity: 0.9; }
@@ -748,6 +757,23 @@ mod tests {
         assert_eq!(html.matches("<table>").count(), 1);
         assert!(html.contains("June as a table"));
         assert!(html.contains("<figcaption>"));
+    }
+
+    #[test]
+    fn hovering_a_cell_is_what_reveals_its_readout() {
+        let html = page(&analysis(Metric::Exceedance), &options());
+        assert!(
+            html.contains(".facet-plot .readout {"),
+            "the readout is styled"
+        );
+        assert!(
+            html.contains("display: none"),
+            "readouts start hidden: {html:.0}"
+        );
+        assert!(
+            html.contains(".facet-plot .cell:hover .readout { display: block; }"),
+            "a plain :hover rule reveals it - no script, and no reliance on <title>"
+        );
     }
 
     #[test]

@@ -18,7 +18,10 @@ const CELL_WIDTH: f64 = 20.0;
 const PLOT_HEIGHT: f64 = 260.0;
 const MARGIN_LEFT: f64 = 46.0;
 const MARGIN_RIGHT: f64 = 8.0;
-const MARGIN_TOP: f64 = 10.0;
+/// Room above the plot for the hover readout, which needs a line of its own.
+const MARGIN_TOP: f64 = 24.0;
+/// Baseline of that readout line.
+const READOUT_BASELINE: f64 = 14.0;
 const MARGIN_BOTTOM: f64 = 54.0;
 const PLOT_WIDTH: f64 = CELL_WIDTH * HOURS_PER_DAY as f64;
 /// Gap between the plot's baseline and the coverage strip. Wide enough that the strip's
@@ -51,6 +54,25 @@ impl SvgOptions {
             Metric::Density => 0,
         }
     }
+}
+
+/// Wrap a mark so that hovering it reveals its description above the plot.
+///
+/// Native SVG `<title>` tooltips cannot be relied on: WebKit has never shown them, and in
+/// Firefox an `svg` carrying `role="img"` hides its subtree from that machinery. So the
+/// description is also drawn as a line of text in the margin above the plot, revealed by
+/// a plain `:hover` rule - which every engine has supported for as long as it has
+/// supported SVG at all. The `<title>` stays for assistive technology and for the
+/// browsers that do show it.
+///
+/// Reading out above the plot rather than following the cursor is deliberate: it never
+/// covers the cells being compared, and it cannot be clipped by the edge of the facet.
+fn hoverable(mark: &str, description: &str) -> String {
+    format!(
+        "<g class=\"cell\">{mark}<text class=\"readout\" x=\"{MARGIN_LEFT:.1}\" \
+         y=\"{READOUT_BASELINE:.1}\">{}</text></g>",
+        escape(description)
+    )
 }
 
 /// A vertical run of buckets that share a colour level.
@@ -206,26 +228,27 @@ pub fn facet_svg(facet: &Facet, buckets: &BucketSpec, options: &SvgOptions) -> S
                     ),
                 ),
             };
-            let _ = write!(
-                svg,
+            let mark = format!(
                 "<rect class=\"{class}\" x=\"{x:.1}\" y=\"{MARGIN_TOP:.1}\" \
                  width=\"{CELL_WIDTH:.1}\" height=\"{PLOT_HEIGHT:.1}\" \
                  fill=\"url(#{NO_DATA_PATTERN_ID})\"><title>{}</title></rect>",
                 escape(&note)
             );
+            svg.push_str(&hoverable(&mark, &note));
             continue;
         }
 
         for run in runs(&column.values, first_bucket, options) {
             let y = MARGIN_TOP + PLOT_HEIGHT - (run.end + 1 - first_bucket) as f64 * cell_height;
             let height = (run.end - run.start + 1) as f64 * cell_height;
-            let _ = write!(
-                svg,
+            let note = run_title(facet, buckets, hour, &run, options.metric);
+            let mark = format!(
                 "<rect class=\"c{}\" x=\"{x:.1}\" y=\"{y:.2}\" width=\"{CELL_WIDTH:.1}\" \
                  height=\"{height:.2}\"><title>{}</title></rect>",
                 run.level,
-                escape(&run_title(facet, buckets, hour, &run, options.metric))
+                escape(&note)
             );
+            svg.push_str(&hoverable(&mark, &note));
         }
     }
     svg.push_str("</g>");
@@ -301,12 +324,12 @@ fn coverage_strip(facet: &Facet) -> String {
                 facet.label, column.days
             )
         };
-        let _ = write!(
-            svg,
+        let mark = format!(
             "<rect class=\"{class}\" x=\"{x:.1}\" y=\"{top:.1}\" width=\"{CELL_WIDTH:.1}\" \
              height=\"{STRIP_HEIGHT:.1}\"><title>{}</title></rect>",
             escape(&note)
         );
+        svg.push_str(&hoverable(&mark, &note));
     }
     svg.push_str("</g>");
     svg
@@ -542,6 +565,48 @@ mod tests {
         assert!(
             !svg.contains("thin-data"),
             "an unrecorded hour is not a thin one"
+        );
+    }
+
+    #[test]
+    fn every_mark_carries_a_readout_as_well_as_a_title() {
+        // Native SVG `<title>` tooltips are not shown at all by WebKit, so the text has to
+        // exist as a drawable element too.
+        let buckets = BucketSpec::new(50.0, 200.0).unwrap();
+        let facet = facet_from(vec![vec![1.0, 0.8, 0.4, 0.1, 0.0]; 24], true);
+        let svg = facet_svg(&facet, &buckets, &options());
+
+        let readouts = svg.matches("class=\"readout\"").count();
+        let titles = svg.matches("<title>").count();
+        assert_eq!(readouts, titles, "one readout per describable mark");
+        assert!(
+            readouts > HOURS_PER_DAY,
+            "cells and strip alike: {readouts}"
+        );
+        assert_eq!(
+            svg.matches("<g class=\"cell\">").count(),
+            readouts,
+            "each readout is grouped with the mark that reveals it"
+        );
+        assert!(
+            svg.contains(">June 00:00"),
+            "the text is drawable, not just a title"
+        );
+    }
+
+    #[test]
+    fn the_readout_sits_above_the_plot_where_nothing_can_cover_it() {
+        let buckets = BucketSpec::new(50.0, 200.0).unwrap();
+        let facet = facet_from(vec![vec![1.0, 0.8, 0.4, 0.1, 0.0]; 24], true);
+        let svg = facet_svg(&facet, &buckets, &options());
+
+        assert!(
+            READOUT_BASELINE < MARGIN_TOP,
+            "the band must clear the plot"
+        );
+        assert!(
+            svg.contains(&format!("y=\"{READOUT_BASELINE:.1}\"")),
+            "readouts are drawn on their own line"
         );
     }
 

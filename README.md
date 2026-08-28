@@ -17,8 +17,8 @@ and the height at which the colour fades is roughly the load you can start at th
 
 The report is one self-contained HTML file: no JavaScript, no web fonts, no network
 access. It follows your system's light/dark setting - with an Auto / Light / Dark switch in
-the header to override it - has hover tooltips on every cell, and carries a table view of
-the same numbers under each plot.
+the header to override it - reads out the exact figure above the plot as you hover a cell,
+and carries a table view of the same numbers under each plot.
 
 ![The same report in the dark theme](docs/example-dark.png)
 
