@@ -82,11 +82,10 @@ pub fn page(analysis: &Analysis, options: &PageOptions) -> String {
     );
 
     html.push_str(&metadata_list(analysis, options));
-    if let Some(coverage) = &options.coverage {
-        html.push_str(&coverage_section(coverage, analysis, options.tz));
-    }
-    html.push_str(&legend(analysis, options));
 
+    // The plots come first: they are what the report is for. The key and the caveats
+    // about the history follow, where they are still to hand without standing in front of
+    // the data.
     if analysis.facets.is_empty() {
         html.push_str(
             "<p class=\"empty\">No readings matched the selected entity and date range, \
@@ -98,6 +97,11 @@ pub fn page(analysis: &Analysis, options: &PageOptions) -> String {
             html.push_str(&facet);
         }
         html.push_str("</main>");
+    }
+
+    html.push_str(&legend(analysis, options));
+    if let Some(coverage) = &options.coverage {
+        html.push_str(&coverage_section(coverage, analysis, options.tz));
     }
 
     html.push_str(&footer(analysis));
@@ -154,12 +158,14 @@ fn lede(analysis: &Analysis) -> String {
     match analysis.metric {
         Metric::Exceedance => format!(
             "Each cell is the share of observed time at that hour with at least that much \
-             power available, per {}. Darker red means more likely.",
+             power available, per {}. Darker red means more likely; the full scale, and \
+             what the hatching means, are below the plots.",
             analysis.grouping
         ),
         Metric::Density => format!(
             "Each cell is the share of observed time at that hour spent inside that power \
-             band, per {}. Darker red means more likely.",
+             band, per {}. Darker red means more likely; the full scale, and what the \
+             hatching means, are below the plots.",
             analysis.grouping
         ),
     }
@@ -336,10 +342,10 @@ fn coverage_section(coverage: &Coverage, analysis: &Analysis, tz: Tz) -> String 
     if coverage.needs_caution() {
         let _ = write!(
             html,
-            "<p>Every percentage below is conditional on the time that was actually \
-             recorded: a sunny week the recorder missed is not represented at all. The \
-             strip under each plot shows how many days back each hour, and hours backed by \
-             fewer than {} days are hatched rather than coloured.</p>",
+            "<p>Every percentage in the plots above is conditional on the time that was \
+             actually recorded: a sunny week the recorder missed is not represented at \
+             all. The strip under each plot shows how many days back each hour, and hours \
+             backed by fewer than {} days are hatched rather than coloured.</p>",
             analysis.min_days
         );
     }
@@ -729,6 +735,20 @@ mod tests {
         analyse(&grid, metric, 1, &[])
     }
 
+    /// The same options, plus a History block, so the order test sees every section.
+    fn options_with_coverage() -> PageOptions {
+        let samples: Vec<Sample> = (0..24)
+            .map(|hour| {
+                let start = 1_718_928_000 + hour * 3_600;
+                Sample::new(start, start + 3_600, 500.0)
+            })
+            .collect();
+        PageOptions {
+            coverage: Coverage::describe(&samples, 1, 1, &[5], Grouping::Month, UTC, 24 * 3_600),
+            ..options()
+        }
+    }
+
     fn options() -> PageOptions {
         PageOptions {
             entity: "sensor.solar_power".to_string(),
@@ -818,6 +838,32 @@ mod tests {
         assert!(
             !html.contains(":has("),
             "the switch must not depend on :has(), which is too new to rely on"
+        );
+    }
+
+    #[test]
+    fn the_plots_come_before_the_key_and_the_caveats() {
+        let html = page(&analysis(Metric::Exceedance), &options_with_coverage());
+        let at = |needle: &str| {
+            html.find(needle)
+                .unwrap_or_else(|| panic!("missing {needle}"))
+        };
+
+        assert!(
+            at("class=\"meta\"") < at("class=\"facets\""),
+            "the plots follow the header"
+        );
+        assert!(
+            at("class=\"facets\"") < at("class=\"legend\""),
+            "the key follows the plots"
+        );
+        assert!(
+            at("class=\"legend\"") < at("class=\"coverage-summary\""),
+            "the history is last"
+        );
+        assert!(
+            at("class=\"coverage-summary\"") < at("class=\"page-footer\""),
+            "the footer stays at the bottom"
         );
     }
 

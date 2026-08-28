@@ -23,9 +23,9 @@ and carries a table view of the same numbers under each plot.
 ![The same report in the dark theme](docs/example-dark.png)
 
 *(The screenshots come from the synthetic `spotty` demo database described below - five
-months of history with outages in it - not from real production data. The "History" block
-and the grey strip under each plot are what that partial history looks like; see
-[Partial history and outages](#partial-history-and-outages).)*
+months of history with outages in it - not from real production data. The grey strip under
+each plot and the "History" block at the foot of the page are what that partial history
+looks like; see [Partial history and outages](#partial-history-and-outages).)*
 
 ## Quick start
 

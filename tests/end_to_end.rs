@@ -492,6 +492,10 @@ fn the_report_tells_the_reader_what_is_missing() {
         "the partial-history caution is shown"
     );
     assert!(html.contains("conditional on the time that was actually recorded"));
+    // The plots come before the key and the history that qualify them.
+    let at = |needle: &str| html.find(needle).expect("section present");
+    assert!(at("class=\"facets\"") < at("class=\"legend\""));
+    assert!(at("class=\"legend\"") < at("class=\"coverage-summary\""));
     // One coverage strip cell per hour of every facet.
     assert_eq!(
         html.matches("<rect class=\"cov").count(),
