@@ -22,6 +22,8 @@ const MARGIN_RIGHT: f64 = 8.0;
 const MARGIN_TOP: f64 = 24.0;
 /// Baseline of that readout line.
 const READOUT_BASELINE: f64 = 14.0;
+// The readout has to clear the plot, or a cell could cover the text describing it.
+const _: () = assert!(READOUT_BASELINE < MARGIN_TOP);
 const MARGIN_BOTTOM: f64 = 54.0;
 const PLOT_WIDTH: f64 = CELL_WIDTH * HOURS_PER_DAY as f64;
 /// Gap between the plot's baseline and the coverage strip. Wide enough that the strip's
@@ -600,10 +602,6 @@ mod tests {
         let facet = facet_from(vec![vec![1.0, 0.8, 0.4, 0.1, 0.0]; 24], true);
         let svg = facet_svg(&facet, &buckets, &options());
 
-        assert!(
-            READOUT_BASELINE < MARGIN_TOP,
-            "the band must clear the plot"
-        );
         assert!(
             svg.contains(&format!("y=\"{READOUT_BASELINE:.1}\"")),
             "readouts are drawn on their own line"
