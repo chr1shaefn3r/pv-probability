@@ -12,6 +12,10 @@ use crate::timeutil::parse_ha_datetime;
 /// Entity used throughout the tests.
 pub const ENTITY: &str = "sensor.solar_power";
 
+/// The grid sensors the payback tool reads, as a real installation would name them.
+pub const IMPORT_ENTITY: &str = "sensor.grid_import_power";
+pub const EXPORT_ENTITY: &str = "sensor.grid_export_power";
+
 const MODERN_SCHEMA: &str = "
 CREATE TABLE statistics_meta (
     id INTEGER PRIMARY KEY,
@@ -484,6 +488,86 @@ pub fn insert_synthetic_history(
     metadata_id
 }
 
+/// A synthetic household load in watts: a base load with a morning and an evening peak.
+///
+/// Real consumption peaks when the sun is low, which is exactly why a battery is worth
+/// anything - the surplus at noon and the demand at seven o'clock never meet.
+pub fn synthetic_load_watts(ts: i64, rng: &mut Lcg) -> f64 {
+    const SECONDS_PER_DAY: f64 = 86_400.0;
+    let hour = (ts as f64 % SECONDS_PER_DAY) / 3_600.0;
+    let peak = |centre: f64, width: f64, height: f64| {
+        let distance = (hour - centre) / width;
+        height * (-distance * distance).exp()
+    };
+    let base = 250.0 + 120.0 * rng.next_unit();
+    let cooking = if rng.next_unit() < 0.12 { 2_000.0 } else { 0.0 };
+    base + peak(7.5, 1.1, 1_400.0) + peak(19.0, 1.8, 2_200.0) + cooking
+}
+
+/// Write the two grid power sensors a payback report needs, and return their
+/// `metadata_id`s as `(import, export)`.
+///
+/// The house runs [`synthetic_load_watts`] against the same solar curve the other
+/// sensors use, and whichever way the meter turns in a ten minute slot becomes import or
+/// export - so both can appear inside the same hour, which is what a battery lives on.
+pub fn insert_synthetic_grid_power(
+    conn: &Connection,
+    start_ts: i64,
+    days: i64,
+    seed: u64,
+    outages: &Outages,
+) -> (i64, i64) {
+    let import_id = insert_statistic_meta(conn, IMPORT_ENTITY, Some("W"));
+    let export_id = insert_statistic_meta(conn, EXPORT_ENTITY, Some("W"));
+    let mut rng = Lcg::new(seed);
+    conn.execute_batch("BEGIN").expect("begin transaction");
+    for day in 0..days {
+        let cloud_factor = if rng.next_unit() < 0.34 {
+            0.15 + 0.35 * rng.next_unit()
+        } else {
+            0.85 + 0.15 * rng.next_unit()
+        };
+        if !outages.covers(day) {
+            continue;
+        }
+        for hour in 0..24 {
+            if !outages.covers_hour(hour) {
+                continue;
+            }
+            let start = start_ts + day * 86_400 + hour * 3_600;
+            let mut import = 0.0;
+            let mut export = 0.0;
+            for slot in 0..6 {
+                let ts = start + slot * 600;
+                let solar = synthetic_watts(ts, &mut rng, cloud_factor);
+                let load = synthetic_load_watts(ts, &mut rng);
+                import += (load - solar).max(0.0) / 6.0;
+                export += (solar - load).max(0.0) / 6.0;
+            }
+            for (metadata_id, mean) in [(import_id, import), (export_id, export)] {
+                insert_statistics_row(
+                    conn,
+                    Flavour::Modern,
+                    "statistics",
+                    metadata_id,
+                    start,
+                    Some(mean),
+                );
+            }
+        }
+    }
+    conn.execute_batch("COMMIT").expect("commit transaction");
+    (import_id, export_id)
+}
+
+/// A modern-schema database holding `days` days of the two grid power sensors.
+pub fn synthetic_grid_database(start: &str, days: i64, seed: u64, outages: &Outages) -> Connection {
+    let conn = Connection::open_in_memory().expect("open in-memory database");
+    create_schema(&conn, Flavour::Modern);
+    insert_synthetic_grid_power(&conn, ts(start), days, seed, outages);
+    conn
+}
+
 /// Write a cumulative energy counter (kWh) alongside a power sensor, the way a real
 /// integration exposes both, and return its `metadata_id`.
 ///
@@ -554,6 +638,28 @@ pub fn synthetic_history_database(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_synthetic_grid_sensors_import_at_night_and_export_at_noon() {
+        let conn = synthetic_grid_database("2024-06-01 00:00:00", 3, 0xBEEF, &Outages::none());
+        let read = |entity: &str, hour: i64| -> f64 {
+            conn.query_row(
+                "SELECT mean FROM statistics s JOIN statistics_meta m ON m.id = s.metadata_id \
+                 WHERE m.statistic_id = ?1 AND s.start_ts = ?2",
+                rusqlite::params![entity, (ts("2024-06-01 00:00:00") + hour * 3_600) as f64],
+                |row| row.get::<_, f64>(0),
+            )
+            .expect("a row for that hour")
+        };
+
+        assert!(
+            read(IMPORT_ENTITY, 2) > 0.0,
+            "the house draws power at night"
+        );
+        assert_eq!(read(EXPORT_ENTITY, 2), 0.0, "and exports nothing then");
+        assert!(read(EXPORT_ENTITY, 12) > 1_000.0, "midday is a big surplus");
+        assert!(read(IMPORT_ENTITY, 20) > 0.0, "the evening peak is bought");
+    }
 
     #[test]
     fn builds_both_schema_flavours() {

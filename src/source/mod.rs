@@ -237,7 +237,7 @@ pub fn explain_no_samples(
              `{column}`.\n\n\
              Home Assistant writes `sum` and `state` - not `{column}` - for cumulative \
              counters such as an energy total in kWh, because the average of a running \
-             total means nothing. This tool plots instantaneous power, so it needs a \
+             total means nothing. These tools read instantaneous power, so they need a \
              sensor measured in W or kW (`state_class: measurement`).{unit} For an energy \
              counter the matching power sensor is usually the same name with `_power` \
              instead of `_energy`.{hint}",

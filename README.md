@@ -2,6 +2,14 @@
 
 [![CI](https://github.com/chr1shaefn3r/pv-probability/actions/workflows/ci.yml/badge.svg)](https://github.com/chr1shaefn3r/pv-probability/actions/workflows/ci.yml)
 
+Two command line tools that read a copy of your Home Assistant recorder database and
+answer a question about your solar installation as one self-contained HTML report:
+
+| Tool | Question |
+|---|---|
+| **`pv-probability`** | How much power can I count on, hour by hour and month by month? |
+| **[`energy-storage-payback-period`](#energy-storage-payback-period)** | How long would a home battery take to pay for itself? |
+
 Turn a Home Assistant recorder database into "flame graph" heatmaps of how much solar
 power you can actually count on, hour by hour, month by month.
 
@@ -52,12 +60,17 @@ covers 2023-01-01 to 2024-12-31 (731 days): 730 days observed, no outage over 24
 open /home/you/pv-probability.html
 ```
 
-No Home Assistant to hand? Generate a synthetic one, either solid or full of holes:
+No Home Assistant to hand? Generate a synthetic one, either solid or full of holes. It
+carries a solar power sensor, an energy counter and a pair of grid meters, so both tools
+have something to read:
 
 ```sh
 cargo run --release --example demo_database -- demo.db 730 dense
 cargo run --release --example demo_database -- demo.db 165 spotty   # 5 months, outages
-cargo run --release -- --db demo.db --entity sensor.solar_power --tz Europe/Berlin
+cargo run --release --bin pv-probability -- --db demo.db --entity sensor.solar_power \
+  --tz Europe/Berlin
+cargo run --release --bin energy-storage-payback-period -- --db demo.db \
+  --import-entity sensor.grid_import_power --export-entity sensor.grid_export_power
 ```
 
 ## Finding the right entity
@@ -83,7 +96,7 @@ pv-probability --db ha.db --list-entities solar    # only ids containing "solar"
 ```
 
 ```
-Power sensors this tool can plot:
+Power sensors these tools can read:
   sensor.solar_power   W     3408 rows  2023-01-01 to 2023-06-15
 
 Energy counters (cumulative totals - not plottable, see the README):
@@ -237,7 +250,7 @@ The line printed after a run carries the overall figure too.
   the months clear the bar at different hours, the pooled window can be empty while no
   single month is. The block explains that where it happens.
 
-## Options
+## Options (pv-probability)
 
 ```
 pv-probability --db <FILE> --entity <ENTITY_ID> [OPTIONS]
@@ -294,6 +307,106 @@ pv-probability --db ha.db --entity sensor.solar_power \
   --reliable-watts 500 --reliable-probability 0.9
 ```
 
+## energy-storage-payback-period
+
+The same database usually holds two more sensors: the **power drawn from the grid** and
+the **power fed back into it**. Everything fed back is given away; everything drawn is
+paid for. A battery turns the first into the second - it stores the midday surplus and
+returns it in the evening - so its worth is simply the grid import it avoids.
+
+```sh
+energy-storage-payback-period --db ha.db \
+  --import-entity sensor.grid_import_power \
+  --export-entity sensor.grid_export_power \
+  --tz Europe/Berlin --price-per-kwh 0.35
+```
+
+```
+wrote energy-storage-payback-period.html: 20 sizes over 17520 slots of 60 minutes, 23 kB, 37.0ms
+measured 17.97 MWh imported and 4.32 MWh exported
+best payback: 3 kWh for 3,000 EUR saves 257 EUR a year - paid off in 11.7 years
+covers 2023-01-01 to 2024-12-31 (731 days): 731 days paired (730 of them full days), 0 outages over 24 h
+
+open /home/you/energy-storage-payback-period.html
+```
+
+The report charts annual savings and payback period against battery size, names the size
+that pays back fastest and the point where further capacity stops earning its keep, and
+shows what the answer becomes at other electricity prices and other quotes.
+
+![Annual savings and payback period by battery size](docs/payback-example.png)
+
+*(From the same synthetic demo database, so the prices and the array are made up - but the
+arithmetic and the simulation are the real ones.)*
+
+**Both sensors must be power sensors in watts** - the same kind the heatmap tool plots.
+A kilowatt-hour counter has no `mean` for the recorder to store, and passing one gets the
+same diagnosis the heatmap tool gives, naming the `_power` sensor beside it.
+`--list-entities` prints what the database holds, power sensors first.
+
+### How the simulation works
+
+* Each sensor is integrated into energy per slot (`--slot-minutes`, hourly by default,
+  which is as fine as a full year of statistics gets). A reading of *w* watts in effect for
+  *s* seconds is `w * s / 3 600 000` kWh, so an hourly mean and a chatty `states` history
+  give the same answer.
+* Only slots **both** sensors really covered are simulated (`--min-slot-coverage`); the
+  rest are counted and reported. A battery cannot be sized against a surplus nobody
+  recorded.
+* Each slot serves the import first and charges from what is left of the export
+  afterwards, respecting `--usable-fraction`, `--round-trip` and the optional
+  `--max-charge-kw` / `--max-discharge-kw`. Import and export inside one slot are *not*
+  netted off: had they been simultaneous the house would never have imported at all.
+* Savings are `avoided import x --price-per-kwh`, less `--feed-in-price` for the export the
+  battery swallowed - zero by default, because the export is gifted.
+* Payback is `(--base-cost + --cost-per-kwh x capacity) / annual savings`. No price
+  escalation, no degradation, no discount rate: the sensitivity block shows what moving the
+  price or the quote does instead.
+* A history shorter than a year is scaled up to one **and** flagged. A summer-heavy
+  history flatters a battery; a winter-heavy one does the opposite.
+* These sensors show what crossed the meter, not what the house used or the roof made, so
+  the report says *grid import avoided* and never claims a self-sufficiency figure.
+
+### Options
+
+| Option | Default | What it does |
+|---|---|---|
+| `--db <FILE>` | required | Copy of `home-assistant_v2.db`, opened read-only |
+| `--import-entity <ID>` | required | Power sensor for energy drawn from the grid |
+| `--export-entity <ID>` | required | Power sensor for energy fed back |
+| `--list-entities [FILTER]` | off | List what the database holds and exit |
+| `--price-per-kwh <P>` | `0.35` | What a kilowatt hour from the grid costs |
+| `--feed-in-price <P>` | `0` | What a kilowatt hour fed back earns |
+| `--cost-per-kwh <C>` | `500` | Installed battery cost per kWh of capacity |
+| `--base-cost <C>` | `1500` | The part of the bill that does not scale with capacity |
+| `--currency <SYMBOL>` | `EUR` | Currency symbol used in the report |
+| `--min-size` / `--max-size` / `--size-step` | `1` / `20` / `1` | The sizes to try, in kWh |
+| `--sizes <LIST>` | off | Exact sizes instead of the range, e.g. `5,10,13.5` |
+| `--round-trip <F>` | `0.9` | Round trip efficiency, charged half on each side |
+| `--usable-fraction <F>` | `0.9` | Share of the nameplate actually cycled |
+| `--max-charge-kw` / `--max-discharge-kw` | unlimited | Inverter power ceilings |
+| `--slot-minutes <M>` | `60` | Simulation slot length; must divide an hour |
+| `--min-slot-coverage <F>` | `0.9` | How much of a slot both sensors must have covered |
+| `--sensitivity <PCT>` | `25` | How far either side the sensitivity grid looks |
+| `--source` / `--stat` / `--scale` / `--max-gap` | as above | Shared with `pv-probability` |
+| `--tz` / `--from` / `--to` | as above | Timezone and date window |
+| `--gap-threshold-hours <H>` | `24` | Outages at least this long are reported |
+| `--threads <N>` | one per core | Cap the rayon worker threads |
+| `-o, --out <FILE>` | `energy-storage-payback-period.html` | Where to write the report |
+| `-v` | off | Print row counts, thread count and timings |
+
+```sh
+# Real quotes for the two sizes actually on offer, at next year's price
+energy-storage-payback-period --db ha.db \
+  --import-entity sensor.grid_import_power --export-entity sensor.grid_export_power \
+  --sizes 6.5,13 --base-cost 2200 --cost-per-kwh 430 --price-per-kwh 0.42
+
+# How much does hourly resolution flatter the battery? Check against the last ten days
+energy-storage-payback-period --db ha.db \
+  --import-entity sensor.grid_import_power --export-entity sensor.grid_export_power \
+  --source short-term --slot-minutes 5
+```
+
 ## Performance
 
 Reading is single-threaded (SQLite), everything after it is parallel: samples are folded
@@ -304,17 +417,25 @@ and render in under 10 ms on a laptop core; the work scales linearly, so even a
 five-minute-resolution decade stays interactive. `--threads` caps the pool if you want to
 leave cores free.
 
+The payback tool reads its two sensors on two connections at once, folds each into slots
+with the same `par_chunks` + `reduce` shape, and then simulates every battery size in
+parallel. A battery's state of charge makes one simulation inherently sequential, so the
+sizes are the unit of parallelism: 391 sizes over two years of hourly slots take 48 ms on
+four cores against 186 ms on one, so a sweep as fine as `--size-step 0.1` costs no more
+wall-clock time than a coarse one until it runs out of cores.
+
 ## Development
 
 ```sh
-cargo test                                        # 195+ unit and integration tests
+cargo test                                        # 290+ unit and integration tests
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all
 ```
 
 The test suite never touches a real Home Assistant: `src/source/testdb.rs` builds
 synthetic recorder databases in both schema generations, including a reproducible
-synthetic solar year - with or without outages - used by `tests/end_to_end.rs`. GitHub Actions runs formatting, clippy
+synthetic solar year - with or without outages - used by `tests/end_to_end.rs` and
+`tests/payback.rs`. GitHub Actions runs formatting, clippy
 and the whole suite on every push to `main` and on every pull request
 (`.github/workflows/ci.yml`).
 
@@ -322,13 +443,15 @@ Layout:
 
 | Path | Contents |
 |---|---|
-| `src/cli.rs` | Command line surface and validation |
+| `src/cli.rs` | Command line surface and validation (`src/storage/cli.rs` for the other tool) |
 | `src/timeutil.rs` | Timezone resolution, DST-safe hour splitting |
 | `src/model.rs` | `Sample`, `BucketSpec`, the additive `Grid` |
 | `src/source/` | Schema probing, the statistics / states readers, the entity catalogue |
 | `src/aggregate.rs` | Parallel folding, exceedance and density |
 | `src/coverage.rs` | Outage detection and what the history really covers |
-| `src/render/` | Colour scale, per-facet SVG, the HTML page |
+| `src/storage/` | Slot energy accounting, the battery simulation and the size sweep |
+| `src/render/` | Colour scale, per-facet SVG, the shared page shell, both reports |
+| `src/bin/energy-storage-payback-period.rs` | The payback tool's entry point |
 | `examples/demo_database.rs` | Writes a synthetic recorder database |
 
 ## Colour scale

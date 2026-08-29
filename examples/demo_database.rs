@@ -5,6 +5,8 @@
 //! cargo run --release --example demo_database -- demo.db 730 dense
 //! cargo run --release --example demo_database -- demo.db 200 spotty
 //! cargo run --release -- --db demo.db --entity sensor.solar_power --tz Europe/Berlin
+//! cargo run --release --bin energy-storage-payback-period -- --db demo.db \
+//!     --import-entity sensor.grid_import_power --export-entity sensor.grid_export_power
 //! ```
 
 use std::path::PathBuf;
@@ -49,11 +51,16 @@ fn main() -> Result<()> {
         &outages,
     );
 
+    // The grid meter the payback tool reads: a household load against the same array.
+    testdb::insert_synthetic_grid_power(&conn, start, days, 0xC0FFEE, &outages);
+
     println!(
-        "wrote {} with {} of {days} days of hourly statistics for {ENTITY} \
-         (and a cumulative sensor.solar_energy counter beside it)",
+        "wrote {} with {} of {days} days of hourly statistics for {ENTITY}, \
+         {} and {} (and a cumulative sensor.solar_energy counter beside them)",
         path.display(),
-        outages.covered_days(days)
+        outages.covered_days(days),
+        testdb::IMPORT_ENTITY,
+        testdb::EXPORT_ENTITY
     );
     Ok(())
 }

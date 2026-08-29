@@ -68,7 +68,7 @@ pub struct Candidate {
 }
 
 impl Candidate {
-    /// Whether this is a power sensor this tool can plot straight away.
+    /// Whether this is a power sensor either tool can read straight away.
     pub fn is_plottable(&self) -> bool {
         self.kind.has_mean() && self.is_power_unit() && self.rows > 0
     }
@@ -352,7 +352,7 @@ pub fn format_listing(candidates: &[Candidate], tz: Tz, limit: usize) -> String 
         .collect();
 
     let mut out = String::new();
-    out.push_str("Power sensors this tool can plot:\n");
+    out.push_str("Power sensors these tools can read:\n");
     out.push_str(&format_candidates(&plottable, tz, limit));
     if !energy.is_empty() {
         out.push_str("\nEnergy counters (cumulative totals - not plottable, see the README):\n");
@@ -587,7 +587,7 @@ mod tests {
     #[test]
     fn the_listing_separates_power_from_counters() {
         let listing = format_listing(&list_statistics(&database(), None).unwrap(), UTC, 20);
-        assert!(listing.contains("Power sensors this tool can plot:"));
+        assert!(listing.contains("Power sensors these tools can read:"));
         assert!(listing.contains("Energy counters"));
         assert!(listing.contains("Other statistics:"));
 

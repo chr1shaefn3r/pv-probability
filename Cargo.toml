@@ -11,6 +11,14 @@ readme = "README.md"
 keywords = ["solar", "photovoltaic", "home-assistant", "statistics", "visualization"]
 categories = ["command-line-utilities", "visualization"]
 
+[[bin]]
+name = "pv-probability"
+path = "src/main.rs"
+
+[[bin]]
+name = "energy-storage-payback-period"
+path = "src/bin/energy-storage-payback-period.rs"
+
 [dependencies]
 anyhow = "1.0"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }

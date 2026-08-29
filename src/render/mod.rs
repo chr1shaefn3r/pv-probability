@@ -2,9 +2,12 @@
 
 pub mod color;
 pub mod html;
+pub mod layout;
+pub mod payback;
 pub mod svg;
 
 pub use html::{PageOptions, describe_window, page};
+pub use payback::{PaybackOptions, page as payback_page};
 
 /// Escape text for inclusion in HTML or SVG markup.
 pub fn escape(text: &str) -> String {
@@ -45,6 +48,69 @@ pub fn format_percent(probability: f64) -> String {
         format!("{}%", trim_zeros(&format!("{percent:.1}")))
     } else {
         format!("{}%", trim_zeros(&format!("{percent:.2}")))
+    }
+}
+
+/// Format an amount of energy for a label: `4.2 kWh`, `420 kWh`, `3.7 MWh`.
+pub fn format_kwh(kwh: f64) -> String {
+    if !kwh.is_finite() {
+        return "-".to_string();
+    }
+    if kwh.abs() < 10.0 {
+        return format!("{} kWh", trim_zeros(&format!("{kwh:.2}")));
+    }
+    if kwh.abs() < 1_000.0 {
+        return format!("{} kWh", group_thousands(&format!("{kwh:.0}")));
+    }
+    format!("{} MWh", trim_zeros(&format!("{:.2}", kwh / 1_000.0)))
+}
+
+/// Format money for a label: `0.35 EUR`, `650 EUR`, `6,500 EUR`.
+///
+/// The symbol follows the number, which is how most of Europe writes it and reads
+/// tolerably everywhere else.
+pub fn format_money(amount: f64, currency: &str) -> String {
+    if !amount.is_finite() {
+        return format!("- {currency}");
+    }
+    let number = if amount.abs() < 10.0 {
+        trim_zeros(&format!("{amount:.2}"))
+    } else {
+        group_thousands(&format!("{amount:.0}"))
+    };
+    format!("{number} {currency}")
+}
+
+/// Format a payback period: `8.4 years`, or what it means when there is not one.
+pub fn format_years(years: Option<f64>) -> String {
+    match years {
+        None => "never".to_string(),
+        Some(years) if !years.is_finite() || years >= 100.0 => "over 100 years".to_string(),
+        Some(years) if years < 1.0 => {
+            format!("{} months", trim_zeros(&format!("{:.1}", years * 12.0)))
+        }
+        Some(years) => format!("{} years", trim_zeros(&format!("{years:.1}"))),
+    }
+}
+
+/// Group the integer part of a formatted number in threes: `6500` becomes `6,500`.
+fn group_thousands(text: &str) -> String {
+    let (sign, digits) = match text.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", text),
+    };
+    let (integer, rest) = digits.split_once('.').unwrap_or((digits, ""));
+    let mut grouped = String::with_capacity(integer.len() + integer.len() / 3);
+    for (index, character) in integer.chars().enumerate() {
+        if index > 0 && (integer.len() - index) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(character);
+    }
+    if rest.is_empty() {
+        format!("{sign}{grouped}")
+    } else {
+        format!("{sign}{grouped}.{rest}")
     }
 }
 
@@ -104,6 +170,36 @@ mod tests {
         assert_eq!(format_percent(0.0045), "0.45%");
         assert_eq!(format_percent(0.0), "0%");
         assert_eq!(format_percent(f64::INFINITY), "-");
+    }
+
+    #[test]
+    fn formats_energy_readably() {
+        assert_eq!(format_kwh(0.0), "0 kWh");
+        assert_eq!(format_kwh(4.25), "4.25 kWh");
+        assert_eq!(format_kwh(9.5), "9.5 kWh");
+        assert_eq!(format_kwh(420.0), "420 kWh");
+        assert_eq!(format_kwh(3_700.0), "3.7 MWh");
+        assert_eq!(format_kwh(f64::NAN), "-");
+    }
+
+    #[test]
+    fn formats_money_with_the_currency_after_it() {
+        assert_eq!(format_money(0.35, "EUR"), "0.35 EUR");
+        assert_eq!(format_money(650.0, "EUR"), "650 EUR");
+        assert_eq!(format_money(6_500.0, "EUR"), "6,500 EUR");
+        assert_eq!(format_money(1_234_567.0, "USD"), "1,234,567 USD");
+        assert_eq!(format_money(-250.0, "EUR"), "-250 EUR");
+        assert_eq!(format_money(f64::INFINITY, "EUR"), "- EUR");
+    }
+
+    #[test]
+    fn formats_a_payback_period_including_the_absence_of_one() {
+        assert_eq!(format_years(Some(8.4)), "8.4 years");
+        assert_eq!(format_years(Some(12.0)), "12 years");
+        assert_eq!(format_years(Some(0.5)), "6 months");
+        assert_eq!(format_years(Some(250.0)), "over 100 years");
+        assert_eq!(format_years(Some(f64::INFINITY)), "over 100 years");
+        assert_eq!(format_years(None), "never");
     }
 
     #[test]
