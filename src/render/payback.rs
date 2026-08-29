@@ -13,7 +13,7 @@ use crate::render::layout::{
 use crate::render::svg::nice_ticks;
 use crate::render::{color, escape, format_kwh, format_money, format_percent, format_years};
 use crate::storage::pair::Paired;
-use crate::storage::sweep::{SizeResult, Sweep};
+use crate::storage::sweep::{Budget, SizeResult, Sweep};
 
 /// Everything the page needs beyond the sweep itself.
 #[derive(Debug, Clone, PartialEq)]
@@ -27,6 +27,8 @@ pub struct PaybackOptions {
     /// How far either side of the price and cost the sensitivity grid looks, as a
     /// fraction: 0.25 for a quarter.
     pub sensitivity: f64,
+    /// The payback period the report works backwards from, in years.
+    pub target_payback_years: f64,
 }
 
 impl Default for PaybackOptions {
@@ -38,6 +40,7 @@ impl Default for PaybackOptions {
             coverage: None,
             tz: Tz::UTC,
             sensitivity: 0.25,
+            target_payback_years: 5.0,
         }
     }
 }
@@ -48,8 +51,9 @@ pub fn page(sweep: &Sweep, paired: &Paired, options: &PaybackOptions) -> String 
     let mut body = String::with_capacity(32 * 1024);
 
     body.push_str(&metadata_list(&metadata_entries(sweep, options)));
-    body.push_str(&sweep_section(sweep));
+    body.push_str(&sweep_section(sweep, options));
     body.push_str(&recommendation(sweep));
+    body.push_str(&budget_section(sweep, options));
     body.push_str(&sensitivity_section(sweep, options));
     body.push_str(&measured_section(sweep, paired));
     if let Some(coverage) = &options.coverage {
@@ -118,14 +122,14 @@ fn metadata_entries(sweep: &Sweep, options: &PaybackOptions) -> Vec<(String, Str
 }
 
 /// The chart and the table: every size, what it saves and what it takes to pay for itself.
-fn sweep_section(sweep: &Sweep) -> String {
+fn sweep_section(sweep: &Sweep, options: &PaybackOptions) -> String {
     let mut html = String::from("<section class=\"panel sweep\"><h2>Payback by battery size</h2>");
     if sweep.results.is_empty() {
         html.push_str("<p class=\"empty\">No battery sizes were simulated.</p></section>");
         return html;
     }
-    html.push_str(&sweep_chart(sweep));
-    html.push_str(&sweep_table(sweep));
+    html.push_str(&sweep_chart(sweep, options.target_payback_years));
+    html.push_str(&sweep_table(sweep, options.target_payback_years));
     html.push_str("</section>");
     html
 }
@@ -142,7 +146,7 @@ const PANEL_HEIGHT: f64 = 130.0;
 const PANEL_GAP: f64 = 40.0;
 const MARGIN_BOTTOM: f64 = 42.0;
 
-fn sweep_chart(sweep: &Sweep) -> String {
+fn sweep_chart(sweep: &Sweep, target_years: f64) -> String {
     let count = sweep.results.len();
     let plot_width = BAR_WIDTH * count as f64;
     let width = MARGIN_LEFT + plot_width + MARGIN_RIGHT;
@@ -155,12 +159,13 @@ fn sweep_chart(sweep: &Sweep) -> String {
         .iter()
         .map(|result| result.annual_savings)
         .fold(0.0f64, f64::max);
-    // A single battery that never pays back must not stretch the axis to infinity.
+    // A single battery that never pays back must not stretch the axis to infinity; the
+    // target line has to fit on it, though, or it could not be read against the bars.
     let max_payback = sweep
         .results
         .iter()
         .filter_map(|result| result.payback_years)
-        .fold(0.0f64, f64::max);
+        .fold(target_years.max(0.0), f64::max);
 
     let mut svg = String::with_capacity(8 * 1024);
     let _ = write!(
@@ -251,6 +256,22 @@ fn sweep_chart(sweep: &Sweep) -> String {
     }
     svg.push_str("</g>");
 
+    // The target, drawn over the bars: everything below the line is a battery that pays
+    // for itself in time.
+    if target_years > 0.0 {
+        let y = payback_top + PANEL_HEIGHT - (target_years / payback_span) * PANEL_HEIGHT;
+        let _ = write!(
+            svg,
+            "<g class=\"target\"><line x1=\"{MARGIN_LEFT:.1}\" y1=\"{y:.1}\" x2=\"{:.1}\" \
+             y2=\"{y:.1}\"/><text class=\"target-label\" x=\"{:.1}\" y=\"{:.1}\" \
+             text-anchor=\"end\">{}</text></g>",
+            MARGIN_LEFT + plot_width,
+            MARGIN_LEFT + plot_width,
+            y - 4.0,
+            escape(&format!("target {}", format_years(Some(target_years))))
+        );
+    }
+
     // One x label per size while they fit, otherwise every second or third.
     let every = (count / 12).max(1);
     svg.push_str("<g class=\"axis\">");
@@ -313,21 +334,24 @@ fn trim_capacity(capacity_kwh: f64) -> String {
     text.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
-fn sweep_table(sweep: &Sweep) -> String {
+fn sweep_table(sweep: &Sweep, target_years: f64) -> String {
     let currency = &sweep.economics.currency;
-    let mut html = String::from(
+    let mut html = format!(
         "<div class=\"table-scroll\"><table class=\"sweep-table\"><caption>Every size that \
          was simulated, with the fastest payback highlighted</caption><thead><tr>\
          <th scope=\"col\">Size</th><th scope=\"col\">Investment</th>\
          <th scope=\"col\">Saved per year</th><th scope=\"col\">Import avoided</th>\
          <th scope=\"col\">Cycles per year</th><th scope=\"col\">Payback</th>\
-         <th scope=\"col\">The step up</th></tr></thead><tbody>",
+         <th scope=\"col\">The step up</th>\
+         <th scope=\"col\">Budget for {}</th></tr></thead><tbody>",
+        escape(&format_years(Some(target_years)))
     );
     for (index, result) in sweep.results.iter().enumerate() {
+        let budget = sweep.budget(result, target_years);
         let _ = write!(
             html,
             "<tr{}><th scope=\"row\">{} kWh</th><td>{}</td><td>{}</td><td>{} ({})</td>\
-             <td>{:.0}</td><td>{}</td><td>{}</td></tr>",
+             <td>{:.0}</td><td>{}</td><td>{}</td><td class=\"{}\">{}</td></tr>",
             if sweep.best == Some(index) {
                 " class=\"best\""
             } else {
@@ -342,10 +366,141 @@ fn sweep_table(sweep: &Sweep) -> String {
             escape(&format_percent(result.import_reduction)),
             result.cycles_per_year,
             escape(&format_years(result.payback_years)),
-            escape(&format_years(result.marginal_payback_years))
+            escape(&format_years(result.marginal_payback_years)),
+            if budget.met {
+                "in-budget"
+            } else {
+                "over-budget"
+            },
+            escape(&describe_budget(&budget, currency))
         );
     }
     html.push_str("</tbody></table></div>");
+    html
+}
+
+/// The budget cell: what the installation may cost, and how far that is from the quote.
+fn describe_budget(budget: &Budget, currency: &str) -> String {
+    if budget.investment <= 0.0 {
+        return "no price is low enough".to_string();
+    }
+    match budget.discount {
+        Some(discount) => format!(
+            "{} ({} less)",
+            format_money(budget.investment, currency),
+            format_percent(discount)
+        ),
+        None => format!("{} (met)", format_money(budget.investment, currency)),
+    }
+}
+
+/// How cheap the installation would have to be, which is the payback sum read backwards.
+fn budget_section(sweep: &Sweep, options: &PaybackOptions) -> String {
+    let currency = &sweep.economics.currency;
+    let target = options.target_payback_years;
+    let years = format_years(Some(target));
+
+    let mut html = format!(
+        "<section class=\"panel budget\"><h2>What it would have to cost to pay back in \
+         {}</h2>",
+        escape(&years)
+    );
+
+    let met: Vec<&SizeResult> = sweep
+        .results
+        .iter()
+        .filter(|result| sweep.budget(result, target).met)
+        .collect();
+    let Some(closest) = sweep.closest_to_target() else {
+        let _ = write!(
+            html,
+            "<p>Nothing here saves anything, so no price is low enough: a battery that \
+             never avoids an import cannot pay for itself in {} or in a hundred.</p>\
+             </section>",
+            escape(&years)
+        );
+        return html;
+    };
+    let budget = sweep.budget(closest, target);
+
+    if met.is_empty() {
+        let _ = write!(
+            html,
+            "<p>No size reaches it at today's prices. The nearest is the \
+             <strong>{} kWh</strong> battery, which pays back in {}: to be square within \
+             {}, the whole installation would have to cost <strong>{}</strong> rather than \
+             {}{}.</p>",
+            escape(&trim_capacity(closest.capacity_kwh)),
+            escape(&format_years(closest.payback_years)),
+            escape(&years),
+            escape(&format_money(budget.investment, currency)),
+            escape(&format_money(budget.quoted, currency)),
+            match budget.discount {
+                Some(discount) => format!(" - {} less", format_percent(discount)),
+                None => String::new(),
+            }
+        );
+    } else {
+        let cheapest = met
+            .iter()
+            .min_by(|left, right| left.investment.total_cmp(&right.investment))
+            .expect("a non-empty list has a minimum");
+        let _ = write!(
+            html,
+            "<p><strong>{} of the {} sizes</strong> already pay back within {} at today's \
+             prices, from the {} kWh battery at {} upwards. The fastest is the \
+             <strong>{} kWh</strong> one, at {}.</p>",
+            met.len(),
+            sweep.results.len(),
+            escape(&years),
+            escape(&trim_capacity(cheapest.capacity_kwh)),
+            escape(&format_money(cheapest.investment, currency)),
+            escape(&trim_capacity(closest.capacity_kwh)),
+            escape(&format_years(closest.payback_years))
+        );
+        let _ = write!(
+            html,
+            "<p>The {} kWh battery has room to spare: up to <strong>{}</strong> would still \
+             be square within {}.</p>",
+            escape(&trim_capacity(closest.capacity_kwh)),
+            escape(&format_money(budget.investment, currency)),
+            escape(&years)
+        );
+    }
+
+    match budget.cost_per_kwh {
+        Some(per_kwh) => {
+            let _ = write!(
+                html,
+                "<p>With the {} that does not scale with capacity paid first, that leaves \
+                 <strong>{} per kWh</strong> for the {} kWh itself, against the {} per kWh \
+                 this report was run with.</p>",
+                escape(&format_money(sweep.economics.base_cost, currency)),
+                escape(&format_money(per_kwh, currency)),
+                escape(&trim_capacity(closest.capacity_kwh)),
+                escape(&format_money(sweep.economics.cost_per_kwh, currency))
+            );
+        }
+        None => {
+            let _ = write!(
+                html,
+                "<p>The {} that does not scale with capacity is on its own more than that \
+                 budget, so no cell price - not even zero - would get this size there. Only \
+                 a cheaper installation, a dearer kilowatt hour, or a longer target can.</p>",
+                escape(&format_money(sweep.economics.base_cost, currency))
+            );
+        }
+    }
+
+    let _ = write!(
+        html,
+        "<p class=\"note\">Read backwards from the same sum as everything else: payback is \
+         the installed price divided by what it saves in a year, so the budget for {} is \
+         simply {} times the annual saving. The last column of the table above does this \
+         for every size.</p></section>",
+        escape(&years),
+        escape(&years)
+    );
     html
 }
 
@@ -559,6 +714,16 @@ const PAYBACK_CSS: &str = "
 .sweep-chart .savings { fill: var(--heat-4); }
 .sweep-chart .payback { fill: var(--heat-7); }
 .sweep-chart .never { fill: var(--axis); }
+.sweep-chart .target line { stroke: var(--ink); stroke-width: 1; stroke-dasharray: 4 3; }
+.sweep-chart .target-label {
+  fill: var(--ink);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  /* The line crosses the bars, so the label needs a halo to stay readable over them. */
+  stroke: var(--surface);
+  stroke-width: 3px;
+  paint-order: stroke;
+}
 .sweep-chart .bar.best rect { stroke: var(--ink); stroke-width: 1; paint-order: stroke; }
 .sweep-chart .readout {
   display: none;
@@ -578,6 +743,8 @@ const PAYBACK_CSS: &str = "
 .panel tbody tr:nth-child(even) { background: var(--plane); }
 .panel tbody tr.best { background: var(--heat-0); color: var(--ink); font-weight: 600; }
 .panel tbody tr.best th { color: var(--ink); font-weight: 600; }
+.panel td.in-budget { color: var(--ink); font-weight: 600; }
+.panel td.over-budget { color: var(--ink-muted); }
 .empty { margin-top: 0.5rem; color: var(--ink-secondary); }
 ";
 
@@ -694,7 +861,8 @@ mod tests {
 
         assert!(at("class=\"meta\"") < at("class=\"panel sweep\""));
         assert!(at("class=\"panel sweep\"") < at("class=\"panel recommendation\""));
-        assert!(at("class=\"panel recommendation\"") < at("class=\"panel sensitivity\""));
+        assert!(at("class=\"panel recommendation\"") < at("class=\"panel budget\""));
+        assert!(at("class=\"panel budget\"") < at("class=\"panel sensitivity\""));
         assert!(at("class=\"panel sensitivity\"") < at("class=\"panel measured\""));
         assert!(at("class=\"panel measured\"") < at("class=\"coverage-summary\""));
         assert!(at("class=\"coverage-summary\"") < at("class=\"page-footer\""));
@@ -796,6 +964,122 @@ mod tests {
             html.contains("grid import avoided rather than as self-sufficiency"),
             "the report must not claim knowledge of the household load"
         );
+    }
+
+    #[test]
+    fn a_target_out_of_reach_says_what_the_installation_would_have_to_cost() {
+        let paired = paired(365);
+        let sweep = sweep_of(&paired);
+        let best = sweep.best_result().expect("something pays back");
+        let mut options = options();
+        options.target_payback_years = 2.0;
+        let budget = sweep.budget(best, 2.0);
+        assert!(
+            !budget.met,
+            "the fixture must not reach two years on its own"
+        );
+
+        let html = page(&sweep, &paired, &options);
+        assert!(html.contains("What it would have to cost to pay back in 2 years"));
+        assert!(html.contains("No size reaches it at today's prices"));
+        assert!(
+            html.contains(&format!(
+                "cost <strong>{}</strong> rather than {}",
+                format_money(budget.investment, "EUR"),
+                format_money(budget.quoted, "EUR")
+            )),
+            "the budget and the quote have to be stated side by side"
+        );
+        assert!(html.contains(&format_percent(budget.discount.unwrap())));
+    }
+
+    #[test]
+    fn a_target_already_met_says_how_much_room_is_left() {
+        let paired = paired(365);
+        let sweep = sweep_of(&paired);
+        let mut options = options();
+        options.target_payback_years = sweep.best_result().unwrap().payback_years.unwrap() + 5.0;
+
+        let html = page(&sweep, &paired, &options);
+        assert!(html.contains("already pay back within"));
+        assert!(html.contains("has room to spare"));
+        assert!(!html.contains("No size reaches it at today's prices"));
+    }
+
+    #[test]
+    fn a_budget_the_fixed_cost_eats_is_called_out_rather_than_quoted_as_negative() {
+        let paired = paired(365);
+        let sweep = sweep_of(&paired);
+        let mut options = options();
+        options.target_payback_years = 1.0;
+        let html = page(&sweep, &paired, &options);
+
+        assert!(html.contains("is on its own more than that budget"));
+        assert!(html.contains("not even zero"));
+
+        // And no negative amount is quoted in its place.
+        let start = html
+            .find("class=\"panel budget\"")
+            .expect("the budget block");
+        let block = &html[start..start + html[start..].find("</section>").unwrap()];
+        assert!(
+            !["-0", "-1", "-2", "-3", "-4", "-5", "-6", "-7", "-8", "-9"]
+                .iter()
+                .any(|negative| block.contains(negative)),
+            "a negative amount slipped into the budget block: {block}"
+        );
+    }
+
+    #[test]
+    fn every_row_carries_the_budget_for_the_target() {
+        let paired = paired(365);
+        let sweep = sweep_of(&paired);
+        let mut options = options();
+        options.target_payback_years = 8.0;
+        let html = page(&sweep, &paired, &options);
+
+        assert!(html.contains("<th scope=\"col\">Budget for 8 years</th>"));
+        assert_eq!(
+            html.matches("class=\"over-budget\"").count()
+                + html.matches("class=\"in-budget\"").count(),
+            sweep.results.len(),
+            "one budget cell per size"
+        );
+        // The cell states the sum the payback maths would need.
+        let best = sweep.best_result().unwrap();
+        assert!(html.contains(&format_money(sweep.budget(best, 8.0).investment, "EUR")));
+    }
+
+    #[test]
+    fn the_target_is_drawn_across_the_payback_panel() {
+        let paired = paired(365);
+        let mut options = options();
+        options.target_payback_years = 6.0;
+        let html = page(&sweep_of(&paired), &paired, &options);
+
+        assert!(html.contains("class=\"target\""));
+        assert!(html.contains(">target 6 years</text>"));
+        assert!(html.contains(".sweep-chart .target line {"));
+    }
+
+    #[test]
+    fn a_target_beyond_every_bar_still_fits_on_the_panel() {
+        // The line has to be visible even when it sits above the tallest bar, or it could
+        // not be read against them at all.
+        let paired = paired(365);
+        let sweep = sweep_of(&paired);
+        let longest = sweep
+            .results
+            .iter()
+            .filter_map(|result| result.payback_years)
+            .fold(0.0f64, f64::max);
+        let mut options = options();
+        options.target_payback_years = longest + 20.0;
+
+        let chart = sweep_chart(&sweep, options.target_payback_years);
+        let (_, span) = panel_scale(longest.max(options.target_payback_years));
+        assert!(span >= options.target_payback_years);
+        assert!(chart.contains("class=\"target\""));
     }
 
     #[test]

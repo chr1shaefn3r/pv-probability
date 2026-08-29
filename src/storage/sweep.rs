@@ -34,6 +34,44 @@ pub fn payback_years(investment: f64, annual_savings: f64) -> Option<f64> {
     (annual_savings > 0.0 && investment.is_finite()).then(|| investment / annual_savings)
 }
 
+/// The most a battery may cost and still be square within `years`.
+///
+/// The inverse of [`payback_years`]: payback is investment over annual savings, so the
+/// budget that meets a target is the target times the savings. A battery that saves
+/// nothing has a budget of nothing - no price is low enough, not even zero.
+pub fn affordable_investment(annual_savings: f64, years: f64) -> f64 {
+    if !annual_savings.is_finite() || !years.is_finite() || annual_savings <= 0.0 || years <= 0.0 {
+        return 0.0;
+    }
+    annual_savings * years
+}
+
+/// The per-kWh price a budget leaves once the fixed part of the bill is paid, or `None`
+/// when that fixed part alone already exceeds it.
+pub fn affordable_cost_per_kwh(budget: f64, base_cost: f64, capacity_kwh: f64) -> Option<f64> {
+    if capacity_kwh <= 0.0 {
+        return None;
+    }
+    let remaining = budget - base_cost;
+    (remaining > 0.0).then_some(remaining / capacity_kwh)
+}
+
+/// What one battery size would have to cost to pay back inside a target period.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Budget {
+    pub target_years: f64,
+    /// The most the whole installation may cost.
+    pub investment: f64,
+    /// What it costs at the prices the report was run with.
+    pub quoted: f64,
+    /// The per-kWh price the budget leaves after the fixed cost, if it leaves any.
+    pub cost_per_kwh: Option<f64>,
+    /// How far the quote has to fall, as a fraction: 0.4 means "40% less".
+    pub discount: Option<f64>,
+    /// Whether this size already pays back inside the target.
+    pub met: bool,
+}
+
 /// One battery size, simulated and priced.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SizeResult {
@@ -74,6 +112,35 @@ impl Sweep {
     /// kilowatt hour is worth buying.
     pub fn next_after_best(&self) -> Option<&SizeResult> {
         self.results.get(self.best? + 1)
+    }
+
+    /// What one size would have to cost to pay back inside `target_years`.
+    pub fn budget(&self, result: &SizeResult, target_years: f64) -> Budget {
+        let investment = affordable_investment(result.annual_savings, target_years);
+        let quoted = result.investment;
+        Budget {
+            target_years,
+            investment,
+            quoted,
+            cost_per_kwh: affordable_cost_per_kwh(
+                investment,
+                self.economics.base_cost,
+                result.capacity_kwh,
+            ),
+            discount: (quoted > investment && quoted > 0.0).then_some(1.0 - investment / quoted),
+            met: result
+                .payback_years
+                .is_some_and(|years| years <= target_years),
+        }
+    }
+
+    /// The size that comes closest to a target payback period.
+    ///
+    /// It is the fastest payback: the room in the budget is `target / payback`, so
+    /// whichever size pays back soonest is also the one needing the smallest discount,
+    /// whatever the target happens to be.
+    pub fn closest_to_target(&self) -> Option<&SizeResult> {
+        self.best_result()
     }
 
     /// Payback for one size at a different price and cost, without re-simulating: the
@@ -379,6 +446,120 @@ mod tests {
         assert_eq!(payback_years(6_500.0, 650.0), Some(10.0));
         assert_eq!(payback_years(6_500.0, 0.0), None);
         assert_eq!(payback_years(6_500.0, -5.0), None);
+    }
+
+    #[test]
+    fn the_budget_for_a_target_is_the_payback_sum_read_backwards() {
+        // 260 EUR a year for five years buys 1,300 EUR of battery, and no more.
+        assert_eq!(affordable_investment(260.0, 5.0), 1_300.0);
+        assert_eq!(payback_years(1_300.0, 260.0), Some(5.0));
+
+        // Nothing saved means no price is low enough, not even nothing.
+        assert_eq!(affordable_investment(0.0, 5.0), 0.0);
+        assert_eq!(affordable_investment(-10.0, 5.0), 0.0);
+        assert_eq!(affordable_investment(260.0, 0.0), 0.0);
+        assert_eq!(affordable_investment(f64::NAN, 5.0), 0.0);
+    }
+
+    #[test]
+    fn the_budget_left_per_kilowatt_hour_is_what_the_fixed_cost_does_not_eat() {
+        // 3,000 EUR of budget, 1,500 of it spent before the first cell: 150 per kWh.
+        assert_eq!(affordable_cost_per_kwh(3_000.0, 1_500.0, 10.0), Some(150.0));
+        // A fixed cost that already exceeds the budget rules the size out entirely.
+        assert_eq!(affordable_cost_per_kwh(1_200.0, 1_500.0, 10.0), None);
+        assert_eq!(affordable_cost_per_kwh(1_500.0, 1_500.0, 10.0), None);
+        assert_eq!(affordable_cost_per_kwh(3_000.0, 1_500.0, 0.0), None);
+    }
+
+    #[test]
+    fn a_budget_says_how_far_a_quote_has_to_fall() {
+        let sweep = sweep(&history(365), &[10.0], &template(), &economics());
+        let result = &sweep.results[0];
+        let payback = result.payback_years.expect("it pays back eventually");
+        assert!(
+            payback > 5.0,
+            "the fixture is not a five year battery: {payback}"
+        );
+
+        let budget = sweep.budget(result, 5.0);
+        assert!(!budget.met);
+        assert_eq!(budget.quoted, 6_500.0);
+        assert!((budget.investment - result.annual_savings * 5.0).abs() < 1e-9);
+        // The discount is exactly the shortfall between the quote and the budget.
+        let discount = budget.discount.expect("a quote above the budget");
+        assert!((discount - (1.0 - budget.investment / budget.quoted)).abs() < 1e-12);
+        // And paying the budget really does hit the target.
+        assert!(
+            (payback_years(budget.investment, result.annual_savings).unwrap() - 5.0).abs() < 1e-9
+        );
+    }
+
+    #[test]
+    fn a_target_a_battery_already_meets_needs_no_discount() {
+        let sweep = sweep(&history(365), &[10.0], &template(), &economics());
+        let result = &sweep.results[0];
+        let generous = result.payback_years.unwrap() + 1.0;
+
+        let budget = sweep.budget(result, generous);
+        assert!(budget.met);
+        assert_eq!(budget.discount, None, "there is nothing to knock off");
+        assert!(
+            budget.investment > budget.quoted,
+            "and room to spare: {} over {}",
+            budget.investment,
+            budget.quoted
+        );
+        assert!(budget.cost_per_kwh.unwrap() > sweep.economics.cost_per_kwh);
+    }
+
+    #[test]
+    fn a_battery_that_saves_nothing_has_no_price_low_enough() {
+        let paired = Paired {
+            steps: Vec::new(),
+            slot_seconds: 3_600,
+            dropped_partial: 0,
+            dropped_unpaired: 0,
+            import_kwh: 0.0,
+            export_kwh: 0.0,
+            observed_seconds: 0.0,
+        };
+        let sweep = sweep(&paired, &[5.0], &template(), &economics());
+        let budget = sweep.budget(&sweep.results[0], 5.0);
+
+        assert!(!budget.met);
+        assert_eq!(budget.investment, 0.0);
+        assert_eq!(budget.cost_per_kwh, None);
+        assert_eq!(
+            budget.discount,
+            Some(1.0),
+            "a 100% discount is not a discount"
+        );
+    }
+
+    #[test]
+    fn the_size_closest_to_any_target_is_the_fastest_payback() {
+        let sweep = sweep(
+            &history(365),
+            &size_range(1.0, 20.0, 1.0),
+            &template(),
+            &economics(),
+        );
+        let closest = sweep.closest_to_target().expect("something pays back");
+
+        // Whatever the target, no other size needs a smaller discount.
+        for target in [2.0, 5.0, 12.0, 30.0] {
+            let room =
+                |result: &SizeResult| sweep.budget(result, target).investment / result.investment;
+            let best_room = room(closest);
+            for result in &sweep.results {
+                assert!(
+                    room(result) <= best_room + 1e-12,
+                    "{} kWh has more room at {target} years than {} kWh",
+                    result.capacity_kwh,
+                    closest.capacity_kwh
+                );
+            }
+        }
     }
 
     #[test]

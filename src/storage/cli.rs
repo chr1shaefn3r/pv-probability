@@ -94,6 +94,13 @@ pub struct Args {
     #[arg(long, value_name = "SYMBOL", default_value = "EUR")]
     pub currency: String,
 
+    /// The payback period worth aiming for, in years.
+    ///
+    /// The report answers the question backwards as well: what the installation would
+    /// have to cost for each size to be square within this many years.
+    #[arg(long, value_name = "YEARS", default_value_t = DEFAULT_TARGET_PAYBACK_YEARS)]
+    pub target_payback_years: f64,
+
     /// Smallest battery to try, in kWh.
     #[arg(long, value_name = "KWH", default_value_t = 1.0)]
     pub min_size: f64,
@@ -169,6 +176,10 @@ pub const DEFAULT_PRICE_PER_KWH: f64 = 0.35;
 pub const DEFAULT_COST_PER_KWH: f64 = 500.0;
 pub const DEFAULT_BASE_COST: f64 = 1_500.0;
 
+/// Five years is the period people usually have in mind when they ask whether a battery
+/// is worth it; long enough to be plausible, short enough to be a real test.
+pub const DEFAULT_TARGET_PAYBACK_YEARS: f64 = 5.0;
+
 /// Arguments after validation, with dates, sizes and assumptions resolved.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
@@ -183,6 +194,8 @@ pub struct Config {
     pub gap_threshold_seconds: i64,
     /// Sensitivity as a fraction, e.g. 0.25.
     pub sensitivity: f64,
+    /// The payback period the report works backwards from.
+    pub target_payback_years: f64,
 }
 
 impl Args {
@@ -247,6 +260,11 @@ impl Args {
             self.sensitivity.is_finite() && (0.0..100.0).contains(&self.sensitivity),
             "--sensitivity must be between 0 and 100 percent, got {}",
             self.sensitivity
+        );
+        ensure!(
+            self.target_payback_years.is_finite() && self.target_payback_years > 0.0,
+            "--target-payback-years must be a positive number, got {}",
+            self.target_payback_years
         );
         ensure!(
             self.gap_threshold_hours.is_finite() && self.gap_threshold_hours > 0.0,
@@ -345,6 +363,7 @@ impl Args {
             },
             gap_threshold_seconds: (self.gap_threshold_hours * 3_600.0).round() as i64,
             sensitivity: self.sensitivity / 100.0,
+            target_payback_years: self.target_payback_years,
         })
     }
 }
@@ -382,6 +401,7 @@ mod tests {
         assert_eq!(args.cost_per_kwh, 500.0);
         assert_eq!(args.base_cost, 1_500.0);
         assert_eq!(args.slot_minutes, 60);
+        assert_eq!(args.target_payback_years, 5.0);
         assert_eq!(args.round_trip, 0.9);
         assert_eq!(args.usable_fraction, 0.9);
         assert_eq!(args.source, SourceKind::Auto);
@@ -397,6 +417,7 @@ mod tests {
         assert_eq!(config.sizes.last(), Some(&20.0));
         assert_eq!(config.sizes.len(), 20);
         assert_eq!(config.sensitivity, 0.25);
+        assert_eq!(config.target_payback_years, 5.0);
         assert_eq!(config.gap_threshold_seconds, 24 * 3_600);
         assert_eq!(config.battery.capacity_kwh, 0.0, "filled in per size");
     }
@@ -435,6 +456,8 @@ mod tests {
         assert!(args(&["--slot-minutes", "0"]).resolve().is_err());
         assert!(args(&["--sensitivity", "-5"]).resolve().is_err());
         assert!(args(&["--sensitivity", "100"]).resolve().is_err());
+        assert!(args(&["--target-payback-years", "0"]).resolve().is_err());
+        assert!(args(&["--target-payback-years", "-5"]).resolve().is_err());
         assert!(args(&["--min-size", "0"]).resolve().is_err());
         assert!(
             args(&["--min-size", "10", "--max-size", "5"])
@@ -457,6 +480,13 @@ mod tests {
         assert!(args(&["--round-trip", "1"]).resolve().is_ok());
         assert!(args(&["--feed-in-price", "0"]).resolve().is_ok());
         assert!(args(&["--sensitivity", "0"]).resolve().is_ok());
+        assert_eq!(
+            args(&["--target-payback-years", "8.5"])
+                .resolve()
+                .unwrap()
+                .target_payback_years,
+            8.5
+        );
         assert!(
             args(&["--min-size", "5", "--max-size", "5"])
                 .resolve()

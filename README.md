@@ -322,9 +322,10 @@ energy-storage-payback-period --db ha.db \
 ```
 
 ```
-wrote energy-storage-payback-period.html: 20 sizes over 17520 slots of 60 minutes, 23 kB, 37.0ms
+wrote energy-storage-payback-period.html: 20 sizes over 17520 slots of 60 minutes, 25 kB, 36.5ms
 measured 17.97 MWh imported and 4.32 MWh exported
 best payback: 3 kWh for 3,000 EUR saves 257 EUR a year - paid off in 11.7 years
+for 5 years: it would have to cost 1,283 EUR instead of 3,000 EUR (57% less), which the 1,500 EUR base cost alone already exceeds
 covers 2023-01-01 to 2024-12-31 (731 days): 731 days paired (730 of them full days), 0 outages over 24 h
 
 open /home/you/energy-storage-payback-period.html
@@ -332,7 +333,9 @@ open /home/you/energy-storage-payback-period.html
 
 The report charts annual savings and payback period against battery size, names the size
 that pays back fastest and the point where further capacity stops earning its keep, and
-shows what the answer becomes at other electricity prices and other quotes.
+shows what the answer becomes at other electricity prices and other quotes. It also runs
+the sum backwards: **how cheap the installation would have to be** to pay back within
+`--target-payback-years` (5 by default).
 
 ![Annual savings and payback period by battery size](docs/payback-example.png)
 
@@ -362,6 +365,12 @@ same diagnosis the heatmap tool gives, naming the `_power` sensor beside it.
 * Payback is `(--base-cost + --cost-per-kwh x capacity) / annual savings`. No price
   escalation, no degradation, no discount rate: the sensitivity block shows what moving the
   price or the quote does instead.
+* The same sum read backwards gives the **budget**: to pay back within
+  `--target-payback-years`, an installation may cost at most `target x annual savings`.
+  Each row of the table carries that figure and how far the quote would have to fall to
+  meet it; the block below the table works it through for the size that comes closest, and
+  says when `--base-cost` alone already exceeds the budget - the case no cell price, not
+  even zero, can fix.
 * A history shorter than a year is scaled up to one **and** flagged. A summer-heavy
   history flatters a battery; a winter-heavy one does the opposite.
 * These sensors show what crossed the meter, not what the house used or the roof made, so
@@ -388,6 +397,7 @@ same diagnosis the heatmap tool gives, naming the `_power` sensor beside it.
 | `--slot-minutes <M>` | `60` | Simulation slot length; must divide an hour |
 | `--min-slot-coverage <F>` | `0.9` | How much of a slot both sensors must have covered |
 | `--sensitivity <PCT>` | `25` | How far either side the sensitivity grid looks |
+| `--target-payback-years <Y>` | `5` | The payback period the budget is worked back from |
 | `--source` / `--stat` / `--scale` / `--max-gap` | as above | Shared with `pv-probability` |
 | `--tz` / `--from` / `--to` | as above | Timezone and date window |
 | `--gap-threshold-hours <H>` | `24` | Outages at least this long are reported |
@@ -405,6 +415,11 @@ energy-storage-payback-period --db ha.db \
 energy-storage-payback-period --db ha.db \
   --import-entity sensor.grid_import_power --export-entity sensor.grid_export_power \
   --source short-term --slot-minutes 5
+
+# What would it have to cost to be square in three years?
+energy-storage-payback-period --db ha.db \
+  --import-entity sensor.grid_import_power --export-entity sensor.grid_export_power \
+  --target-payback-years 3
 ```
 
 ## Performance

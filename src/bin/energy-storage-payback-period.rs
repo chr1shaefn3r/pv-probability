@@ -14,7 +14,7 @@ use pv_probability::cli::open_command;
 use pv_probability::coverage::Coverage;
 use pv_probability::model::Grouping;
 use pv_probability::render::{
-    PaybackOptions, format_kwh, format_money, format_years, payback_page,
+    PaybackOptions, format_kwh, format_money, format_percent, format_years, payback_page,
 };
 use pv_probability::source::catalog;
 use pv_probability::source::{self, LoadOptions, LoadedSamples};
@@ -155,6 +155,7 @@ fn run() -> Result<()> {
             coverage: coverage.clone(),
             tz: config.tz,
             sensitivity: config.sensitivity,
+            target_payback_years: config.target_payback_years,
         },
     );
     fs::write(&args.out, &html)
@@ -215,18 +216,52 @@ fn report(
         format_kwh(paired.import_kwh),
         format_kwh(paired.export_kwh)
     );
+    let target = config.target_payback_years;
     match result.best_result() {
-        Some(best) => println!(
-            "best payback: {} kWh for {} saves {} a year - paid off in {}",
-            trim(best.capacity_kwh),
-            format_money(best.investment, currency),
-            format_money(best.annual_savings, currency),
-            format_years(best.payback_years)
-        ),
+        Some(best) => {
+            println!(
+                "best payback: {} kWh for {} saves {} a year - paid off in {}",
+                trim(best.capacity_kwh),
+                format_money(best.investment, currency),
+                format_money(best.annual_savings, currency),
+                format_years(best.payback_years)
+            );
+            let budget = result.budget(best, target);
+            let per_kwh = match budget.cost_per_kwh {
+                Some(per_kwh) => format!(
+                    ", or {} per kWh on top of the {} base cost",
+                    format_money(per_kwh, currency),
+                    format_money(config.economics.base_cost, currency)
+                ),
+                None => format!(
+                    ", which the {} base cost alone already exceeds",
+                    format_money(config.economics.base_cost, currency)
+                ),
+            };
+            if budget.met {
+                println!(
+                    "for {}: already there - it could cost up to {}{}",
+                    format_years(Some(target)),
+                    format_money(budget.investment, currency),
+                    per_kwh
+                );
+            } else {
+                println!(
+                    "for {}: it would have to cost {} instead of {} ({} less){}",
+                    format_years(Some(target)),
+                    format_money(budget.investment, currency),
+                    format_money(budget.quoted, currency),
+                    format_percent(budget.discount.unwrap_or_default()),
+                    per_kwh
+                );
+            }
+        }
         None => println!(
-            "best payback: none - no battery between {} and {} kWh pays for itself here",
+            "best payback: none - no battery between {} and {} kWh pays for itself here, so \
+             no price would reach {}",
             trim(config.sizes.first().copied().unwrap_or_default()),
-            trim(config.sizes.last().copied().unwrap_or_default())
+            trim(config.sizes.last().copied().unwrap_or_default()),
+            format_years(Some(target))
         ),
     }
     if result.annualisation > 1.01 {

@@ -167,6 +167,69 @@ fn losses_and_a_shallower_depth_of_discharge_both_cost_savings() {
 }
 
 #[test]
+fn the_budget_for_a_target_is_what_actually_hits_that_target() {
+    let conn = database(730);
+    let (_, result) = run(&conn);
+
+    for target in [3.0, 5.0, 10.0] {
+        for size in &result.results {
+            let budget = result.budget(size, target);
+            if size.annual_savings <= 0.0 {
+                assert_eq!(budget.investment, 0.0);
+                continue;
+            }
+            // Paying exactly the budget hits the target, to the last decimal.
+            let years = pv_probability::storage::sweep::payback_years(
+                budget.investment,
+                size.annual_savings,
+            );
+            assert!(
+                (years.unwrap() - target).abs() < 1e-9,
+                "{years:?} vs {target}"
+            );
+            // And "met" agrees with the quoted payback, not with anything else.
+            assert_eq!(budget.met, size.payback_years.is_some_and(|y| y <= target));
+            // A quote above the budget is exactly the discount that closes the gap.
+            if let Some(discount) = budget.discount {
+                assert!(
+                    (budget.quoted * (1.0 - discount) - budget.investment).abs() < 1e-6,
+                    "the discount does not land on the budget"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_cheap_enough_installation_reaches_a_five_year_payback() {
+    let conn = database(730);
+    let paired = paired_history(&conn, HOUR);
+    let sizes = size_range(1.0, 20.0, 1.0);
+    let template = BatterySpec::new(0.0, 0.9, 0.9);
+
+    // At the default quote nothing here is a five year battery ...
+    let quoted = sweep(&paired, &sizes, &template, &economics());
+    let best = quoted.best_result().expect("something pays back");
+    assert!(!quoted.budget(best, 5.0).met);
+
+    // ... but the report says what it would have to cost, and that price really does it.
+    let budget = quoted.budget(best, 5.0);
+    let cheaper = sweep(
+        &paired,
+        &[best.capacity_kwh],
+        &template,
+        &Economics {
+            // Put the whole budget into the per-kWh price, with nothing fixed to pay.
+            base_cost: 0.0,
+            cost_per_kwh: budget.investment / best.capacity_kwh,
+            ..economics()
+        },
+    );
+    assert!((cheaper.results[0].payback_years.unwrap() - 5.0).abs() < 1e-6);
+    assert!(cheaper.budget(&cheaper.results[0], 5.0).met);
+}
+
+#[test]
 fn a_partial_year_is_annualised_and_says_so() {
     let conn = database(180);
     let (paired, result) = run(&conn);
