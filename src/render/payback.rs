@@ -447,9 +447,11 @@ fn budget_section(sweep: &Sweep, options: &PaybackOptions) -> String {
             .expect("a non-empty list has a minimum");
         let _ = write!(
             html,
+            // Not "from X upwards": the payback curve turns, so the sizes that meet a
+            // target need not be everything above the smallest one that does.
             "<p><strong>{} of the {} sizes</strong> already pay back within {} at today's \
-             prices, from the {} kWh battery at {} upwards. The fastest is the \
-             <strong>{} kWh</strong> one, at {}.</p>",
+             prices; the cheapest of them is the {} kWh battery at {}, and the fastest is \
+             the <strong>{} kWh</strong> one, at {}.</p>",
             met.len(),
             sweep.results.len(),
             escape(&years),
