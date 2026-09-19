@@ -116,16 +116,34 @@ Home Assistant writes continuously, and the recorder runs in WAL mode, so a plai
 The safe way, from an SSH or Terminal add-on on the Home Assistant machine:
 
 ```sh
-sqlite3 /config/home-assistant_v2.db ".backup '/config/pv-copy.db'"
+sqlite3 /config/home-assistant_v2.db "VACUUM INTO '/config/pv-copy.db'"
 ```
 
 Then copy `pv-copy.db` off the box (Samba share, `scp`, the File Editor add-on) and point
 `--db` at it. On a Home Assistant Green the database lives at `/config/home-assistant_v2.db`
 and is typically a few hundred MB.
 
+`VACUUM INTO` rather than `.backup`: both give a consistent copy including whatever is
+still in the `-wal`, but `.backup` copies the WAL *mode* along with the data, and every
+later reader of a WAL database has to create a `-shm` and a `-wal` beside it. A
+`VACUUM INTO` copy is a plain rollback-journal database, so nothing ever appears next to
+it - and it is smaller, because vacuuming rewrites it without the free pages.
+
 If you would rather copy the raw file, stop Home Assistant first, or copy
 `home-assistant_v2.db`, `home-assistant_v2.db-wal` and `home-assistant_v2.db-shm`
 together.
+
+### Why no `-shm` and `-wal` appear next to your copy
+
+A read-only connection to a WAL database has to build SQLite's log index, and - unlike a
+writer - it cannot run the checkpoint that removes the index again when it closes. So the
+naive thing to do would leave a `-shm` and a `-wal` behind after every run.
+
+Instead, when no `-wal` or `-journal` sits beside the database, the tools tell SQLite the
+file is immutable: it then needs no index and takes no locks, and creates nothing. When a
+journal *is* there, they fall back to an ordinary read-only open, because `immutable`
+would silently skip the rows that are still in it - the sidecars stay, but they were
+already there. `-v` says which of the two happened.
 
 Nothing is ever sent anywhere: the tool is a local CLI that reads SQLite and writes HTML.
 

@@ -74,19 +74,96 @@ impl LoadedSamples {
     }
 }
 
+/// How a recorder database is opened.
+///
+/// Home Assistant's recorder runs in WAL mode, and that mode travels with the file: any
+/// connection to a WAL database has to build the write-ahead log index, which lives in a
+/// `-shm` file beside it. A *read-only* connection cannot run the checkpoint that removes
+/// the `-shm` and `-wal` again on close, so an ordinary read-only open litters the
+/// directory holding someone's database. Telling SQLite the file is immutable avoids the
+/// index entirely - but only when nothing could still be writing to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenMode {
+    /// No journal sits beside the database, so SQLite is told it cannot change. It then
+    /// needs no log index and no locks, and leaves nothing behind.
+    Immutable,
+    /// A `-wal` or `-journal` sits beside the database and may hold the newest rows.
+    /// `immutable` would silently skip them, so the file is opened the ordinary
+    /// read-only way and SQLite builds its index.
+    ReadOnly,
+}
+
+impl OpenMode {
+    /// What this mode means for the directory the database lives in.
+    pub fn describe(self) -> &'static str {
+        match self {
+            OpenMode::Immutable => {
+                "immutable - nothing is writing to it, so no -shm/-wal files are created"
+            }
+            OpenMode::ReadOnly => {
+                "read-only - a journal sits beside it, so its rows are read too and SQLite \
+                 leaves -shm/-wal behind"
+            }
+        }
+    }
+}
+
+/// How `path` will be opened: immutable unless a journal sits beside it.
+pub fn open_mode(path: &Path) -> OpenMode {
+    // A hot rollback journal is the same hazard as a WAL: it holds state the main file
+    // does not, and `immutable` would skip the recovery that applies it.
+    if sidecar(path, "-wal").exists() || sidecar(path, "-journal").exists() {
+        OpenMode::ReadOnly
+    } else {
+        OpenMode::Immutable
+    }
+}
+
+fn sidecar(path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    std::path::PathBuf::from(name)
+}
+
 /// Open a recorder database read-only. The file is never written to, so it is safe to
 /// point at a copy taken while Home Assistant is running.
 pub fn open_database(path: &Path) -> Result<Connection> {
     if !path.exists() {
         bail!("{} does not exist", path.display());
     }
-    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).with_context(|| {
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY;
+    let opened = match open_mode(path) {
+        OpenMode::Immutable => Connection::open_with_flags(
+            file_uri(path, "?immutable=1"),
+            flags | OpenFlags::SQLITE_OPEN_URI,
+        ),
+        OpenMode::ReadOnly => Connection::open_with_flags(path, flags),
+    };
+    opened.with_context(|| {
         format!(
             "failed to open {} read-only. If Home Assistant is still writing to it, copy it first \
-             with: sqlite3 home-assistant_v2.db \".backup 'copy.db'\"",
+             with: sqlite3 home-assistant_v2.db \"VACUUM INTO 'copy.db'\"",
             path.display()
         )
     })
+}
+
+/// A path as a SQLite `file:` URI with `query` appended.
+///
+/// Only the three characters that end the path component of a URI are escaped; SQLite
+/// takes the rest verbatim, including Windows drive letters and backslashes.
+fn file_uri(path: &Path, query: &str) -> String {
+    let mut uri = String::from("file:");
+    for character in path.to_string_lossy().chars() {
+        match character {
+            // Escaping by character rather than by byte keeps an accented directory name
+            // intact; SQLite reads the rest of the URI as UTF-8.
+            '?' | '#' | '%' => uri.push_str(&format!("%{:02X}", character as u32)),
+            other => uri.push(other),
+        }
+    }
+    uri.push_str(query);
+    uri
 }
 
 /// Load samples, resolving [`SourceKind::Auto`] against what the database actually holds.
@@ -503,6 +580,157 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("does not exist"), "{error}");
+    }
+
+    /// A scratch directory of this test's own, since these tests are about what a run
+    /// leaves on disk next to a database.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("pv-probability-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create the scratch directory");
+        dir
+    }
+
+    /// Everything beside the database itself, which is what must not pile up.
+    fn sidecars(dir: &std::path::Path) -> Vec<String> {
+        let mut found: Vec<String> = std::fs::read_dir(dir)
+            .expect("read the scratch directory")
+            .map(|entry| entry.expect("a directory entry").file_name())
+            .filter_map(|name| {
+                let name = name.to_string_lossy().to_string();
+                (name != "ha.db").then_some(name)
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// A WAL mode database on disk with `rows` rows, the way Home Assistant keeps one.
+    fn wal_database(path: &std::path::Path, rows: i64) -> Connection {
+        let conn = Connection::open(path).expect("create the database");
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+            .expect("set WAL mode");
+        assert_eq!(mode, "wal", "the test fixture has to be a WAL database");
+        conn.execute_batch("CREATE TABLE t (a INTEGER)")
+            .expect("create a table");
+        for value in 0..rows {
+            conn.execute("INSERT INTO t VALUES (?1)", [value])
+                .expect("insert a row");
+        }
+        conn
+    }
+
+    fn count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT count(*) FROM t", [], |row| row.get(0))
+            .expect("count the rows")
+    }
+
+    #[test]
+    fn reading_a_wal_database_leaves_no_files_behind() {
+        let dir = scratch("clean");
+        let path = dir.join("ha.db");
+        drop(wal_database(&path, 1_000));
+        assert!(
+            sidecars(&dir).is_empty(),
+            "a closed database has no journal beside it"
+        );
+
+        // The whole point: an ordinary read-only open would create a -shm and a -wal here
+        // and be unable to remove them again.
+        assert_eq!(open_mode(&path), OpenMode::Immutable);
+        let conn = open_database(&path).expect("open the copy");
+        assert_eq!(count(&conn), 1_000);
+        assert!(
+            sidecars(&dir).is_empty(),
+            "nothing may be created while reading: {:?}",
+            sidecars(&dir)
+        );
+        drop(conn);
+        assert_eq!(sidecars(&dir), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_wal_beside_the_database_is_read_rather_than_skipped() {
+        // A copy taken while the writer was running: the newest rows are still in the
+        // -wal, and `immutable` would silently report the database without them.
+        let source = scratch("hot-source");
+        let writer = wal_database(&source.join("ha.db"), 1_000);
+        writer
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+            .expect("checkpoint what exists so far");
+        for value in 0..500 {
+            writer
+                .execute("INSERT INTO t VALUES (?1)", [value])
+                .expect("insert a row that stays in the WAL");
+        }
+
+        let dir = scratch("hot-copy");
+        for suffix in ["", "-wal", "-shm"] {
+            let name = format!("ha.db{suffix}");
+            std::fs::copy(source.join(&name), dir.join(&name)).expect("copy the database");
+        }
+        drop(writer);
+
+        let path = dir.join("ha.db");
+        assert_eq!(open_mode(&path), OpenMode::ReadOnly);
+        let conn = open_database(&path).expect("open the copy");
+        assert_eq!(
+            count(&conn),
+            1_500,
+            "the rows still in the -wal have to be read too"
+        );
+    }
+
+    #[test]
+    fn a_rollback_journal_also_rules_out_the_immutable_shortcut() {
+        let dir = scratch("journal");
+        let path = dir.join("ha.db");
+        drop(wal_database(&path, 1));
+        assert_eq!(open_mode(&path), OpenMode::Immutable);
+
+        // A hot rollback journal holds state the main file does not, exactly like a WAL.
+        std::fs::write(dir.join("ha.db-journal"), b"hot journal").expect("write a journal");
+        assert_eq!(open_mode(&path), OpenMode::ReadOnly);
+    }
+
+    #[test]
+    fn an_awkward_path_still_becomes_a_usable_uri() {
+        assert_eq!(file_uri(Path::new("/tmp/ha.db"), ""), "file:/tmp/ha.db");
+        assert_eq!(
+            file_uri(Path::new("/tmp/ha.db"), "?immutable=1"),
+            "file:/tmp/ha.db?immutable=1"
+        );
+        // The three characters that would otherwise end the path get escaped ...
+        assert_eq!(
+            file_uri(Path::new("/tmp/a?b#c%d.db"), ""),
+            "file:/tmp/a%3Fb%23c%25d.db"
+        );
+        // ... and everything else, spaces and accents included, is left alone.
+        assert_eq!(
+            file_uri(Path::new("/tmp/Müllers Kopie.db"), ""),
+            "file:/tmp/Müllers Kopie.db"
+        );
+    }
+
+    #[test]
+    fn a_database_in_an_awkward_directory_opens_all_the_same() {
+        let dir = scratch("awkward").join("Müllers Kopie #1");
+        std::fs::create_dir_all(&dir).expect("create the awkward directory");
+        let path = dir.join("ha.db");
+        drop(wal_database(&path, 7));
+
+        assert_eq!(open_mode(&path), OpenMode::Immutable);
+        let conn = open_database(&path).expect("open a database behind an escaped path");
+        assert_eq!(count(&conn), 7);
+        assert_eq!(sidecars(&dir), Vec::<String>::new());
+    }
+
+    #[test]
+    fn both_modes_say_what_they_mean_for_the_directory() {
+        assert!(OpenMode::Immutable.describe().contains("no -shm/-wal"));
+        assert!(OpenMode::ReadOnly.describe().contains("leaves -shm/-wal"));
     }
 
     #[test]

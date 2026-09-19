@@ -39,6 +39,13 @@ fn run() -> Result<()> {
 
     let started = Instant::now();
     let conn = source::open_database(&args.db)?;
+    if args.verbose > 0 {
+        eprintln!(
+            "opened {} {}",
+            args.db.display(),
+            source::open_mode(&args.db).describe()
+        );
+    }
 
     if let Some(filter) = &args.list_entities {
         let candidates = catalog::list_statistics(&conn, Some(filter))?;
