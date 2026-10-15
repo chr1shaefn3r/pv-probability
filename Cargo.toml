@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/ha-testdb"]
+members = [".", "crates/ha-recorder", "crates/ha-testdb"]
 
 [workspace.package]
 version = "0.1.0"
@@ -20,6 +20,7 @@ clap = { version = "4", features = ["derive"] }
 rayon = "1.10"
 rusqlite = { version = "0.40", features = ["bundled"] }
 
+ha-recorder = { path = "crates/ha-recorder" }
 ha-testdb = { path = "crates/ha-testdb" }
 
 [package]
@@ -47,6 +48,7 @@ anyhow.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
 clap.workspace = true
+ha-recorder.workspace = true
 rayon.workspace = true
 rusqlite.workspace = true
 

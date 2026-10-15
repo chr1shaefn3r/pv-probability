@@ -10,10 +10,10 @@ use std::fmt::Write as _;
 
 use chrono_tz::Tz;
 
-use crate::coverage::{Coverage, Gap};
-use crate::model::Grouping;
 use crate::render::color;
 use crate::render::{escape, format_duration, format_percent};
+use ha_recorder::coverage::{Coverage, Gap};
+use ha_recorder::model::Grouping;
 
 /// Ids the stylesheet keys off; kept beside the markup that emits them.
 pub const THEME_AUTO_ID: &str = "pv-theme-auto";

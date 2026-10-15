@@ -2,16 +2,15 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Result, bail, ensure};
-use chrono_tz::Tz;
+use anyhow::{Result, ensure};
 use clap::Parser;
 
-use crate::model::{Grouping, Metric};
+use ha_recorder::model::Grouping;
+use ha_recorder::{RecorderArgs, RecorderConfig};
+
+use crate::model::Metric;
 use crate::render::color;
 use crate::render::html;
-use crate::source::SourceKind;
-use crate::source::schema::ValueColumn;
-use crate::timeutil::{parse_local_date, resolve_timezone};
 
 /// Build a "how likely is this much solar power?" heatmap from a Home Assistant
 /// recorder database.
@@ -20,9 +19,9 @@ use crate::timeutil::{parse_local_date, resolve_timezone};
 // a message about the value rather than about an unknown flag.
 #[command(name = "pv-probability", version, about, long_about = None, allow_negative_numbers = true)]
 pub struct Args {
-    /// Path to a copy of home-assistant_v2.db (opened read-only).
-    #[arg(long, value_name = "FILE")]
-    pub db: PathBuf,
+    /// The database, the table, the dates: the options every tool shares.
+    #[command(flatten)]
+    pub recorder: RecorderArgs,
 
     /// Entity to analyse, e.g. sensor.solar_power.
     #[arg(
@@ -31,12 +30,6 @@ pub struct Args {
         required_unless_present = "list_entities"
     )]
     pub entity: Option<String>,
-
-    /// List the statistics this database holds and exit, power sensors first.
-    ///
-    /// Takes an optional word to filter the ids by, e.g. `--list-entities solar`.
-    #[arg(long, value_name = "FILTER", num_args = 0..=1, default_missing_value = "")]
-    pub list_entities: Option<String>,
 
     /// One heatmap per calendar month or per ISO week.
     #[arg(long, value_enum, default_value_t = Grouping::Month)]
@@ -54,27 +47,6 @@ pub struct Args {
     #[arg(long, value_name = "Q", default_value_t = 0.999)]
     pub max_quantile: f64,
 
-    /// Which recorder table to read.
-    #[arg(long, value_enum, default_value_t = SourceKind::Auto)]
-    pub source: SourceKind,
-
-    /// Which statistics column to use when reading a statistics table.
-    #[arg(long, value_enum, default_value_t = ValueColumn::Mean)]
-    pub stat: ValueColumn,
-
-    /// IANA timezone for the hour-of-day axis, e.g. Europe/Berlin. Defaults to the
-    /// machine's timezone.
-    #[arg(long, value_name = "TZ")]
-    pub tz: Option<String>,
-
-    /// Only consider data from this local date on (YYYY-MM-DD).
-    #[arg(long, value_name = "DATE")]
-    pub from: Option<String>,
-
-    /// Only consider data before this local date (YYYY-MM-DD).
-    #[arg(long, value_name = "DATE")]
-    pub to: Option<String>,
-
     /// Cell meaning: exceedance is "at least this many watts".
     #[arg(long, value_enum, default_value_t = Metric::Exceedance)]
     pub metric: Metric,
@@ -85,11 +57,6 @@ pub struct Args {
     /// the recorder wrote.
     #[arg(long, value_name = "N", default_value_t = 3)]
     pub min_days: u32,
-
-    /// Report outages longer than this. The default of a full day keeps inverters that
-    /// go offline every night from filling the report with nightly "gaps".
-    #[arg(long, value_name = "HOURS", default_value_t = 24.0)]
-    pub gap_threshold_hours: f64,
 
     /// Power the "reliable window" block asks about, in watts.
     ///
@@ -116,14 +83,6 @@ pub struct Args {
     /// Number of colour steps on the likelihood scale.
     #[arg(long, value_name = "N", default_value_t = color::DEFAULT_LEVELS)]
     pub levels: usize,
-
-    /// How long a single raw state reading is assumed to stay valid, in seconds.
-    #[arg(long, value_name = "SECONDS", default_value_t = 900)]
-    pub max_gap: i64,
-
-    /// Multiply every reading by this factor (use 1000 for a sensor reporting kW).
-    #[arg(long, value_name = "FACTOR")]
-    pub scale: Option<f64>,
 
     /// Keep negative readings instead of clamping them to zero.
     #[arg(long)]
@@ -178,14 +137,8 @@ fn shell_quote(text: &str) -> String {
 /// Command line arguments after validation, with dates and timezones resolved.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
-    pub tz: Tz,
-    /// Inclusive lower bound as a UTC timestamp.
-    pub from: Option<i64>,
-    /// Exclusive upper bound as a UTC timestamp.
-    pub to: Option<i64>,
+    pub recorder: RecorderConfig,
     pub clamp_negative: bool,
-    /// Outages at least this long are reported.
-    pub gap_threshold_seconds: i64,
 }
 
 impl Args {
@@ -247,49 +200,13 @@ impl Args {
             color::MAX_LEVELS,
             self.levels
         );
-        ensure!(
-            self.max_gap > 0,
-            "--max-gap must be positive, got {}",
-            self.max_gap
-        );
-        ensure!(
-            self.gap_threshold_hours.is_finite() && self.gap_threshold_hours > 0.0,
-            "--gap-threshold-hours must be a positive number, got {}",
-            self.gap_threshold_hours
-        );
-        if let Some(scale) = self.scale {
-            ensure!(
-                scale.is_finite() && scale != 0.0,
-                "--scale must be a non-zero number, got {scale}"
-            );
-        }
         if let Some(threads) = self.threads {
             ensure!(threads > 0, "--threads must be at least 1");
         }
 
-        let tz = resolve_timezone(self.tz.as_deref())?;
-        let from = self
-            .from
-            .as_deref()
-            .map(|date| parse_local_date(date, tz))
-            .transpose()?;
-        let to = self
-            .to
-            .as_deref()
-            .map(|date| parse_local_date(date, tz))
-            .transpose()?;
-        if let (Some(from), Some(to)) = (from, to)
-            && to <= from
-        {
-            bail!("--to must be after --from");
-        }
-
         Ok(Config {
-            tz,
-            from,
-            to,
+            recorder: self.recorder.resolve()?,
             clamp_negative: !self.keep_negative,
-            gap_threshold_seconds: (self.gap_threshold_hours * 3_600.0).round() as i64,
         })
     }
 }
@@ -299,7 +216,9 @@ mod tests {
     use super::*;
     use chrono_tz::Europe::Berlin;
 
-    use crate::timeutil::parse_ha_datetime;
+    use ha_recorder::source::SourceKind;
+    use ha_recorder::source::schema::ValueColumn;
+    use ha_recorder::timeutil::parse_ha_datetime;
 
     fn parse(argv: &[&str]) -> Result<Args, clap::Error> {
         let mut all = vec!["pv-probability"];
@@ -325,11 +244,11 @@ mod tests {
         assert_eq!(args.group, Grouping::Month);
         assert_eq!(args.step_watts, 50.0);
         assert_eq!(args.metric, Metric::Exceedance);
-        assert_eq!(args.source, SourceKind::Auto);
-        assert_eq!(args.stat, ValueColumn::Mean);
-        assert_eq!(args.max_gap, 900);
+        assert_eq!(args.recorder.source, SourceKind::Auto);
+        assert_eq!(args.recorder.stat, ValueColumn::Mean);
+        assert_eq!(args.recorder.max_gap, 900);
         assert_eq!(args.min_days, 3);
-        assert_eq!(args.gap_threshold_hours, 24.0);
+        assert_eq!(args.recorder.gap_threshold_hours, 24.0);
         assert_eq!(args.reliable_watts, 100.0);
         assert_eq!(
             args.reliable_probability, 1.0,
@@ -340,9 +259,9 @@ mod tests {
 
         let config = args.resolve().unwrap();
         assert!(config.clamp_negative);
-        assert_eq!(config.from, None);
-        assert_eq!(config.to, None);
-        assert_eq!(config.gap_threshold_seconds, 24 * 3_600);
+        assert_eq!(config.recorder.from, None);
+        assert_eq!(config.recorder.to, None);
+        assert_eq!(config.recorder.gap_threshold_seconds, 24 * 3_600);
     }
 
     #[test]
@@ -355,23 +274,23 @@ mod tests {
     fn listing_makes_the_entity_optional() {
         let args = parse(&["--db", "ha.db", "--list-entities"]).expect("no entity needed");
         assert_eq!(
-            args.list_entities.as_deref(),
+            args.recorder.list_entities.as_deref(),
             Some(""),
             "an empty filter is everything"
         );
         assert_eq!(args.entity, None);
 
         let args = parse(&["--db", "ha.db", "--list-entities", "solar"]).unwrap();
-        assert_eq!(args.list_entities.as_deref(), Some("solar"));
+        assert_eq!(args.recorder.list_entities.as_deref(), Some("solar"));
 
         // Both together are fine: the listing simply wins.
         let args = parse(&["--db", "ha.db", "--entity", "sensor.x", "--list-entities"]).unwrap();
         assert_eq!(args.entity.as_deref(), Some("sensor.x"));
-        assert!(args.list_entities.is_some());
+        assert!(args.recorder.list_entities.is_some());
 
         // Without the flag, nothing changes.
         let args = parse(&["--db", "ha.db", "--entity", "sensor.x"]).unwrap();
-        assert_eq!(args.list_entities, None);
+        assert_eq!(args.recorder.list_entities, None);
         assert_eq!(args.entity(), "sensor.x");
     }
 
@@ -380,10 +299,10 @@ mod tests {
         assert_eq!(args(&["--group", "week"]).group, Grouping::Week);
         assert_eq!(args(&["--metric", "density"]).metric, Metric::Density);
         assert_eq!(
-            args(&["--source", "short-term"]).source,
+            args(&["--source", "short-term"]).recorder.source,
             SourceKind::ShortTerm
         );
-        assert_eq!(args(&["--stat", "max"]).stat, ValueColumn::Max);
+        assert_eq!(args(&["--stat", "max"]).recorder.stat, ValueColumn::Max);
         assert!(
             Args::try_parse_from([
                 "pv-probability",
@@ -446,6 +365,7 @@ mod tests {
             args(&["--gap-threshold-hours", "6"])
                 .resolve()
                 .unwrap()
+                .recorder
                 .gap_threshold_seconds,
             6 * 3_600
         );
@@ -465,9 +385,12 @@ mod tests {
         ])
         .resolve()
         .unwrap();
-        assert_eq!(config.tz, Berlin);
-        assert_eq!(config.from, parse_ha_datetime("2024-06-20 22:00:00"));
-        assert_eq!(config.to, parse_ha_datetime("2024-06-21 22:00:00"));
+        assert_eq!(config.recorder.tz, Berlin);
+        assert_eq!(
+            config.recorder.from,
+            parse_ha_datetime("2024-06-20 22:00:00")
+        );
+        assert_eq!(config.recorder.to, parse_ha_datetime("2024-06-21 22:00:00"));
     }
 
     #[test]

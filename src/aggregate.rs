@@ -3,8 +3,10 @@
 use chrono_tz::Tz;
 use rayon::prelude::*;
 
-use crate::model::{BucketSpec, DayWindow, Grid, Grouping, HOURS_PER_DAY, Metric, Sample};
-use crate::timeutil::for_each_hour_slice;
+use ha_recorder::model::{Grouping, Sample};
+
+use crate::model::{BucketSpec, DayWindow, Grid, HOURS_PER_DAY, Metric};
+use ha_recorder::timeutil::for_each_hour_slice;
 
 /// Samples per rayon work unit. Each work unit allocates one partial [`Grid`], so this
 /// trades allocation overhead against parallelism; a few tens of thousands of samples
@@ -424,7 +426,7 @@ mod tests {
     use chrono_tz::Europe::Berlin;
     use chrono_tz::Tz::UTC;
 
-    use crate::timeutil::parse_ha_datetime;
+    use ha_recorder::timeutil::parse_ha_datetime;
 
     fn ts(text: &str) -> i64 {
         parse_ha_datetime(text).expect("test timestamp parses")

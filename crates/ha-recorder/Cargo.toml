@@ -1,0 +1,19 @@
+[package]
+name = "ha-recorder"
+description = "Reading a copy of a Home Assistant recorder database: schema probing, readers, coverage and the shared command line options"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+clap.workspace = true
+rusqlite.workspace = true
+
+[dev-dependencies]
+ha-testdb.workspace = true

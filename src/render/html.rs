@@ -8,7 +8,6 @@ use rayon::prelude::*;
 use chrono_tz::Tz;
 
 use crate::aggregate::{Analysis, Facet, ReliableWindow};
-use crate::coverage::Coverage;
 use crate::model::{BucketSpec, HOURS_PER_DAY, Metric};
 use crate::render::color;
 use crate::render::layout::{
@@ -16,6 +15,7 @@ use crate::render::layout::{
 };
 use crate::render::svg::{NO_DATA_PATTERN_ID, SvgOptions, axis_ticks, facet_svg};
 use crate::render::{escape, format_percent, format_watts};
+use ha_recorder::coverage::Coverage;
 
 /// Everything the page needs beyond the analysis itself.
 #[derive(Debug, Clone, PartialEq)]
@@ -637,8 +637,9 @@ mod tests {
     use chrono_tz::Tz::UTC;
 
     use crate::aggregate::{analyse, build_grid};
-    use crate::model::{DayWindow, Grid, Grouping, Sample};
-    use crate::timeutil::parse_ha_datetime;
+    use crate::model::{DayWindow, Grid};
+    use ha_recorder::model::{Grouping, Sample};
+    use ha_recorder::timeutil::parse_ha_datetime;
 
     fn analysis(metric: Metric) -> Analysis {
         let buckets = BucketSpec::new(500.0, 2_000.0).unwrap();

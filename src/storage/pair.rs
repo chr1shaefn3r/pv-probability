@@ -5,8 +5,8 @@
 //! surplus a battery would have stored. Slots that fail that test are dropped and
 //! counted, never quietly treated as zero.
 
-use crate::model::Sample;
 use crate::storage::series::Slots;
+use ha_recorder::model::Sample;
 
 /// One slot both sensors covered.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -23,7 +23,7 @@ impl PairedStep {
         self.seconds / 3_600.0
     }
 
-    /// The step as a sample, so [`crate::coverage`] can describe the paired timeline.
+    /// The step as a sample, so [`ha_recorder::coverage`] can describe the paired timeline.
     ///
     /// The watt value is the average power across the step, which is what the energy was
     /// integrated from in the first place.

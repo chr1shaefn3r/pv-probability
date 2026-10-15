@@ -8,7 +8,7 @@
 
 use rayon::prelude::*;
 
-use crate::model::Sample;
+use ha_recorder::model::Sample;
 
 /// Samples per rayon work unit, matching [`crate::aggregate`]'s reasoning: each unit
 /// allocates one partial [`Slots`], so a few tens of thousands keeps both the allocation

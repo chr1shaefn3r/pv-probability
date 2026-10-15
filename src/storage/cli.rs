@@ -2,15 +2,12 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Result, bail, ensure};
-use chrono_tz::Tz;
+use anyhow::{Result, ensure};
 use clap::Parser;
+use ha_recorder::{RecorderArgs, RecorderConfig};
 
-use crate::source::SourceKind;
-use crate::source::schema::ValueColumn;
 use crate::storage::simulate::BatterySpec;
 use crate::storage::sweep::{Economics, size_range};
-use crate::timeutil::{parse_local_date, resolve_timezone};
 
 /// Work out how long a home battery would take to pay for itself, from the grid import
 /// and export power sensors a Home Assistant recorder database already holds.
@@ -19,9 +16,9 @@ use crate::timeutil::{parse_local_date, resolve_timezone};
 // with a message about the value rather than about an unknown flag.
 #[command(name = "energy-storage-payback-period", version, about, long_about = None, allow_negative_numbers = true)]
 pub struct Args {
-    /// Path to a copy of home-assistant_v2.db (opened read-only).
-    #[arg(long, value_name = "FILE")]
-    pub db: PathBuf,
+    /// The database, the table, the dates: the options every tool shares.
+    #[command(flatten)]
+    pub recorder: RecorderArgs,
 
     /// Power sensor for energy drawn from the grid, e.g. sensor.grid_import_power.
     #[arg(
@@ -38,30 +35,6 @@ pub struct Args {
         required_unless_present = "list_entities"
     )]
     pub export_entity: Option<String>,
-
-    /// List the statistics this database holds and exit, power sensors first.
-    #[arg(long, value_name = "FILTER", num_args = 0..=1, default_missing_value = "")]
-    pub list_entities: Option<String>,
-
-    /// IANA timezone used for the dates in the report. Defaults to the machine's.
-    #[arg(long, value_name = "TZ")]
-    pub tz: Option<String>,
-
-    /// Only consider data from this local date on (YYYY-MM-DD).
-    #[arg(long, value_name = "DATE")]
-    pub from: Option<String>,
-
-    /// Only consider data before this local date (YYYY-MM-DD).
-    #[arg(long, value_name = "DATE")]
-    pub to: Option<String>,
-
-    /// Which recorder table to read.
-    #[arg(long, value_enum, default_value_t = SourceKind::Auto)]
-    pub source: SourceKind,
-
-    /// Which statistics column to use when reading a statistics table.
-    #[arg(long, value_enum, default_value_t = ValueColumn::Mean)]
-    pub stat: ValueColumn,
 
     /// Length of one simulation slot, in minutes. Must divide an hour.
     ///
@@ -139,18 +112,6 @@ pub struct Args {
     #[arg(long, value_name = "PCT", default_value_t = 25.0)]
     pub sensitivity: f64,
 
-    /// Report outages longer than this, in hours.
-    #[arg(long, value_name = "HOURS", default_value_t = 24.0)]
-    pub gap_threshold_hours: f64,
-
-    /// How long a single raw state reading is assumed to stay valid, in seconds.
-    #[arg(long, value_name = "SECONDS", default_value_t = 900)]
-    pub max_gap: i64,
-
-    /// Multiply every reading by this factor (use 1000 for a sensor reporting kW).
-    #[arg(long, value_name = "FACTOR")]
-    pub scale: Option<f64>,
-
     /// Limit the rayon worker threads; defaults to one per core.
     #[arg(long, value_name = "N")]
     pub threads: Option<usize>,
@@ -183,15 +144,12 @@ pub const DEFAULT_TARGET_PAYBACK_YEARS: f64 = 5.0;
 /// Arguments after validation, with dates, sizes and assumptions resolved.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
-    pub tz: Tz,
-    pub from: Option<i64>,
-    pub to: Option<i64>,
+    pub recorder: RecorderConfig,
     pub slot_seconds: i64,
     pub min_slot_coverage: f64,
     pub sizes: Vec<f64>,
     pub battery: BatterySpec,
     pub economics: Economics,
-    pub gap_threshold_seconds: i64,
     /// Sensitivity as a fraction, e.g. 0.25.
     pub sensitivity: f64,
     /// The payback period the report works backwards from.
@@ -266,22 +224,6 @@ impl Args {
             "--target-payback-years must be a positive number, got {}",
             self.target_payback_years
         );
-        ensure!(
-            self.gap_threshold_hours.is_finite() && self.gap_threshold_hours > 0.0,
-            "--gap-threshold-hours must be a positive number, got {}",
-            self.gap_threshold_hours
-        );
-        ensure!(
-            self.max_gap > 0,
-            "--max-gap must be positive, got {}",
-            self.max_gap
-        );
-        if let Some(scale) = self.scale {
-            ensure!(
-                scale.is_finite() && scale != 0.0,
-                "--scale must be a non-zero number, got {scale}"
-            );
-        }
         if let Some(threads) = self.threads {
             ensure!(threads > 0, "--threads must be at least 1");
         }
@@ -323,27 +265,8 @@ impl Args {
             }
         };
 
-        let tz = resolve_timezone(self.tz.as_deref())?;
-        let from = self
-            .from
-            .as_deref()
-            .map(|date| parse_local_date(date, tz))
-            .transpose()?;
-        let to = self
-            .to
-            .as_deref()
-            .map(|date| parse_local_date(date, tz))
-            .transpose()?;
-        if let (Some(from), Some(to)) = (from, to)
-            && to <= from
-        {
-            bail!("--to must be after --from");
-        }
-
         Ok(Config {
-            tz,
-            from,
-            to,
+            recorder: self.recorder.resolve()?,
             slot_seconds: self.slot_minutes * 60,
             min_slot_coverage: self.min_slot_coverage,
             sizes,
@@ -361,7 +284,6 @@ impl Args {
                 base_cost: self.base_cost,
                 currency: self.currency.clone(),
             },
-            gap_threshold_seconds: (self.gap_threshold_hours * 3_600.0).round() as i64,
             sensitivity: self.sensitivity / 100.0,
             target_payback_years: self.target_payback_years,
         })
@@ -372,6 +294,8 @@ impl Args {
 mod tests {
     use super::*;
     use chrono_tz::Europe::Berlin;
+    use ha_recorder::source::SourceKind;
+    use ha_recorder::source::schema::ValueColumn;
 
     fn parse(argv: &[&str]) -> Result<Args, clap::Error> {
         let mut all = vec!["energy-storage-payback-period"];
@@ -404,8 +328,8 @@ mod tests {
         assert_eq!(args.target_payback_years, 5.0);
         assert_eq!(args.round_trip, 0.9);
         assert_eq!(args.usable_fraction, 0.9);
-        assert_eq!(args.source, SourceKind::Auto);
-        assert_eq!(args.stat, ValueColumn::Mean);
+        assert_eq!(args.recorder.source, SourceKind::Auto);
+        assert_eq!(args.recorder.stat, ValueColumn::Mean);
         assert_eq!(
             args.out,
             PathBuf::from("energy-storage-payback-period.html")
@@ -418,7 +342,7 @@ mod tests {
         assert_eq!(config.sizes.len(), 20);
         assert_eq!(config.sensitivity, 0.25);
         assert_eq!(config.target_payback_years, 5.0);
-        assert_eq!(config.gap_threshold_seconds, 24 * 3_600);
+        assert_eq!(config.recorder.gap_threshold_seconds, 24 * 3_600);
         assert_eq!(config.battery.capacity_kwh, 0.0, "filled in per size");
     }
 
@@ -428,11 +352,11 @@ mod tests {
         assert!(parse(&["--db", "ha.db", "--import-entity", "sensor.a"]).is_err());
         assert!(parse(&["--db", "ha.db", "--export-entity", "sensor.b"]).is_err());
         let listing = parse(&["--db", "ha.db", "--list-entities"]).expect("no sensors needed");
-        assert_eq!(listing.list_entities.as_deref(), Some(""));
+        assert_eq!(listing.recorder.list_entities.as_deref(), Some(""));
         assert_eq!(listing.import_entity(), "");
 
         let filtered = parse(&["--db", "ha.db", "--list-entities", "grid"]).unwrap();
-        assert_eq!(filtered.list_entities.as_deref(), Some("grid"));
+        assert_eq!(filtered.recorder.list_entities.as_deref(), Some("grid"));
     }
 
     #[test]
@@ -512,8 +436,8 @@ mod tests {
         ])
         .resolve()
         .unwrap();
-        assert_eq!(config.tz, Berlin);
-        assert!(config.from.unwrap() < config.to.unwrap());
+        assert_eq!(config.recorder.tz, Berlin);
+        assert!(config.recorder.from.unwrap() < config.recorder.to.unwrap());
         assert!(
             args(&["--from", "2024-06-22", "--to", "2024-06-21"])
                 .resolve()

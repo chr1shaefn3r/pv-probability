@@ -254,6 +254,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ha-recorder"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "chrono-tz",
+ "clap",
+ "ha-testdb",
+ "rusqlite",
+]
+
+[[package]]
 name = "ha-testdb"
 version = "0.1.0"
 dependencies = [
@@ -427,6 +439,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "clap",
+ "ha-recorder",
  "ha-testdb",
  "rayon",
  "rusqlite",

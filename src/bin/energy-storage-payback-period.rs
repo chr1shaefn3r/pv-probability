@@ -10,19 +10,18 @@ use chrono::DateTime;
 use chrono_tz::Tz;
 use clap::Parser;
 
+use ha_recorder::coverage::Coverage;
+use ha_recorder::model::Grouping;
+use ha_recorder::source::{self, LoadOptions, LoadedSamples};
+use ha_recorder::timeutil::{local_day, local_parts};
 use pv_probability::cli::open_command;
-use pv_probability::coverage::Coverage;
-use pv_probability::model::Grouping;
 use pv_probability::render::{
     PaybackOptions, format_kwh, format_money, format_percent, format_years, payback_page,
 };
-use pv_probability::source::catalog;
-use pv_probability::source::{self, LoadOptions, LoadedSamples};
 use pv_probability::storage::cli::{Args, Config};
 use pv_probability::storage::pair::{Paired, pair};
 use pv_probability::storage::series::{accumulate, grid_for};
 use pv_probability::storage::sweep::{Sweep, sweep};
-use pv_probability::timeutil::{local_day, local_parts};
 
 fn main() {
     if let Err(error) = run() {
@@ -48,30 +47,8 @@ fn run() -> Result<()> {
     }
 
     let started = Instant::now();
-    let conn = source::open_database(&args.db)?;
-    if args.verbose > 0 {
-        eprintln!(
-            "opened {} {}",
-            args.db.display(),
-            source::open_mode(&args.db).describe()
-        );
-    }
-
-    if let Some(filter) = &args.list_entities {
-        let candidates = catalog::list_statistics(&conn, Some(filter))?;
-        if candidates.is_empty() {
-            println!(
-                "No statistics in {}{}.",
-                args.db.display(),
-                if filter.trim().is_empty() {
-                    String::new()
-                } else {
-                    format!(" matching {filter:?}")
-                }
-            );
-        } else {
-            print!("{}", catalog::format_listing(&candidates, config.tz, 40));
-        }
+    let conn = args.recorder.open(args.verbose > 0)?;
+    if args.recorder.print_listing(&conn, config.recorder.tz)? {
         return Ok(());
     }
 
@@ -102,7 +79,7 @@ fn run() -> Result<()> {
                 &conn,
                 &load_options(&args, &config, entity),
                 loaded,
-                config.tz,
+                config.recorder.tz,
             ));
         }
     }
@@ -141,15 +118,15 @@ fn run() -> Result<()> {
     }
 
     let samples = paired.samples();
-    let (observed_days, full_days) = day_counts(&paired, config.tz);
+    let (observed_days, full_days) = day_counts(&paired, config.recorder.tz);
     let coverage = Coverage::describe(
         &samples,
         observed_days,
         full_days,
-        &present_months(&paired, config.tz),
+        &present_months(&paired, config.recorder.tz),
         Grouping::Month,
-        config.tz,
-        config.gap_threshold_seconds,
+        config.recorder.tz,
+        config.recorder.gap_threshold_seconds,
     );
 
     let html = payback_page(
@@ -160,7 +137,7 @@ fn run() -> Result<()> {
             export_entity: args.export_entity().to_string(),
             metadata: metadata(&args, &config, &import, &export),
             coverage: coverage.clone(),
-            tz: config.tz,
+            tz: config.recorder.tz,
             sensitivity: config.sensitivity,
             target_payback_years: config.target_payback_years,
         },
@@ -170,7 +147,7 @@ fn run() -> Result<()> {
 
     report(&args, &config, &result, &paired, html.len(), started);
     if let Some(coverage) = &coverage {
-        println!("{}", coverage_line(coverage, config.tz));
+        println!("{}", coverage_line(coverage, config.recorder.tz));
     }
 
     // The last line is the one worth copying.
@@ -180,23 +157,13 @@ fn run() -> Result<()> {
 
 /// Load one sensor on its own read-only connection.
 fn read(args: &Args, config: &Config, entity: &str) -> Result<LoadedSamples> {
-    let conn = source::open_database(&args.db)?;
+    let conn = source::open_database(&args.recorder.db)?;
     source::load(&conn, &load_options(args, config, entity))
 }
 
-fn load_options<'a>(args: &'a Args, config: &Config, entity: &'a str) -> LoadOptions<'a> {
-    LoadOptions {
-        entity,
-        source: args.source,
-        value: args.stat,
-        from: config.from,
-        to: config.to,
-        max_gap: args.max_gap,
-        scale: args.scale,
-        // A grid meter reading below zero is noise, not generation.
-        clamp_negative: true,
-        tz: config.tz,
-    }
+fn load_options<'a>(args: &Args, config: &Config, entity: &'a str) -> LoadOptions<'a> {
+    // A grid meter reading below zero is noise, not generation.
+    args.recorder.load_options(entity, &config.recorder, true)
 }
 
 /// What the run found, in the order it matters.
@@ -339,7 +306,7 @@ fn metadata(
 ) -> Vec<(String, String)> {
     let mut metadata = vec![
         ("Source".to_string(), import.source.to_string()),
-        ("Timezone".to_string(), config.tz.to_string()),
+        ("Timezone".to_string(), config.recorder.tz.to_string()),
         (
             "Slot".to_string(),
             format!("{} minutes", config.slot_seconds / 60),
@@ -352,8 +319,8 @@ fn metadata(
             "Range".to_string(),
             format!(
                 "{} to {}",
-                local_date(first, config.tz),
-                local_date(last, config.tz)
+                local_date(first, config.recorder.tz),
+                local_date(last, config.recorder.tz)
             ),
         ));
     }
@@ -384,8 +351,11 @@ fn metadata(
             }
         ),
     ));
-    if args.source == pv_probability::source::SourceKind::States {
-        metadata.push(("Max gap".to_string(), format!("{} s", args.max_gap)));
+    if args.recorder.source == ha_recorder::source::SourceKind::States {
+        metadata.push((
+            "Max gap".to_string(),
+            format!("{} s", args.recorder.max_gap),
+        ));
     }
     metadata
 }

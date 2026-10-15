@@ -6,13 +6,12 @@ use chrono::DateTime;
 use chrono_tz::Tz;
 use clap::Parser;
 
+use ha_recorder::coverage::{Coverage, possible_days_per_facet};
+use ha_recorder::source::{self, LoadedSamples, SourceKind};
 use pv_probability::aggregate::{analyse, build_grid, suggest_max_watts};
 use pv_probability::cli::{self, Args};
-use pv_probability::coverage::{Coverage, possible_days_per_facet};
 use pv_probability::model::BucketSpec;
 use pv_probability::render::{PageOptions, describe_window, format_duration, format_watts, page};
-use pv_probability::source::catalog;
-use pv_probability::source::{self, LoadOptions, LoadedSamples, SourceKind};
 
 fn main() {
     if let Err(error) = run() {
@@ -38,47 +37,15 @@ fn run() -> Result<()> {
     }
 
     let started = Instant::now();
-    let conn = source::open_database(&args.db)?;
-    if args.verbose > 0 {
-        eprintln!(
-            "opened {} {}",
-            args.db.display(),
-            source::open_mode(&args.db).describe()
-        );
-    }
-
-    if let Some(filter) = &args.list_entities {
-        let candidates = catalog::list_statistics(&conn, Some(filter))?;
-        if candidates.is_empty() {
-            println!(
-                "No statistics in {}{}.",
-                args.db.display(),
-                if filter.trim().is_empty() {
-                    String::new()
-                } else {
-                    format!(" matching {filter:?}")
-                }
-            );
-        } else {
-            print!("{}", catalog::format_listing(&candidates, config.tz, 40));
-        }
+    let conn = args.recorder.open(args.verbose > 0)?;
+    if args.recorder.print_listing(&conn, config.recorder.tz)? {
         return Ok(());
     }
 
-    let loaded = source::load(
-        &conn,
-        &LoadOptions {
-            entity: args.entity(),
-            source: args.source,
-            value: args.stat,
-            from: config.from,
-            to: config.to,
-            max_gap: args.max_gap,
-            scale: args.scale,
-            clamp_negative: config.clamp_negative,
-            tz: config.tz,
-        },
-    )?;
+    let load_options =
+        args.recorder
+            .load_options(args.entity(), &config.recorder, config.clamp_negative);
+    let loaded = source::load(&conn, &load_options)?;
     if args.verbose > 0 {
         eprintln!(
             "read {} rows from `{}` in {:.2?}",
@@ -91,19 +58,9 @@ fn run() -> Result<()> {
     if loaded.samples.is_empty() {
         return Err(source::explain_no_samples(
             &conn,
-            &LoadOptions {
-                entity: args.entity(),
-                source: args.source,
-                value: args.stat,
-                from: config.from,
-                to: config.to,
-                max_gap: args.max_gap,
-                scale: args.scale,
-                clamp_negative: config.clamp_negative,
-                tz: config.tz,
-            },
+            &load_options,
             &loaded,
-            config.tz,
+            config.recorder.tz,
         ));
     }
 
@@ -114,12 +71,12 @@ fn run() -> Result<()> {
     let buckets = BucketSpec::new(args.step_watts, max_watts)?;
 
     let aggregation_started = Instant::now();
-    let grid = build_grid(&loaded.samples, args.group, buckets, config.tz);
+    let grid = build_grid(&loaded.samples, args.group, buckets, config.recorder.tz);
     let possible_days = match (loaded.first_ts, loaded.last_ts) {
         (Some(first), Some(last)) => possible_days_per_facet(
             first,
             last.saturating_sub(1).max(first),
-            config.tz,
+            config.recorder.tz,
             args.group,
         ),
         _ => Vec::new(),
@@ -135,8 +92,8 @@ fn run() -> Result<()> {
             .map(|facet| facet.index)
             .collect::<Vec<_>>(),
         args.group,
-        config.tz,
-        config.gap_threshold_seconds,
+        config.recorder.tz,
+        config.recorder.gap_threshold_seconds,
     );
     if args.verbose > 0 {
         eprintln!(
@@ -152,9 +109,9 @@ fn run() -> Result<()> {
         &analysis,
         &PageOptions {
             entity: args.entity().to_string(),
-            metadata: metadata(&args, &loaded, config.tz),
+            metadata: metadata(&args, &loaded, config.recorder.tz),
             coverage: coverage.clone(),
-            tz: config.tz,
+            tz: config.recorder.tz,
             levels: args.levels,
             gamma: args.gamma,
             min_probability: args.min_probability,
@@ -179,14 +136,14 @@ fn run() -> Result<()> {
         describe_window(&analysis.overall_window(args.reliable_watts, args.reliable_probability))
     );
     if let Some(coverage) = &coverage {
-        println!("{}", coverage_line(coverage, config.tz));
+        println!("{}", coverage_line(coverage, config.recorder.tz));
         if args.verbose > 0 {
             for gap in &coverage.gaps {
                 eprintln!(
                     "  outage: {} from {} to {}",
                     format_duration(gap.seconds() as f64),
-                    local_stamp(gap.start_ts, config.tz),
-                    local_stamp(gap.end_ts, config.tz)
+                    local_stamp(gap.start_ts, config.recorder.tz),
+                    local_stamp(gap.end_ts, config.recorder.tz)
                 );
             }
         }
@@ -255,7 +212,7 @@ fn metadata(args: &Args, loaded: &LoadedSamples, tz: Tz) -> Vec<(String, String)
     ) {
         metadata.push((
             "Statistic".to_string(),
-            format!("{:?}", args.stat).to_lowercase(),
+            format!("{:?}", args.recorder.stat).to_lowercase(),
         ));
     }
     if let (Some(first), Some(last)) = (loaded.first_ts, loaded.last_ts) {
@@ -275,7 +232,10 @@ fn metadata(args: &Args, loaded: &LoadedSamples, tz: Tz) -> Vec<(String, String)
         metadata.push(("Scale".to_string(), format!("x{}", loaded.scale)));
     }
     if loaded.source == SourceKind::States {
-        metadata.push(("Max gap".to_string(), format!("{} s", args.max_gap)));
+        metadata.push((
+            "Max gap".to_string(),
+            format!("{} s", args.recorder.max_gap),
+        ));
     }
     if args.max_watts.is_some() {
         metadata.push((

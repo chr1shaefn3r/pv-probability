@@ -5,8 +5,6 @@ use std::fmt::Write as _;
 
 use chrono_tz::Tz;
 
-use crate::coverage::Coverage;
-use crate::model::Grouping;
 use crate::render::layout::{
     CHROME_CSS, Shell, coverage_section, document, metadata_list, theme_stylesheet,
 };
@@ -14,6 +12,8 @@ use crate::render::svg::nice_ticks;
 use crate::render::{color, escape, format_kwh, format_money, format_percent, format_years};
 use crate::storage::pair::Paired;
 use crate::storage::sweep::{Budget, SizeResult, Sweep};
+use ha_recorder::coverage::Coverage;
+use ha_recorder::model::Grouping;
 
 /// Everything the page needs beyond the sweep itself.
 #[derive(Debug, Clone, PartialEq)]

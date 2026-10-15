@@ -4,10 +4,10 @@ use chrono_tz::Europe::Berlin;
 use chrono_tz::Tz::UTC;
 use rusqlite::Connection;
 
+use ha_recorder::source::schema::ValueColumn;
+use ha_recorder::source::{LoadOptions, SourceKind, load};
 use ha_testdb::{self as testdb, EXPORT_ENTITY, IMPORT_ENTITY};
 use pv_probability::render::{PaybackOptions, payback_page};
-use pv_probability::source::schema::ValueColumn;
-use pv_probability::source::{LoadOptions, SourceKind, load};
 use pv_probability::storage::pair::{Paired, pair};
 use pv_probability::storage::series::{accumulate, grid_for};
 use pv_probability::storage::simulate::{BatterySpec, simulate};
@@ -365,7 +365,7 @@ fn an_energy_counter_passed_by_mistake_is_diagnosed_rather_than_read() {
         "a kWh counter has no mean to read"
     );
 
-    let error = pv_probability::source::explain_no_samples(
+    let error = ha_recorder::source::explain_no_samples(
         &conn,
         &options("sensor.grid_import_energy"),
         &loaded,

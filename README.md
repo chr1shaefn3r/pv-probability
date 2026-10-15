@@ -476,12 +476,10 @@ Layout:
 
 | Path | Contents |
 |---|---|
+| `crates/ha-recorder/` | Reading the database: schema probing, the statistics / states readers, the entity catalogue, outage detection, DST-safe time, and the command line options every tool shares |
 | `src/cli.rs` | Command line surface and validation (`src/storage/cli.rs` for the other tool) |
-| `src/timeutil.rs` | Timezone resolution, DST-safe hour splitting |
-| `src/model.rs` | `Sample`, `BucketSpec`, the additive `Grid` |
-| `src/source/` | Schema probing, the statistics / states readers, the entity catalogue |
+| `src/model.rs` | `BucketSpec`, the additive `Grid` |
 | `src/aggregate.rs` | Parallel folding, exceedance and density |
-| `src/coverage.rs` | Outage detection and what the history really covers |
 | `src/storage/` | Slot energy accounting, the battery simulation and the size sweep |
 | `src/render/` | Colour scale, per-facet SVG, the shared page shell, both reports |
 | `src/bin/energy-storage-payback-period.rs` | The payback tool's entry point |
