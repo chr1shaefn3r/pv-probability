@@ -1,0 +1,16 @@
+[package]
+name = "ha-testdb"
+description = "Synthetic Home Assistant recorder databases for tests and the demo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+chrono.workspace = true
+rusqlite.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true

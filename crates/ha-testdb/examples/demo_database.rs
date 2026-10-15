@@ -4,7 +4,8 @@
 //! ```text
 //! cargo run --release --example demo_database -- demo.db 730 dense
 //! cargo run --release --example demo_database -- demo.db 200 spotty
-//! cargo run --release -- --db demo.db --entity sensor.solar_power --tz Europe/Berlin
+//! cargo run --release --bin pv-probability -- --db demo.db --entity sensor.solar_power \
+//!     --tz Europe/Berlin
 //! cargo run --release --bin energy-storage-payback-period -- --db demo.db \
 //!     --import-entity sensor.grid_import_power --export-entity sensor.grid_export_power
 //! ```
@@ -14,7 +15,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 
-use pv_probability::source::testdb::{self, ENTITY};
+use ha_testdb::{self as testdb, ENTITY};
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);

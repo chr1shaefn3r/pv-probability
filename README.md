@@ -65,8 +65,8 @@ carries a solar power sensor, an energy counter and a pair of grid meters, so bo
 have something to read:
 
 ```sh
-cargo run --release --example demo_database -- demo.db 730 dense
-cargo run --release --example demo_database -- demo.db 165 spotty   # 5 months, outages
+cargo run --release -p ha-testdb --example demo_database -- demo.db 730 dense
+cargo run --release -p ha-testdb --example demo_database -- demo.db 165 spotty  # 5 months, outages
 cargo run --release --bin pv-probability -- --db demo.db --entity sensor.solar_power \
   --tz Europe/Berlin
 cargo run --release --bin energy-storage-payback-period -- --db demo.db \
@@ -460,12 +460,12 @@ wall-clock time than a coarse one until it runs out of cores.
 ## Development
 
 ```sh
-cargo test                                        # 290+ unit and integration tests
-cargo clippy --all-targets --all-features -- -D warnings
+cargo test --workspace                            # 310+ unit and integration tests
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all
 ```
 
-The test suite never touches a real Home Assistant: `src/source/testdb.rs` builds
+The test suite never touches a real Home Assistant: `crates/ha-testdb` builds
 synthetic recorder databases in both schema generations, including a reproducible
 synthetic solar year - with or without outages - used by `tests/end_to_end.rs` and
 `tests/payback.rs`. GitHub Actions runs formatting, clippy
@@ -485,7 +485,7 @@ Layout:
 | `src/storage/` | Slot energy accounting, the battery simulation and the size sweep |
 | `src/render/` | Colour scale, per-facet SVG, the shared page shell, both reports |
 | `src/bin/energy-storage-payback-period.rs` | The payback tool's entry point |
-| `examples/demo_database.rs` | Writes a synthetic recorder database |
+| `crates/ha-testdb/` | Synthetic recorder databases for the tests, and the demo database example |
 
 ## Colour scale
 

@@ -160,7 +160,7 @@ pub fn time_column(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::testdb::{self, ENTITY, Flavour, ts};
+    use ha_testdb::{self as testdb, ENTITY, Flavour, ts};
 
     fn request<'a>(statistic_id: &'a str) -> Request<'a> {
         Request {

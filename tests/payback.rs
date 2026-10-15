@@ -4,9 +4,9 @@ use chrono_tz::Europe::Berlin;
 use chrono_tz::Tz::UTC;
 use rusqlite::Connection;
 
+use ha_testdb::{self as testdb, EXPORT_ENTITY, IMPORT_ENTITY};
 use pv_probability::render::{PaybackOptions, payback_page};
 use pv_probability::source::schema::ValueColumn;
-use pv_probability::source::testdb::{self, EXPORT_ENTITY, IMPORT_ENTITY};
 use pv_probability::source::{LoadOptions, SourceKind, load};
 use pv_probability::storage::pair::{Paired, pair};
 use pv_probability::storage::series::{accumulate, grid_for};

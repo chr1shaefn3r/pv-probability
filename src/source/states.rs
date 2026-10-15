@@ -163,7 +163,7 @@ pub fn samples_from_readings(readings: &[(i64, Option<f64>)], max_gap: i64) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::testdb::{self, ENTITY, Flavour, ts};
+    use ha_testdb::{self as testdb, ENTITY, Flavour, ts};
 
     fn request<'a>(entity_id: &'a str) -> Request<'a> {
         Request {

@@ -365,6 +365,15 @@ mod tests {
     }
 
     #[test]
+    fn reads_back_what_the_legacy_test_schema_writes() {
+        let stamp = ts("2024-06-21 09:00:00");
+        assert_eq!(
+            parse_ha_datetime(&ha_testdb::format_utc(stamp)),
+            Some(stamp)
+        );
+    }
+
+    #[test]
     fn parses_cli_dates_as_local_midnight() {
         // Local midnight in Berlin in summer is 22:00 UTC the previous day.
         assert_eq!(

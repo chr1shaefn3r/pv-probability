@@ -1,13 +1,14 @@
 //! Builders for synthetic Home Assistant recorder databases.
 //!
-//! Home Assistant is deliberately never contacted by this crate's tests, so every reader
-//! is exercised against databases created here instead: one shaped like a current
-//! recorder schema, one shaped like a pre-2023 schema, and a multi-year synthetic solar
-//! year for the end-to-end test.
+//! Home Assistant is deliberately never contacted by any test in this workspace, so every
+//! reader is exercised against databases created here instead: one shaped like a current
+//! recorder schema, one shaped like a pre-2023 schema, and multi-year synthetic histories
+//! for the end-to-end tests and the demo database.
+//!
+//! This crate depends on nothing else in the workspace, so every other crate can take it
+//! as a dev-dependency without a cycle.
 
 use rusqlite::Connection;
-
-use crate::timeutil::parse_ha_datetime;
 
 /// Entity used throughout the tests.
 pub const ENTITY: &str = "sensor.solar_power";
@@ -280,9 +281,12 @@ pub fn format_utc(ts: i64) -> String {
         .to_string()
 }
 
-/// Parse a UTC timestamp in tests.
+/// Parse a UTC timestamp written `YYYY-MM-DD HH:MM:SS` in tests.
 pub fn ts(text: &str) -> i64 {
-    parse_ha_datetime(text).expect("test timestamp parses")
+    chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S")
+        .expect("test timestamp parses")
+        .and_utc()
+        .timestamp()
 }
 
 /// A small in-memory database in the modern schema: three hourly statistics rows, three
@@ -676,9 +680,13 @@ mod tests {
     }
 
     #[test]
-    fn legacy_timestamps_round_trip() {
-        let stamp = ts("2024-06-21 09:00:00");
-        assert_eq!(parse_ha_datetime(&format_utc(stamp)), Some(stamp));
+    fn test_timestamps_are_utc() {
+        assert_eq!(ts("1970-01-01 00:00:00"), 0);
+        assert_eq!(ts("2024-06-21 09:00:00"), 1_718_960_400);
+        assert_eq!(
+            format_utc(ts("2024-06-21 09:00:00")),
+            "2024-06-21 09:00:00.000000"
+        );
     }
 
     #[test]

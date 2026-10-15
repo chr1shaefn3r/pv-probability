@@ -370,7 +370,7 @@ mod tests {
     use super::*;
     use chrono_tz::Tz::UTC;
 
-    use crate::source::testdb::{self, ENTITY, Flavour, ts};
+    use ha_testdb::{self as testdb, ENTITY, Flavour, ts};
 
     /// A database with a power sensor, its energy counter sibling, and a thermometer.
     fn database() -> Connection {

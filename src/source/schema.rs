@@ -352,7 +352,7 @@ pub fn value_to_f64(value: &Value) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::testdb;
+    use ha_testdb as testdb;
 
     #[test]
     fn detects_the_modern_statistics_layout() {

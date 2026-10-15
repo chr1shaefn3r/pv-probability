@@ -4,7 +4,6 @@ pub mod catalog;
 pub mod schema;
 pub mod states;
 pub mod statistics;
-pub mod testdb;
 
 use std::path::Path;
 
@@ -352,7 +351,7 @@ mod tests {
     use super::*;
     use chrono_tz::Tz::UTC;
 
-    use crate::source::testdb::{self, ENTITY, Flavour, ts};
+    use ha_testdb::{self as testdb, ENTITY, Flavour, ts};
 
     fn options(entity: &str) -> LoadOptions<'_> {
         LoadOptions {
