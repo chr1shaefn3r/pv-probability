@@ -468,7 +468,7 @@ cargo fmt --all
 The test suite never touches a real Home Assistant: `crates/ha-testdb` builds
 synthetic recorder databases in both schema generations, including a reproducible
 synthetic solar year - with or without outages - used by `tests/end_to_end.rs` and
-`tests/payback.rs`. GitHub Actions runs formatting, clippy
+`tools/energy-storage-payback-period/tests/payback.rs`. GitHub Actions runs formatting, clippy
 and the whole suite on every push to `main` and on every pull request
 (`.github/workflows/ci.yml`).
 
@@ -477,13 +477,12 @@ Layout:
 | Path | Contents |
 |---|---|
 | `crates/ha-recorder/` | Reading the database: schema probing, the statistics / states readers, the entity catalogue, outage detection, DST-safe time, and the command line options every tool shares |
-| `src/cli.rs` | Command line surface and validation (`src/storage/cli.rs` for the other tool) |
+| `src/cli.rs` | Command line surface and validation |
 | `src/model.rs` | `BucketSpec`, the additive `Grid` |
 | `src/aggregate.rs` | Parallel folding, exceedance and density |
-| `src/storage/` | Slot energy accounting, the battery simulation and the size sweep |
 | `crates/ha-report/` | The page every report shares: the HTML shell, the light and dark palettes, colour scales, number formatting |
-| `src/render/` | The per-facet SVG and both reports' bodies |
-| `src/bin/energy-storage-payback-period.rs` | The payback tool's entry point |
+| `src/render/` | The per-facet SVG and the heatmap report |
+| `tools/energy-storage-payback-period/` | The payback tool: slot energy accounting, the battery simulation, the size sweep and its report |
 | `crates/ha-testdb/` | Synthetic recorder databases for the tests, and the demo database example |
 
 ## Colour scale

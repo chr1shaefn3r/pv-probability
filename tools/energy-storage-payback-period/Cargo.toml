@@ -1,0 +1,23 @@
+[package]
+name = "energy-storage-payback-period"
+description = "Work out how long a home battery would take to pay for itself, from the grid import and export power sensors a Home Assistant recorder database already holds"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["battery", "solar", "home-assistant", "payback", "energy-storage"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+clap.workspace = true
+ha-recorder.workspace = true
+ha-report.workspace = true
+rayon.workspace = true
+
+[dev-dependencies]
+ha-testdb.workspace = true
+rusqlite.workspace = true

@@ -1,6 +1,6 @@
 //! Replaying one battery over the paired timeline.
 
-use crate::storage::pair::PairedStep;
+use crate::pair::PairedStep;
 
 /// The battery being tried out.
 #[derive(Debug, Clone, Copy, PartialEq)]

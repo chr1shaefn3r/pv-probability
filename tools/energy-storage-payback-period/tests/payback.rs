@@ -4,14 +4,14 @@ use chrono_tz::Europe::Berlin;
 use chrono_tz::Tz::UTC;
 use rusqlite::Connection;
 
+use energy_storage_payback_period::pair::{Paired, pair};
+use energy_storage_payback_period::report::{PaybackOptions, page as payback_page};
+use energy_storage_payback_period::series::{accumulate, grid_for};
+use energy_storage_payback_period::simulate::{BatterySpec, simulate};
+use energy_storage_payback_period::sweep::{Economics, Sweep, size_range, sweep};
 use ha_recorder::source::schema::ValueColumn;
 use ha_recorder::source::{LoadOptions, SourceKind, load};
 use ha_testdb::{self as testdb, EXPORT_ENTITY, IMPORT_ENTITY};
-use pv_probability::render::{PaybackOptions, payback_page};
-use pv_probability::storage::pair::{Paired, pair};
-use pv_probability::storage::series::{accumulate, grid_for};
-use pv_probability::storage::simulate::{BatterySpec, simulate};
-use pv_probability::storage::sweep::{Economics, Sweep, size_range, sweep};
 
 const HOUR: i64 = 3_600;
 
@@ -179,7 +179,7 @@ fn the_budget_for_a_target_is_what_actually_hits_that_target() {
                 continue;
             }
             // Paying exactly the budget hits the target, to the last decimal.
-            let years = pv_probability::storage::sweep::payback_years(
+            let years = energy_storage_payback_period::sweep::payback_years(
                 budget.investment,
                 size.annual_savings,
             );

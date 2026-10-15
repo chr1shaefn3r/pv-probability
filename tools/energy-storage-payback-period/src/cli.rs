@@ -6,8 +6,8 @@ use anyhow::{Result, ensure};
 use clap::Parser;
 use ha_recorder::{RecorderArgs, RecorderConfig};
 
-use crate::storage::simulate::BatterySpec;
-use crate::storage::sweep::{Economics, size_range};
+use crate::simulate::BatterySpec;
+use crate::sweep::{Economics, size_range};
 
 /// Work out how long a home battery would take to pay for itself, from the grid import
 /// and export power sensors a Home Assistant recorder database already holds.

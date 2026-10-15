@@ -2,8 +2,8 @@
 
 use rayon::prelude::*;
 
-use crate::storage::pair::Paired;
-use crate::storage::simulate::{BatterySpec, Simulation, simulate};
+use crate::pair::Paired;
+use crate::simulate::{BatterySpec, Simulation, simulate};
 
 /// Seconds in a mean Gregorian year, used to annualise a partial history.
 pub const SECONDS_PER_YEAR: f64 = 365.2425 * 86_400.0;
@@ -255,7 +255,7 @@ pub fn sweep(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::pair::PairedStep;
+    use crate::pair::PairedStep;
 
     fn economics() -> Economics {
         Economics {

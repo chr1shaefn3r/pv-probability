@@ -5,7 +5,7 @@
 //! surplus a battery would have stored. Slots that fail that test are dropped and
 //! counted, never quietly treated as zero.
 
-use crate::storage::series::Slots;
+use crate::series::Slots;
 use ha_recorder::model::Sample;
 
 /// One slot both sensors covered.
@@ -112,7 +112,7 @@ pub fn pair(import: &Slots, export: &Slots, min_coverage: f64) -> Paired {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::series::{SlotGrid, accumulate};
+    use crate::series::{SlotGrid, accumulate};
 
     const HOUR: i64 = 3_600;
 

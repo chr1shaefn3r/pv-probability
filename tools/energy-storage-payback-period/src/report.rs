@@ -5,8 +5,8 @@ use std::fmt::Write as _;
 
 use chrono_tz::Tz;
 
-use crate::storage::pair::Paired;
-use crate::storage::sweep::{Budget, SizeResult, Sweep};
+use crate::pair::Paired;
+use crate::sweep::{Budget, SizeResult, Sweep};
 use ha_recorder::coverage::Coverage;
 use ha_recorder::model::Grouping;
 use ha_report::axis::nice_ticks;
@@ -759,9 +759,9 @@ mod tests {
     use super::*;
     use chrono_tz::Tz::UTC;
 
-    use crate::storage::pair::PairedStep;
-    use crate::storage::simulate::BatterySpec;
-    use crate::storage::sweep::{Economics, size_range, sweep as run_sweep};
+    use crate::pair::PairedStep;
+    use crate::simulate::BatterySpec;
+    use crate::sweep::{Economics, size_range, sweep as run_sweep};
 
     fn economics() -> Economics {
         Economics {

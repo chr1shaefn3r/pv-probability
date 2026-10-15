@@ -1,5 +1,13 @@
 [workspace]
-members = [".", "crates/ha-recorder", "crates/ha-report", "crates/ha-testdb"]
+members = [
+    ".",
+    "crates/ha-recorder",
+    "crates/ha-report",
+    "crates/ha-testdb",
+    "tools/energy-storage-payback-period",
+]
+# What a plain `cargo build` or `cargo run --bin` at the root covers: every tool.
+default-members = [".", "tools/energy-storage-payback-period"]
 
 [workspace.package]
 version = "0.1.0"
@@ -35,14 +43,6 @@ repository.workspace = true
 readme = "README.md"
 keywords = ["solar", "photovoltaic", "home-assistant", "statistics", "visualization"]
 categories = ["command-line-utilities", "visualization"]
-
-[[bin]]
-name = "pv-probability"
-path = "src/main.rs"
-
-[[bin]]
-name = "energy-storage-payback-period"
-path = "src/bin/energy-storage-payback-period.rs"
 
 [dependencies]
 anyhow.workspace = true
