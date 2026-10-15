@@ -4,7 +4,7 @@
 //! * [`layout`] is the shell - the theme switch, the page chrome, the metadata card and
 //!   the History block - that every report wraps its own body in.
 //! * [`color`] holds the colour scales a report may draw with, as CSS custom properties.
-//! * [`format`] writes numbers the way every report states them, and [`axis`] picks
+//! * [`format`](mod@format) writes numbers the way every report states them, and [`axis`] picks
 //!   gridlines.
 //!
 //! Like `ha-recorder`, nothing here knows what question a tool answers: a change here
