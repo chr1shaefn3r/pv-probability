@@ -5,8 +5,9 @@
 //! surplus a battery would have stored. Slots that fail that test are dropped and
 //! counted, never quietly treated as zero.
 
-use crate::series::Slots;
 use ha_recorder::model::Sample;
+
+use crate::series::Slots;
 
 /// One slot both sensors covered.
 #[derive(Debug, Clone, Copy, PartialEq)]

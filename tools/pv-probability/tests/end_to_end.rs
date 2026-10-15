@@ -12,6 +12,7 @@ use ha_recorder::model::Grouping;
 use ha_recorder::source::schema::ValueColumn;
 use ha_recorder::source::{LoadOptions, LoadedSamples, SourceKind, load};
 use ha_testdb::{self as testdb, ENTITY};
+
 use pv_probability::aggregate::{Analysis, ColumnStatus, analyse, build_grid, suggest_max_watts};
 use pv_probability::model::{BucketSpec, Metric};
 use pv_probability::render::{PageOptions, page};

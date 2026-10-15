@@ -3,19 +3,19 @@
 
 use std::fmt::Write as _;
 
+use chrono_tz::Tz;
 use rayon::prelude::*;
 
-use chrono_tz::Tz;
-
-use crate::aggregate::{Analysis, Facet, ReliableWindow};
-use crate::model::{BucketSpec, HOURS_PER_DAY, Metric};
-use crate::render::svg::{NO_DATA_PATTERN_ID, SvgOptions, axis_ticks, facet_svg};
 use ha_recorder::coverage::Coverage;
 use ha_report::color;
 use ha_report::layout::{
     CHROME_CSS, Shell, coverage_section, document, metadata_list, theme_stylesheet,
 };
 use ha_report::{escape, format_percent, format_watts};
+
+use crate::aggregate::{Analysis, Facet, ReliableWindow};
+use crate::model::{BucketSpec, HOURS_PER_DAY, Metric};
+use crate::render::svg::{NO_DATA_PATTERN_ID, SvgOptions, axis_ticks, facet_svg};
 
 /// Everything the page needs beyond the analysis itself.
 #[derive(Debug, Clone, PartialEq)]

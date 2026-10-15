@@ -7,10 +7,11 @@
 
 use std::fmt::Write as _;
 
-use crate::aggregate::{ColumnStatus, Facet};
-use crate::model::{BucketSpec, HOURS_PER_DAY, Metric};
 use ha_report::axis::nice_ticks;
 use ha_report::{color, escape, format_percent, format_watts};
+
+use crate::aggregate::{ColumnStatus, Facet};
+use crate::model::{BucketSpec, HOURS_PER_DAY, Metric};
 
 /// Width of one hour column, in user units.
 const CELL_WIDTH: f64 = 20.0;

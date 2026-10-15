@@ -1,75 +1,52 @@
-# pv-probability
+# Home Assistant energy analyzer
 
 [![CI](https://github.com/chr1shaefn3r/pv-probability/actions/workflows/ci.yml/badge.svg)](https://github.com/chr1shaefn3r/pv-probability/actions/workflows/ci.yml)
 
-Two command line tools that read a copy of your Home Assistant recorder database and
-answer a question about your solar installation as one self-contained HTML report:
+Command line tools that read a copy of your Home Assistant recorder database and each
+answer one question about your home's energy as a self-contained HTML report:
 
 | Tool | Question |
 |---|---|
-| **`pv-probability`** | How much power can I count on, hour by hour and month by month? |
-| **[`energy-storage-payback-period`](#energy-storage-payback-period)** | How long would a home battery take to pay for itself? |
+| **[`pv-probability`](tools/pv-probability/README.md)** | How much solar power can I count on, hour by hour and month by month? |
+| **[`energy-storage-payback-period`](tools/energy-storage-payback-period/README.md)** | How long would a home battery take to pay for itself? |
 
-Turn a Home Assistant recorder database into "flame graph" heatmaps of how much solar
-power you can actually count on, hour by hour, month by month.
+![Monthly likelihood heatmaps from pv-probability](tools/pv-probability/docs/example-light.png)
 
-One heatmap per month (or per ISO week). The x-axis is the hour of the day, the y-axis is
-power in configurable 50 W steps, and each cell answers a single question:
+Every report is one HTML file: no JavaScript, no web fonts, no network access. It follows
+your system's light/dark setting, with an Auto / Light / Dark switch in the header to
+override it, and ends with a **History** block that says what the recorder really
+covered - how many days, how many outages, the worst of them - because every figure
+above it is conditional on the time that was actually recorded.
 
-> **How often, historically, was at least this much power available at this hour?**
-
-Very likely is deep red, unlikely fades to yellow, and never blank. Read a column upwards
-and the height at which the colour fades is roughly the load you can start at that hour.
-
-![Monthly likelihood heatmaps, light theme](docs/example-light.png)
-
-The report is one self-contained HTML file: no JavaScript, no web fonts, no network
-access. It follows your system's light/dark setting - with an Auto / Light / Dark switch in
-the header to override it - reads out the exact figure above the plot as you hover a cell,
-and carries a table view of the same numbers under each plot. Under the colour key it
-answers the scheduling question directly: [the earliest and latest hour you can count
-on](#the-reliable-window).
-
-![The same report in the dark theme](docs/example-dark.png)
-
-*(The screenshots come from the synthetic `spotty` demo database described below - half a
-year of history with outages in it - not from real production data. The grey strip under
-each plot and the "History" block at the foot of the page are what that partial history
-looks like; see [Partial history and outages](#partial-history-and-outages).)*
+Nothing is ever sent anywhere: the tools are local CLIs that read SQLite and write HTML.
 
 ## Quick start
 
 ```sh
-# 1. Build
+# 1. Build every tool
 cargo build --release
 
 # 2. Take a copy of the recorder database (see "Getting the database" below)
 scp homeassistant.local:/config/home-assistant_v2.db ha.db
 
-# 3. Plot
+# 3. Ask a question
 ./target/release/pv-probability --db ha.db --entity sensor.solar_power --tz Europe/Berlin
+./target/release/energy-storage-payback-period --db ha.db --tz Europe/Berlin \
+  --import-entity sensor.grid_import_power --export-entity sensor.grid_export_power
 ```
 
-It finishes by printing the command that opens the report, ready to paste:
-
-```
-wrote pv-probability.html: 12 facets from 17520 readings (730 d), 159 kB, 9.65ms
-reliable window: 12:00 to the end of the 13:00 hour - at least 100 W in every recorded minute
-covers 2023-01-01 to 2024-12-31 (731 days): 730 days observed, no outage over 24 h
-
-open /home/you/pv-probability.html
-```
+Each finishes by printing the command that opens its report, ready to paste.
 
 No Home Assistant to hand? Generate a synthetic one, either solid or full of holes. It
-carries a solar power sensor, an energy counter and a pair of grid meters, so both tools
-have something to read:
+carries a solar power sensor, an energy counter and a pair of grid meters, so every tool
+has something to read:
 
 ```sh
 cargo run --release -p ha-testdb --example demo_database -- demo.db 730 dense
 cargo run --release -p ha-testdb --example demo_database -- demo.db 165 spotty  # 5 months, outages
-cargo run --release --bin pv-probability -- --db demo.db --entity sensor.solar_power \
+cargo run --release -p pv-probability -- --db demo.db --entity sensor.solar_power \
   --tz Europe/Berlin
-cargo run --release --bin energy-storage-payback-period -- --db demo.db \
+cargo run --release -p energy-storage-payback-period -- --db demo.db \
   --import-entity sensor.grid_import_power --export-entity sensor.grid_export_power
 ```
 
@@ -84,7 +61,7 @@ here:
 | `sensor.…_energy` | `kWh` | `total_increasing` | a running total | no |
 
 The recorder stores them differently: a measurement gets an hourly `mean`, a counter gets a
-`sum` and no mean at all, because the average of a running total means nothing. Point this
+`sum` and no mean at all, because the average of a running total means nothing. Point a
 tool at a counter and there is nothing for it to read - it says so, and names the power
 sensor to use instead.
 
@@ -103,12 +80,12 @@ Energy counters (cumulative totals - not plottable, see the README):
   sensor.solar_energy  kWh   3408 rows  2023-01-01 to 2023-06-15
 ```
 
-`--entity` is not needed when listing. Every error about an entity - unknown, empty, or the
+No entity is needed when listing. Every error about an entity - unknown, empty, or the
 wrong kind - ends with the same shortlist, so the next command is always in front of you.
 
 ## Getting the database
 
-The tool only ever opens the file **read-only**, but SQLite still needs a consistent file.
+The tools only ever open the file **read-only**, but SQLite still needs a consistent file.
 Home Assistant writes continuously, and the recorder runs in WAL mode, so a plain `cp` of
 `home-assistant_v2.db` on a running system can miss everything still sitting in the
 `-wal` sidecar.
@@ -145,9 +122,7 @@ journal *is* there, they fall back to an ordinary read-only open, because `immut
 would silently skip the rows that are still in it - the sidecars stay, but they were
 already there. `-v` says which of the two happened.
 
-Nothing is ever sent anywhere: the tool is a local CLI that reads SQLite and writes HTML.
-
-## Which data it reads
+## Which data the tools read
 
 Home Assistant keeps three different records of a power sensor, and they have very
 different retention. `--source auto` (the default) picks the one with the most history:
@@ -169,330 +144,80 @@ timestamps, `states.entity_id`) are detected automatically.
 If the entity name is wrong - or right but unusable - the error says which, and lists the
 power sensors that would work. See [Finding the right entity](#finding-the-right-entity).
 
-## Partial history and outages
+## Shared options
 
-This is written for a real recorder database, which is rarely a tidy block of years. Less
-than a year of history, and holes in the middle of it, are the normal case.
-
-**What the tool does about it**
-
-* **Months you have no data for are simply absent** from the report - not drawn empty, not
-  guessed at. The header names any that are missing from a span that could have contained
-  them.
-* **Evidence is counted in distinct local days, never in readings.** One sunny morning can
-  be six readings from the hourly statistics table or six hundred from `states`; it is one
-  day of evidence either way. Any (month, hour) column backed by fewer than `--min-days`
-  days (default 3) is **hatched rather than coloured**, so a single February morning cannot
-  masquerade as a settled 100%.
-* **Hours the recorder never covered are hatched differently** from hours it covered only
-  briefly, so "we know nothing about 03:00" is distinguishable from "we have two days of
-  03:00".
-* **A coverage strip under every heatmap** shows, hour by hour, how many distinct days back
-  that column, shaded on a neutral grey scale and exact on hover. The panel caption states
-  the same thing for the month as a whole ("26 of 31 days").
-* **The header reports the real span and the outages in it**: how many days carry data, how
-  many were recorded right through the day, how many outages longer than
-  `--gap-threshold-hours` (default 24) interrupted it, and how long the worst one was. The
-  same summary goes to stdout, with every outage listed under `-v`.
-
-**What it cannot do about it**
-
-Every percentage is conditional on the time that was actually recorded. If the recorder was
-down through a sunny week in July, that week is not represented at all, and July's numbers
-describe the days that survived rather than July. No amount of arithmetic fixes that; the
-coverage strip and the outage summary are there so you can see when it applies.
-
-Two knobs are worth knowing:
-
-* `--min-days 1` shows everything, however thin. `--min-days 10` is strict.
-* `--gap-threshold-hours 6` catches shorter outages. The default of 24 exists because many
-  inverters report `unavailable` all night, and a 14 hour nightly hole would otherwise fill
-  the report with "outages". If your sensor reports 0 W at night instead, lower it.
-
-## How the numbers are computed
-
-* **Time-weighted, not row-weighted.** Every reading is weighted by how long it was in
-  effect, so a sensor that reports rapidly at noon and rarely at dusk does not skew the
-  result. Raw states are carried forward until the next reading, capped at `--max-gap`
-  (default 15 minutes) so a recorder outage is not counted as hours of steady production.
-  A statistics row counts as its hour, a short-term row as its five minutes.
-* **Split at local hour boundaries.** A reading in effect from 13:50 to 14:20 contributes
-  10 minutes to hour 13 and 20 minutes to hour 14.
-* **Daylight saving is handled honestly.** Hours are local wall-clock hours in `--tz`. On
-  the spring-forward day the missing local hour gets no weight; on the fall-back day the
-  repeated hour gets both passes. That is what you want when the question is "at 14:00,
-  what can I run?".
-* **Exceedance by default.** Cell = `P(watts >= the bucket's lower edge)`, computed as a
-  reverse cumulative sum over the power axis and normalised by the observed time of that
-  hour. This is what gives the plot its flame shape. `--metric density` switches to
-  `P(watts inside the bucket)` instead, where each column sums to 100%.
-* **The exceedance axis starts one step up.** "At least 0 W" is true whenever the hour was
-  observed at all, so drawing it would paint a certainty band across the night.
-* **Thin columns are marked, not guessed.** Evidence is counted in distinct local days, so
-  an hour backed by fewer than `--min-days` of them is hatched rather than coloured however
-  many rows the recorder wrote. See [Partial history and outages](#partial-history-and-outages).
-* **Facets pool across years.** Every June in the database contributes to the June
-  heatmap; that is the point of asking about likelihood. Narrow the window with `--from` /
-  `--to` if you want a single season.
-
-## The reliable window
-
-The heatmaps show what is *likely*; a load schedule needs to know what is *safe*. The
-**Reliable window** block, between the colour key and the History section, names the
-earliest and the latest hour of the day that reach a given power - by default 100 W - in
-every recorded minute:
-
-```
-Earliest 12:00, latest 13:00: across the whole record at least 100 W is available in
-every recorded minute of those hours. The window runs from 12:00 to the end of the
-13:00 hour.
-```
-
-The same sentence appears for each individual month or week, at the top of that panel's
-expandable table, so "when can I run this in November?" is answered in the panel itself.
-The line printed after a run carries the overall figure too.
-
-* `--reliable-watts <W>` sets the power. It is rounded **up** to a bucket edge - asking
-  for 120 W with 50 W steps is answered from the "at least 150 W" row, never from the
-  100 W one, which would overstate the claim - and the block says so when it rounds.
-* `--reliable-probability <P>` sets how strict "always" is. At the default of `1` a
-  single recorded hour below the threshold rules that hour of the day out for good, which
-  on a patchy history often leaves no window at all. That is the honest answer, and the
-  report says it in words rather than showing an empty range; `--reliable-probability 0.9`
-  then asks the useful follow-up question.
-* Hours the `--min-days` rule considers too thin never qualify: two sunny mornings are not
-  a guarantee.
-* The overall figure pools every month, weighted by how much of each was actually
-  recorded. At `--reliable-probability 1` that is exactly the intersection of the monthly
-  windows, so the whole record can only promise what its worst month promises - and when
-  the months clear the bar at different hours, the pooled window can be empty while no
-  single month is. The block explains that where it happens.
-
-## Options (pv-probability)
-
-```
-pv-probability --db <FILE> --entity <ENTITY_ID> [OPTIONS]
-```
+Every tool takes the same options for reading the database. `--help` lists them under
+**Reading the database**, after the tool's own:
 
 | Option | Default | What it does |
 |---|---|---|
 | `--db <FILE>` | required | Copy of `home-assistant_v2.db`, opened read-only |
-| `--entity <ID>` | required | `sensor.solar_power`; also accepted as a `statistic_id` |
 | `--list-entities [FILTER]` | off | List what the database holds and exit, power sensors first |
-| `--group <month\|week>` | `month` | One heatmap per calendar month or per ISO week |
-| `--step-watts <W>` | `50` | Height of one power bucket |
-| `--max-watts <W>` | auto | Top of the power axis; everything above lands in the top bucket |
-| `--max-quantile <Q>` | `0.999` | Quantile used to pick the axis when `--max-watts` is absent |
 | `--source <auto\|statistics\|short-term\|states>` | `auto` | Which recorder table to read |
 | `--stat <mean\|min\|max>` | `mean` | Which statistics column to use |
-| `--tz <TZ>` | machine zone | IANA timezone for the hour axis, e.g. `Europe/Berlin` |
+| `--tz <TZ>` | machine zone | IANA timezone for hours and dates, e.g. `Europe/Berlin` |
 | `--from <YYYY-MM-DD>` / `--to <YYYY-MM-DD>` | all data | Local date window, `--to` exclusive |
-| `--metric <exceedance\|density>` | `exceedance` | Cell meaning |
-| `--min-days <N>` | `3` | Hours backed by fewer distinct days are hatched, not coloured |
-| `--gap-threshold-hours <H>` | `24` | Outages at least this long are reported |
-| `--reliable-watts <W>` | `100` | Power the [reliable window](#the-reliable-window) asks about |
-| `--reliable-probability <P>` | `1` | Share of recorded time that has to reach it; `1` means always |
-| `--min-probability <P>` | `0.005` | Cells below this are left blank |
-| `--gamma <G>` | `0.6` | Ramp shaping; below 1 lifts rare-but-real cells into view |
-| `--levels <N>` | `10` | Colour steps on the likelihood scale (3-16) |
 | `--max-gap <SECONDS>` | `900` | How long one raw state reading is assumed to hold |
 | `--scale <FACTOR>` | auto | Multiply readings; `kW`/`MW` units are converted automatically |
-| `--keep-negative` | off | Keep negative readings instead of clamping them to zero |
-| `--threads <N>` | one per core | Cap the rayon worker threads |
-| `-o, --out <FILE>` | `pv-probability.html` | Where to write the report |
-| `-v` | off | Print row counts and timings |
-
-`--help` prints the same list with the full descriptions.
-
-### Examples
-
-```sh
-# Weekly resolution, 100 W buckets, only last year
-pv-probability --db ha.db --entity sensor.solar_power --group week \
-  --step-watts 100 --from 2025-01-01 --to 2026-01-01 --tz Europe/Berlin
-
-# What is the peak within each hour, rather than the hourly average?
-pv-probability --db ha.db --entity sensor.solar_power --stat max
-
-# High-resolution look at the last ten days from the raw states table
-pv-probability --db ha.db --entity sensor.solar_power --source states --group week
-
-# A sensor that reports kilowatts but has no unit recorded
-pv-probability --db ha.db --entity sensor.pv_now --scale 1000
-
-# When can I count on 500 W nine days out of ten?
-pv-probability --db ha.db --entity sensor.solar_power \
-  --reliable-watts 500 --reliable-probability 0.9
-```
-
-## energy-storage-payback-period
-
-The same database usually holds two more sensors: the **power drawn from the grid** and
-the **power fed back into it**. Everything fed back is given away; everything drawn is
-paid for. A battery turns the first into the second - it stores the midday surplus and
-returns it in the evening - so its worth is simply the grid import it avoids.
-
-```sh
-energy-storage-payback-period --db ha.db \
-  --import-entity sensor.grid_import_power \
-  --export-entity sensor.grid_export_power \
-  --tz Europe/Berlin --price-per-kwh 0.35
-```
-
-```
-wrote energy-storage-payback-period.html: 20 sizes over 17520 slots of 60 minutes, 25 kB, 36.5ms
-measured 17.97 MWh imported and 4.32 MWh exported
-best payback: 3 kWh for 3,000 EUR saves 257 EUR a year - paid off in 11.7 years
-for 5 years: it would have to cost 1,283 EUR instead of 3,000 EUR (57% less), which the 1,500 EUR base cost alone already exceeds
-covers 2023-01-01 to 2024-12-31 (731 days): 731 days paired (730 of them full days), 0 outages over 24 h
-
-open /home/you/energy-storage-payback-period.html
-```
-
-The report charts annual savings and payback period against battery size, names the size
-that pays back fastest and the point where further capacity stops earning its keep, and
-shows what the answer becomes at other electricity prices and other quotes. It also runs
-the sum backwards: **how cheap the installation would have to be** to pay back within
-`--target-payback-years` (5 by default).
-
-![Annual savings and payback period by battery size](docs/payback-example.png)
-
-*(From the same synthetic demo database, so the prices and the array are made up - but the
-arithmetic and the simulation are the real ones.)*
-
-**Both sensors must be power sensors in watts** - the same kind the heatmap tool plots.
-A kilowatt-hour counter has no `mean` for the recorder to store, and passing one gets the
-same diagnosis the heatmap tool gives, naming the `_power` sensor beside it.
-`--list-entities` prints what the database holds, power sensors first.
-
-### How the simulation works
-
-* Each sensor is integrated into energy per slot (`--slot-minutes`, hourly by default,
-  which is as fine as a full year of statistics gets). A reading of *w* watts in effect for
-  *s* seconds is `w * s / 3 600 000` kWh, so an hourly mean and a chatty `states` history
-  give the same answer.
-* Only slots **both** sensors really covered are simulated (`--min-slot-coverage`); the
-  rest are counted and reported. A battery cannot be sized against a surplus nobody
-  recorded.
-* Each slot serves the import first and charges from what is left of the export
-  afterwards, respecting `--usable-fraction`, `--round-trip` and the optional
-  `--max-charge-kw` / `--max-discharge-kw`. Import and export inside one slot are *not*
-  netted off: had they been simultaneous the house would never have imported at all.
-* Savings are `avoided import x --price-per-kwh`, less `--feed-in-price` for the export the
-  battery swallowed - zero by default, because the export is gifted.
-* Payback is `(--base-cost + --cost-per-kwh x capacity) / annual savings`. No price
-  escalation, no degradation, no discount rate: the sensitivity block shows what moving the
-  price or the quote does instead.
-* The same sum read backwards gives the **budget**: to pay back within
-  `--target-payback-years`, an installation may cost at most `target x annual savings`.
-  Each row of the table carries that figure and how far the quote would have to fall to
-  meet it; the block below the table works it through for the size that comes closest, and
-  says when `--base-cost` alone already exceeds the budget - the case no cell price, not
-  even zero, can fix.
-* A history shorter than a year is scaled up to one **and** flagged. A summer-heavy
-  history flatters a battery; a winter-heavy one does the opposite.
-* These sensors show what crossed the meter, not what the house used or the roof made, so
-  the report says *grid import avoided* and never claims a self-sufficiency figure.
-
-### Options
-
-| Option | Default | What it does |
-|---|---|---|
-| `--db <FILE>` | required | Copy of `home-assistant_v2.db`, opened read-only |
-| `--import-entity <ID>` | required | Power sensor for energy drawn from the grid |
-| `--export-entity <ID>` | required | Power sensor for energy fed back |
-| `--list-entities [FILTER]` | off | List what the database holds and exit |
-| `--price-per-kwh <P>` | `0.35` | What a kilowatt hour from the grid costs |
-| `--feed-in-price <P>` | `0` | What a kilowatt hour fed back earns |
-| `--cost-per-kwh <C>` | `500` | Installed battery cost per kWh of capacity |
-| `--base-cost <C>` | `1500` | The part of the bill that does not scale with capacity |
-| `--currency <SYMBOL>` | `EUR` | Currency symbol used in the report |
-| `--min-size` / `--max-size` / `--size-step` | `1` / `20` / `1` | The sizes to try, in kWh |
-| `--sizes <LIST>` | off | Exact sizes instead of the range, e.g. `5,10,13.5` |
-| `--round-trip <F>` | `0.9` | Round trip efficiency, charged half on each side |
-| `--usable-fraction <F>` | `0.9` | Share of the nameplate actually cycled |
-| `--max-charge-kw` / `--max-discharge-kw` | unlimited | Inverter power ceilings |
-| `--slot-minutes <M>` | `60` | Simulation slot length; must divide an hour |
-| `--min-slot-coverage <F>` | `0.9` | How much of a slot both sensors must have covered |
-| `--sensitivity <PCT>` | `25` | How far either side the sensitivity grid looks |
-| `--target-payback-years <Y>` | `5` | The payback period the budget is worked back from |
-| `--source` / `--stat` / `--scale` / `--max-gap` | as above | Shared with `pv-probability` |
-| `--tz` / `--from` / `--to` | as above | Timezone and date window |
 | `--gap-threshold-hours <H>` | `24` | Outages at least this long are reported |
-| `--threads <N>` | one per core | Cap the rayon worker threads |
-| `-o, --out <FILE>` | `energy-storage-payback-period.html` | Where to write the report |
-| `-v` | off | Print row counts, thread count and timings |
 
-```sh
-# Real quotes for the two sizes actually on offer, at next year's price
-energy-storage-payback-period --db ha.db \
-  --import-entity sensor.grid_import_power --export-entity sensor.grid_export_power \
-  --sizes 6.5,13 --base-cost 2200 --cost-per-kwh 430 --price-per-kwh 0.42
-
-# How much does hourly resolution flatter the battery? Check against the last ten days
-energy-storage-payback-period --db ha.db \
-  --import-entity sensor.grid_import_power --export-entity sensor.grid_export_power \
-  --source short-term --slot-minutes 5
-
-# What would it have to cost to be square in three years?
-energy-storage-payback-period --db ha.db \
-  --import-entity sensor.grid_import_power --export-entity sensor.grid_export_power \
-  --target-payback-years 3
-```
-
-## Performance
-
-Reading is single-threaded (SQLite), everything after it is parallel: samples are folded
-into per-facet histograms with rayon (`par_chunks` + `reduce`, since the histograms are
-additive), the power axis quantile uses a parallel sort, and the facets are rendered
-concurrently. Two years of hourly statistics (17 520 rows, 129 buckets) load, aggregate
-and render in under 10 ms on a laptop core; the work scales linearly, so even a
-five-minute-resolution decade stays interactive. `--threads` caps the pool if you want to
-leave cores free.
-
-The payback tool reads its two sensors on two connections at once, folds each into slots
-with the same `par_chunks` + `reduce` shape, and then simulates every battery size in
-parallel. A battery's state of charge makes one simulation inherently sequential, so the
-sizes are the unit of parallelism: 391 sizes over two years of hourly slots take 48 ms on
-four cores against 186 ms on one, so a sweep as fine as `--size-step 0.1` costs no more
-wall-clock time than a coarse one until it runs out of cores.
+Each tool also takes `--threads <N>` to cap its rayon worker threads, `-o` for where to
+write the report, and `-v` for timings and row counts.
 
 ## Development
 
 ```sh
-cargo test --workspace                            # 310+ unit and integration tests
+cargo test --workspace                            # 320+ unit and integration tests
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all
+cargo test -p pv-probability                      # one tool and what it depends on
 ```
 
 The test suite never touches a real Home Assistant: `crates/ha-testdb` builds
-synthetic recorder databases in both schema generations, including a reproducible
-synthetic solar year - with or without outages - used by `tests/end_to_end.rs` and
-`tools/energy-storage-payback-period/tests/payback.rs`. GitHub Actions runs formatting, clippy
-and the whole suite on every push to `main` and on every pull request
-(`.github/workflows/ci.yml`).
+synthetic recorder databases in both schema generations, including reproducible
+synthetic histories - with or without outages - for each tool's end-to-end test.
+GitHub Actions runs formatting, clippy, the whole suite and a release build on every push
+to `main` and on every pull request (`.github/workflows/ci.yml`).
 
-Layout:
+### Layout
 
-| Path | Contents |
-|---|---|
-| `crates/ha-recorder/` | Reading the database: schema probing, the statistics / states readers, the entity catalogue, outage detection, DST-safe time, and the command line options every tool shares |
-| `src/cli.rs` | Command line surface and validation |
-| `src/model.rs` | `BucketSpec`, the additive `Grid` |
-| `src/aggregate.rs` | Parallel folding, exceedance and density |
-| `crates/ha-report/` | The page every report shares: the HTML shell, the light and dark palettes, colour scales, number formatting |
-| `src/render/` | The per-facet SVG and the heatmap report |
-| `tools/energy-storage-payback-period/` | The payback tool: slot energy accounting, the battery simulation, the size sweep and its report |
-| `crates/ha-testdb/` | Synthetic recorder databases for the tests, and the demo database example |
+The repository is a Cargo workspace with one crate per tool, so a change to one tool
+rebuilds that tool alone:
 
-## Colour scale
+```
+crates/
+  ha-recorder/   reading the database: schema probing, the statistics / states readers,
+                 the entity catalogue, outage coverage, DST-safe time, shared options
+  ha-report/     the page every report shares: HTML shell, light and dark palettes,
+                 colour scales, number formatting
+  ha-testdb/     synthetic recorder databases for the tests (dev-only), and the demo
+tools/
+  pv-probability/                   the heatmap tool
+  energy-storage-payback-period/    the battery payback tool
+```
 
-The ramp is a semantic heat scale, monotone in perceived lightness so it survives
-greyscale printing and colour vision deficiencies: light mode runs pale yellow to deep
-red (OKLCH lightness 0.95 down to 0.43), dark mode runs dim ochre to bright red (0.34 up
-to 0.65). In both themes "unlikely" recedes towards the page and "likely" stands out. The
-legend spells out the probability range of every step, and the table view under each plot
-gives the same numbers as text.
+Dependencies only point one way: each tool depends on `ha-report` and `ha-recorder`,
+`ha-report` on `ha-recorder`, and `ha-testdb` on nothing in the workspace. A tool's own
+code therefore never makes another tool recompile; on four cores, touching one file in a
+tool rebuilds just that tool, in about 13 s for a release build (down from 25 s when both
+tools were one crate) and about 1.3 s for a debug one. A change to a shared crate still
+rebuilds every tool, which is why the shared crates hold only what does not care which
+question is asked.
+
+Every crate takes its dependencies from `[workspace.dependencies]` in the root
+`Cargo.toml`, so a single tool built with `-p` resolves the same features as the whole
+workspace and never forces the shared dependencies to rebuild.
+
+### Adding a tool
+
+1. `tools/<name>/` with a `Cargo.toml` that takes its dependencies with
+   `.workspace = true`, a `src/lib.rs` for the logic and a thin `src/main.rs`.
+2. Flatten `ha_recorder::RecorderArgs` into its clap arguments: that brings every shared
+   option, its validation, `--list-entities` and the loader options.
+3. Wrap the report in `ha_report::layout::document`, passing the colour scales it draws
+   with to `theme_stylesheet`, and end it with `coverage_section`.
+4. Test it end to end against a database from `ha-testdb`, adding whatever sensors it
+   needs there, and give it a `README.md` linked from the table at the top of this one.
 
 ## Licence
 

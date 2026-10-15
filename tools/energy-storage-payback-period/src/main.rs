@@ -10,16 +10,17 @@ use chrono::DateTime;
 use chrono_tz::Tz;
 use clap::Parser;
 
-use energy_storage_payback_period::cli::{Args, Config};
-use energy_storage_payback_period::pair::{Paired, pair};
-use energy_storage_payback_period::report::{PaybackOptions, page as payback_page};
-use energy_storage_payback_period::series::{accumulate, grid_for};
-use energy_storage_payback_period::sweep::{Sweep, sweep};
 use ha_recorder::coverage::Coverage;
 use ha_recorder::model::Grouping;
 use ha_recorder::source::{self, LoadOptions, LoadedSamples};
 use ha_recorder::timeutil::{local_day, local_parts};
 use ha_report::{format_kwh, format_money, format_percent, format_years, open_command};
+
+use energy_storage_payback_period::cli::{Args, Config};
+use energy_storage_payback_period::pair::{Paired, pair};
+use energy_storage_payback_period::report::{PaybackOptions, page as payback_page};
+use energy_storage_payback_period::series::{accumulate, grid_for};
+use energy_storage_payback_period::sweep::{Sweep, sweep};
 
 fn main() {
     if let Err(error) = run() {

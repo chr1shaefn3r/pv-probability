@@ -4,9 +4,9 @@ use chrono_tz::Tz;
 use rayon::prelude::*;
 
 use ha_recorder::model::{Grouping, Sample};
+use ha_recorder::timeutil::for_each_hour_slice;
 
 use crate::model::{BucketSpec, DayWindow, Grid, HOURS_PER_DAY, Metric};
-use ha_recorder::timeutil::for_each_hour_slice;
 
 /// Samples per rayon work unit. Each work unit allocates one partial [`Grid`], so this
 /// trades allocation overhead against parallelism; a few tens of thousands of samples

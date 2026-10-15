@@ -9,6 +9,7 @@ use clap::Parser;
 use ha_recorder::coverage::{Coverage, possible_days_per_facet};
 use ha_recorder::source::{self, LoadedSamples, SourceKind};
 use ha_report::{format_duration, format_watts, open_command};
+
 use pv_probability::aggregate::{analyse, build_grid, suggest_max_watts};
 use pv_probability::cli::Args;
 use pv_probability::model::BucketSpec;

@@ -1,0 +1,24 @@
+[package]
+name = "pv-probability"
+description = "Turn a Home Assistant recorder database into per-month/week solar power likelihood flame graphs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["solar", "photovoltaic", "home-assistant", "statistics", "visualization"]
+categories = ["command-line-utilities", "visualization"]
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+clap.workspace = true
+ha-recorder.workspace = true
+ha-report.workspace = true
+rayon.workspace = true
+
+[dev-dependencies]
+ha-testdb.workspace = true
+rusqlite.workspace = true

@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use anyhow::{Result, ensure};
 use clap::Parser;
+
 use ha_recorder::{RecorderArgs, RecorderConfig};
 
 use crate::simulate::BatterySpec;

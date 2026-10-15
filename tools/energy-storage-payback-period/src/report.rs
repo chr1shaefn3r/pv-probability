@@ -5,8 +5,6 @@ use std::fmt::Write as _;
 
 use chrono_tz::Tz;
 
-use crate::pair::Paired;
-use crate::sweep::{Budget, SizeResult, Sweep};
 use ha_recorder::coverage::Coverage;
 use ha_recorder::model::Grouping;
 use ha_report::axis::nice_ticks;
@@ -14,6 +12,9 @@ use ha_report::layout::{
     CHROME_CSS, Shell, coverage_section, document, metadata_list, theme_stylesheet,
 };
 use ha_report::{color, escape, format_kwh, format_money, format_percent, format_years};
+
+use crate::pair::Paired;
+use crate::sweep::{Budget, SizeResult, Sweep};
 
 /// Everything the page needs beyond the sweep itself.
 #[derive(Debug, Clone, PartialEq)]
