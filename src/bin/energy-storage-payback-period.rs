@@ -14,10 +14,8 @@ use ha_recorder::coverage::Coverage;
 use ha_recorder::model::Grouping;
 use ha_recorder::source::{self, LoadOptions, LoadedSamples};
 use ha_recorder::timeutil::{local_day, local_parts};
-use pv_probability::cli::open_command;
-use pv_probability::render::{
-    PaybackOptions, format_kwh, format_money, format_percent, format_years, payback_page,
-};
+use ha_report::{format_kwh, format_money, format_percent, format_years, open_command};
+use pv_probability::render::{PaybackOptions, payback_page};
 use pv_probability::storage::cli::{Args, Config};
 use pv_probability::storage::pair::{Paired, pair};
 use pv_probability::storage::series::{accumulate, grid_for};

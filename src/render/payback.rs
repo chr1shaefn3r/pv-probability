@@ -5,15 +5,15 @@ use std::fmt::Write as _;
 
 use chrono_tz::Tz;
 
-use crate::render::layout::{
-    CHROME_CSS, Shell, coverage_section, document, metadata_list, theme_stylesheet,
-};
-use crate::render::svg::nice_ticks;
-use crate::render::{color, escape, format_kwh, format_money, format_percent, format_years};
 use crate::storage::pair::Paired;
 use crate::storage::sweep::{Budget, SizeResult, Sweep};
 use ha_recorder::coverage::Coverage;
 use ha_recorder::model::Grouping;
+use ha_report::axis::nice_ticks;
+use ha_report::layout::{
+    CHROME_CSS, Shell, coverage_section, document, metadata_list, theme_stylesheet,
+};
+use ha_report::{color, escape, format_kwh, format_money, format_percent, format_years};
 
 /// Everything the page needs beyond the sweep itself.
 #[derive(Debug, Clone, PartialEq)]
@@ -688,14 +688,18 @@ fn footer(sweep: &Sweep) -> String {
 }
 
 fn stylesheet() -> String {
-    let mut css = theme_stylesheet(color::DEFAULT_LEVELS);
+    // The charts borrow steps of the heat ramp; this page has no coverage strip.
+    let mut css = theme_stylesheet(
+        &color::heat_tokens(color::DEFAULT_LEVELS, false),
+        &color::heat_tokens(color::DEFAULT_LEVELS, true),
+    );
     css.push_str(CHROME_CSS);
     css.push_str(PAYBACK_CSS);
     css
 }
 
 /// The rules only this report needs; the chrome it shares lives in
-/// [`crate::render::layout::CHROME_CSS`].
+/// [`ha_report::layout::CHROME_CSS`].
 const PAYBACK_CSS: &str = "
 .panel {
   margin: 1.25rem 0 0;

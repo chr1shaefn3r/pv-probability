@@ -9,13 +9,13 @@ use chrono_tz::Tz;
 
 use crate::aggregate::{Analysis, Facet, ReliableWindow};
 use crate::model::{BucketSpec, HOURS_PER_DAY, Metric};
-use crate::render::color;
-use crate::render::layout::{
+use crate::render::svg::{NO_DATA_PATTERN_ID, SvgOptions, axis_ticks, facet_svg};
+use ha_recorder::coverage::Coverage;
+use ha_report::color;
+use ha_report::layout::{
     CHROME_CSS, Shell, coverage_section, document, metadata_list, theme_stylesheet,
 };
-use crate::render::svg::{NO_DATA_PATTERN_ID, SvgOptions, axis_ticks, facet_svg};
-use crate::render::{escape, format_percent, format_watts};
-use ha_recorder::coverage::Coverage;
+use ha_report::{escape, format_percent, format_watts};
 
 /// Everything the page needs beyond the analysis itself.
 #[derive(Debug, Clone, PartialEq)]
@@ -534,7 +534,10 @@ fn hidden_defs() -> String {
 }
 
 fn stylesheet(levels: usize) -> String {
-    let mut css = theme_stylesheet(levels);
+    let mut css = theme_stylesheet(
+        &(color::heat_tokens(levels, false) + &color::coverage_tokens(false)),
+        &(color::heat_tokens(levels, true) + &color::coverage_tokens(true)),
+    );
 
     for index in 0..levels {
         let _ = writeln!(
@@ -555,7 +558,7 @@ fn stylesheet(levels: usize) -> String {
 }
 
 /// The rules only the heatmap report needs; the chrome it shares lives in
-/// [`crate::render::page::CHROME_CSS`].
+/// [`ha_report::layout::CHROME_CSS`].
 const HEATMAP_CSS: &str = "
 .legend { margin: 1.25rem 0 0; padding: 0.85rem 1rem; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; }
 .scale { display: flex; flex-wrap: wrap; gap: 0.25rem 0.9rem; list-style: none; margin: 0; padding: 0; }

@@ -1,19 +1,18 @@
-//! The document shell both reports share: the theme switch, the palette, the page
+//! The document shell every report shares: the theme switch, the palette, the page
 //! chrome, the metadata card and the History block.
 //!
-//! Two tools read the same database and answer different questions, and a reader moving
-//! between their reports should not have to learn a second page. Everything here is
+//! Each tool reads the same database and answers a different question, and a reader
+//! moving between their reports should not have to learn a new page. Everything here is
 //! deliberately question-agnostic; what is specific to a report lives beside that
 //! report's markup.
 
 use std::fmt::Write as _;
 
 use chrono_tz::Tz;
-
-use crate::render::color;
-use crate::render::{escape, format_duration, format_percent};
 use ha_recorder::coverage::{Coverage, Gap};
 use ha_recorder::model::Grouping;
+
+use crate::{escape, format_duration, format_percent};
 
 /// Ids the stylesheet keys off; kept beside the markup that emits them.
 pub const THEME_AUTO_ID: &str = "pv-theme-auto";
@@ -235,63 +234,50 @@ fn describe_gap(gap: &Gap, tz: Tz) -> String {
 }
 
 /// The theme half of a stylesheet: the palette, the system preference, and the override.
-pub fn theme_stylesheet(levels: usize) -> String {
+///
+/// `light` and `dark` are the report's own custom properties for each theme - the colour
+/// scales it draws with, usually from [`crate::color`] - and follow the shared ones. The
+/// shell itself draws only with the neutral palette, so it never needs to know which
+/// scales a report uses or how many steps they have.
+pub fn theme_stylesheet(light: &str, dark: &str) -> String {
+    let (light, dark) = (light_tokens(light), dark_tokens(dark));
     let mut css = String::with_capacity(4 * 1024);
 
     // Light is the base, and the system preference swaps it. This pair drives the page
     // chrome (the area behind an overscroll, for instance) and is what "Auto" means.
-    let _ = writeln!(css, ":root {{\n{}}}", light_tokens(levels));
+    let _ = writeln!(css, ":root {{\n{light}}}");
     let _ = writeln!(
         css,
-        "@media (prefers-color-scheme: dark) {{\n  #{THEME_AUTO_ID}:checked ~ .page {{\n{}  }}\n\
-         \x20 :root {{\n{}  }}\n}}",
-        dark_tokens(levels),
-        dark_tokens(levels)
+        "@media (prefers-color-scheme: dark) {{\n  #{THEME_AUTO_ID}:checked ~ .page {{\n{dark}  }}\n\
+         \x20 :root {{\n{dark}  }}\n}}"
     );
     // An explicit choice overrides both, in either direction: these are more specific than
     // `:root`, and apply whatever the system setting says.
-    let _ = writeln!(
-        css,
-        "#{THEME_LIGHT_ID}:checked ~ .page {{\n{}}}",
-        light_tokens(levels)
-    );
-    let _ = writeln!(
-        css,
-        "#{THEME_DARK_ID}:checked ~ .page {{\n{}}}",
-        dark_tokens(levels)
-    );
+    let _ = writeln!(css, "#{THEME_LIGHT_ID}:checked ~ .page {{\n{light}}}");
+    let _ = writeln!(css, "#{THEME_DARK_ID}:checked ~ .page {{\n{dark}}}");
     css
 }
 
-/// The light palette, as CSS custom property declarations.
-pub fn light_tokens(levels: usize) -> String {
+/// The light palette, as CSS custom property declarations, followed by `extra`.
+pub fn light_tokens(extra: &str) -> String {
     let mut css = String::from(
         "  color-scheme: light;\n  --surface: #fcfcfb;\n  --plane: #f9f9f7;\n\
          \x20 --ink: #0b0b0b;\n  --ink-secondary: #52514e;\n  --ink-muted: #898781;\n\
          \x20 --grid: #e1e0d9;\n  --axis: #c3c2b7;\n  --border: rgba(11, 11, 11, 0.10);\n",
     );
-    for (index, colour) in color::ramp(levels, false).iter().enumerate() {
-        let _ = writeln!(css, "  --heat-{index}: {colour};");
-    }
-    for (index, colour) in color::COVERAGE_LIGHT.iter().enumerate() {
-        let _ = writeln!(css, "  --cov-{index}: {colour};");
-    }
+    css.push_str(extra);
     css
 }
 
-/// The dark palette, stepped for the dark surface rather than flipped.
-pub fn dark_tokens(levels: usize) -> String {
+/// The dark palette, stepped for the dark surface rather than flipped, followed by
+/// `extra`.
+pub fn dark_tokens(extra: &str) -> String {
     let mut css = String::from(
         "  color-scheme: dark;\n  --surface: #1a1a19;\n  --plane: #0d0d0d;\n\
          \x20 --ink: #ffffff;\n  --ink-secondary: #c3c2b7;\n  --ink-muted: #898781;\n\
          \x20 --grid: #2c2c2a;\n  --axis: #383835;\n  --border: rgba(255, 255, 255, 0.10);\n",
     );
-    for (index, colour) in color::ramp(levels, true).iter().enumerate() {
-        let _ = writeln!(css, "  --heat-{index}: {colour};");
-    }
-    for (index, colour) in color::COVERAGE_DARK.iter().enumerate() {
-        let _ = writeln!(css, "  --cov-{index}: {colour};");
-    }
+    css.push_str(extra);
     css
 }
 

@@ -8,6 +8,8 @@
 //! "semantic heat" case, which is why the page always ships a scale legend and a table
 //! view of the same numbers.
 
+use std::fmt::Write as _;
+
 /// Number of colour levels used unless the caller asks for another.
 pub const DEFAULT_LEVELS: usize = 10;
 /// Levels below this would blur into each other; above this the legend gets unreadable.
@@ -97,6 +99,27 @@ fn parse_hex(hex: &str) -> (u8, u8, u8) {
         ((value >> 8) & 0xff) as u8,
         (value & 0xff) as u8,
     )
+}
+
+/// The heat ramp as CSS custom properties, `--heat-0` (least likely) to
+/// `--heat-{levels - 1}`, for [`crate::layout::theme_stylesheet`].
+pub fn heat_tokens(levels: usize, dark: bool) -> String {
+    let mut css = String::new();
+    for (index, colour) in ramp(levels, dark).iter().enumerate() {
+        let _ = writeln!(css, "  --heat-{index}: {colour};");
+    }
+    css
+}
+
+/// The coverage scale as CSS custom properties, `--cov-0` (least covered) to
+/// `--cov-{COVERAGE_LEVELS - 1}`, for [`crate::layout::theme_stylesheet`].
+pub fn coverage_tokens(dark: bool) -> String {
+    let scale = if dark { COVERAGE_DARK } else { COVERAGE_LIGHT };
+    let mut css = String::new();
+    for (index, colour) in scale.iter().enumerate() {
+        let _ = writeln!(css, "  --cov-{index}: {colour};");
+    }
+    css
 }
 
 /// Which colour level a probability lands in, or `None` when it is below
@@ -346,5 +369,19 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn tokens_name_every_step_of_the_scale() {
+        let light = heat_tokens(DEFAULT_LEVELS, false);
+        assert_eq!(light.lines().count(), DEFAULT_LEVELS);
+        assert!(light.starts_with(&format!("  --heat-0: {};\n", HEAT_LIGHT[0])));
+        assert!(heat_tokens(DEFAULT_LEVELS, true).contains(HEAT_DARK[DEFAULT_LEVELS - 1]));
+        assert_eq!(heat_tokens(4, false).lines().count(), 4);
+
+        let coverage = coverage_tokens(true);
+        assert_eq!(coverage.lines().count(), COVERAGE_LEVELS);
+        assert!(coverage.contains(&format!("--cov-0: {};", COVERAGE_DARK[0])));
+        assert!(coverage_tokens(false).contains(COVERAGE_LIGHT[COVERAGE_LEVELS - 1]));
     }
 }

@@ -481,7 +481,8 @@ Layout:
 | `src/model.rs` | `BucketSpec`, the additive `Grid` |
 | `src/aggregate.rs` | Parallel folding, exceedance and density |
 | `src/storage/` | Slot energy accounting, the battery simulation and the size sweep |
-| `src/render/` | Colour scale, per-facet SVG, the shared page shell, both reports |
+| `crates/ha-report/` | The page every report shares: the HTML shell, the light and dark palettes, colour scales, number formatting |
+| `src/render/` | The per-facet SVG and both reports' bodies |
 | `src/bin/energy-storage-payback-period.rs` | The payback tool's entry point |
 | `crates/ha-testdb/` | Synthetic recorder databases for the tests, and the demo database example |
 
