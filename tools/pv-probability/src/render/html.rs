@@ -13,7 +13,7 @@ use ha_report::layout::{
 };
 use ha_report::{escape, format_percent, format_watts};
 
-use crate::aggregate::{Analysis, Facet, ReliableWindow};
+use crate::aggregate::{Analysis, Facet, ReliableWindow, SeasonColumns};
 use crate::model::{BucketSpec, HOURS_PER_DAY, Metric};
 use crate::render::svg::{NO_DATA_PATTERN_ID, SvgOptions, axis_ticks, facet_svg};
 
@@ -343,7 +343,63 @@ fn reliable_section(analysis: &Analysis, options: &PageOptions) -> String {
          inside its table above.",
         analysis.min_days, analysis.grouping
     );
-    let _ = write!(html, "<p class=\"note\">{}</p></section>", escape(&note));
+    let _ = write!(html, "<p class=\"note\">{}</p>", escape(&note));
+
+    // After the note, which they share with the whole record, so it does not read as
+    // the last season's.
+    for season in &analysis.seasons {
+        html.push_str(&season_window(analysis, season, options));
+    }
+    html.push_str("</section>");
+    html
+}
+
+/// One half of the year's window, under its own heading: the result sentence alone.
+///
+/// The block around it has already said what the power, the bar and the pooling mean;
+/// all a season changes is which months are pooled.
+fn season_window(analysis: &Analysis, season: &SeasonColumns, options: &PageOptions) -> String {
+    let span = season.season.span();
+    let mut html = format!("<h3>{}</h3>", escape(season.season.label()));
+    if !season.is_recorded() {
+        let _ = write!(html, "<p>Nothing was recorded from {span}.</p>");
+        return html;
+    }
+
+    let window = analysis.window(
+        &season.columns,
+        options.reliable_watts,
+        options.reliable_probability,
+    );
+    let criterion = window_criterion(window.probability);
+    let power = format_watts(window.watts);
+    match window.hours() {
+        Some((earliest, latest)) => {
+            let _ = write!(
+                html,
+                "<p>Earliest <strong>{}</strong>, latest <strong>{}</strong>: from {span} at \
+                 least <strong>{}</strong> is available {} of those hours.{}</p>",
+                escape(&hour_label(earliest)),
+                escape(&hour_label(latest)),
+                escape(&power),
+                escape(&criterion),
+                // A span with holes in it must not read as an unbroken block.
+                if window.contiguous {
+                    ""
+                } else {
+                    " Some hours in between fall short."
+                }
+            );
+        }
+        None => {
+            let _ = write!(
+                html,
+                "<p>No hour of the day reaches <strong>{}</strong> {} from {span}.</p>",
+                escape(&power),
+                escape(&criterion)
+            );
+        }
+    }
     html
 }
 
@@ -617,6 +673,7 @@ const HEATMAP_CSS: &str = "
 .reliable-window p { margin: 0 0 0.35rem; color: var(--ink-secondary); max-width: 78ch; }
 .reliable-window p strong { color: var(--ink); font-variant-numeric: tabular-nums; }
 .reliable-window p:last-child { margin-bottom: 0; }
+.reliable-window h3 { font-size: 0.8rem; font-weight: 600; margin: 0.85rem 0 0.25rem; color: var(--ink); }
 .window-line {
   margin: 0.5rem 0 0;
   color: var(--ink-secondary);
@@ -854,6 +911,80 @@ mod tests {
         );
         // December drags the middle of the day down, which the block must not hide.
         assert!(html.contains("Not every hour in between clears it"));
+    }
+
+    /// The block's own text from `html`.
+    fn reliable_block(html: &str) -> &str {
+        let start = html
+            .find("<section class=\"reliable-window\">")
+            .expect("the block");
+        let end = start + html[start..].find("</section>").expect("its end");
+        &html[start..end]
+    }
+
+    #[test]
+    fn summer_and_winter_each_get_one_sentence_after_the_note() {
+        let mut options = options();
+        options.reliable_watts = 1_000.0;
+        let html = page(&summer_and_winter(), &options);
+        let block = reliable_block(&html);
+        let at = |needle: &str| {
+            block
+                .find(needle)
+                .unwrap_or_else(|| panic!("missing {needle} in {block}"))
+        };
+
+        assert!(at("class=\"note\"") < at("<h3>Summer</h3>"));
+        assert!(at("<h3>Summer</h3>") < at("<h3>Winter</h3>"));
+        let summer = &block[at("<h3>Summer</h3>")..at("<h3>Winter</h3>")];
+        let winter = &block[at("<h3>Winter</h3>")..];
+        assert_eq!(
+            summer,
+            "<h3>Summer</h3><p>Earliest <strong>09:00</strong>, latest <strong>16:00</strong>: \
+             from April to September at least <strong>1 kW</strong> is available in every \
+             recorded minute of those hours.</p>",
+            "June alone, without December pulling it apart"
+        );
+        assert_eq!(
+            winter,
+            "<h3>Winter</h3><p>No hour of the day reaches <strong>1 kW</strong> in every \
+             recorded minute from October to March.</p>"
+        );
+    }
+
+    #[test]
+    fn a_season_with_no_data_says_so_in_place_of_a_window() {
+        // Only 21 June.
+        let html = page(&analysis(Metric::Exceedance), &options());
+        let block = reliable_block(&html);
+        assert!(block.contains("<h3>Summer</h3><p>Earliest"));
+        assert!(
+            block.contains("<h3>Winter</h3><p>Nothing was recorded from October to March.</p>")
+        );
+    }
+
+    #[test]
+    fn a_seasonal_span_with_a_gap_in_it_says_so() {
+        let buckets = BucketSpec::new(500.0, 2_000.0).unwrap();
+        let samples: Vec<Sample> = (0..3)
+            .flat_map(|day| {
+                let midnight = parse_ha_datetime("2024-07-10 00:00:00").unwrap() + day * 86_400;
+                (9..17).map(move |hour| {
+                    let from = midnight + hour * 3_600;
+                    // A cloud that comes over at noon every day.
+                    let watts = if hour == 12 { 200.0 } else { 1_500.0 };
+                    Sample::new(from, from + 3_600, watts)
+                })
+            })
+            .collect();
+        let grid = build_grid(&samples, Grouping::Month, buckets, UTC);
+        let mut options = options();
+        options.reliable_watts = 1_000.0;
+        let html = page(&analyse(&grid, Metric::Exceedance, 3, &[]), &options);
+        assert!(reliable_block(&html).contains(
+            "from April to September at least <strong>1 kW</strong> is available in every \
+             recorded minute of those hours. Some hours in between fall short.</p>"
+        ));
     }
 
     #[test]

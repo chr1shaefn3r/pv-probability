@@ -165,6 +165,79 @@ impl Facet {
     }
 }
 
+/// Half of the year, as the reliable window splits it: the long days and the short ones.
+///
+/// Whole calendar months rather than equinoxes, so a season is made of exactly the months
+/// the report already shows, and the same split holds whatever `--tz` says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Season {
+    /// April to September.
+    Summer,
+    /// October to March.
+    Winter,
+}
+
+impl Season {
+    pub const ALL: [Season; 2] = [Season::Summer, Season::Winter];
+
+    /// The zero-based months the season pools.
+    pub fn months(self) -> [usize; 6] {
+        match self {
+            Season::Summer => [3, 4, 5, 6, 7, 8],
+            Season::Winter => [9, 10, 11, 0, 1, 2],
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Season::Summer => "Summer",
+            Season::Winter => "Winter",
+        }
+    }
+
+    /// The months it spans, as a sentence names them.
+    pub fn span(self) -> &'static str {
+        match self {
+            Season::Summer => "April to September",
+            Season::Winter => "October to March",
+        }
+    }
+}
+
+/// The 24 hour-of-day columns of one season, pooled over its months exactly as
+/// [`Analysis::overall`] pools the whole record.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SeasonColumns {
+    pub season: Season,
+    pub columns: Vec<Column>,
+}
+
+impl SeasonColumns {
+    /// Whether the recorder covered any of the season's months at all.
+    pub fn is_recorded(&self) -> bool {
+        self.columns
+            .iter()
+            .any(|column| column.weight_seconds > 0.0)
+    }
+}
+
+/// Pool a grid grouped by month into [`Season::ALL`], in that order.
+///
+/// A grid grouped by week has no seasons to give: ISO weeks straddle the months a season
+/// is made of, so the caller pools the same samples grouped by month instead.
+pub fn seasons(grid: &Grid, metric: Metric, min_days: u32) -> Vec<SeasonColumns> {
+    if grid.grouping() != Grouping::Month {
+        return Vec::new();
+    }
+    Season::ALL
+        .into_iter()
+        .map(|season| SeasonColumns {
+            season,
+            columns: pooled_columns(grid, &season.months(), metric, min_days),
+        })
+        .collect()
+}
+
 /// Everything the renderer needs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Analysis {
@@ -177,6 +250,10 @@ pub struct Analysis {
     pub facets: Vec<Facet>,
     /// The same 24 columns computed over every facet at once - the whole record.
     pub overall: Vec<Column>,
+    /// The same again for summer and for winter. [`analyse`] fills this from a grid
+    /// grouped by month; for one grouped by week, [`Analysis::pool_seasons_by_month`]
+    /// does.
+    pub seasons: Vec<SeasonColumns>,
     pub total_weight_seconds: f64,
     pub total_samples: u64,
     /// Distinct local days observed anywhere.
@@ -197,6 +274,19 @@ impl Analysis {
     /// The same window over the whole record rather than a single facet.
     pub fn overall_window(&self, watts: f64, probability: f64) -> ReliableWindow {
         self.window(&self.overall, watts, probability)
+    }
+
+    /// Pool [`Analysis::seasons`] from the samples behind this analysis, grouped by month.
+    ///
+    /// [`analyse`] already did for a grid grouped by month, so this only does work for one
+    /// grouped by week: ISO weeks straddle the months a season is made of, and only the
+    /// samples can say which side of a month boundary each hour fell on.
+    pub fn pool_seasons_by_month(&mut self, samples: &[Sample], tz: Tz) {
+        if self.grouping == Grouping::Month {
+            return;
+        }
+        let months = build_grid(samples, Grouping::Month, self.buckets, tz);
+        self.seasons = seasons(&months, self.metric, self.min_days);
     }
 }
 
@@ -324,19 +414,7 @@ pub fn analyse(grid: &Grid, metric: Metric, min_days: u32, possible_days: &[u32]
     let mut facets = facets;
     facets.sort_by_key(|facet| facet.index);
 
-    let overall: Vec<Column> = (0..HOURS_PER_DAY)
-        .map(|hour| {
-            column_from_weights(
-                hour,
-                &grid.pooled_column(hour),
-                grid.pooled_column_weight(hour),
-                grid.pooled_column_samples(hour),
-                grid.pooled_column_days(hour),
-                metric,
-                min_days,
-            )
-        })
-        .collect();
+    let overall = pooled_columns(grid, &grid.all_facets(), metric, min_days);
 
     Analysis {
         grouping,
@@ -345,6 +423,7 @@ pub fn analyse(grid: &Grid, metric: Metric, min_days: u32, possible_days: &[u32]
         min_days,
         facets,
         overall,
+        seasons: seasons(grid, metric, min_days),
         total_weight_seconds: grid.total_weight(),
         total_samples: grid.total_samples(),
         observed_days: grid.observed_days(),
@@ -367,6 +446,23 @@ fn column_probabilities(
         metric,
         min_days,
     )
+}
+
+/// The 24 columns of `facets` taken together, each hour pooled over all of them.
+fn pooled_columns(grid: &Grid, facets: &[usize], metric: Metric, min_days: u32) -> Vec<Column> {
+    (0..HOURS_PER_DAY)
+        .map(|hour| {
+            column_from_weights(
+                hour,
+                &grid.pooled_column(hour, facets),
+                grid.pooled_column_weight(hour, facets),
+                grid.pooled_column_samples(hour, facets),
+                grid.pooled_column_days(hour, facets),
+                metric,
+                min_days,
+            )
+        })
+        .collect()
 }
 
 /// Turn one column of accumulated seconds into probabilities.
@@ -881,6 +977,122 @@ mod tests {
         let analysis = analyse(&grid, Metric::Exceedance, 3, &[]);
         assert_eq!(analysis.overall_window(150.0, 1.0).hours(), Some((12, 12)));
         assert_eq!(analysis.overall_window(200.0, 1.0).hours(), None);
+    }
+
+    #[test]
+    fn the_seasons_split_the_year_at_april_and_october() {
+        let mut months: Vec<usize> = Season::ALL
+            .iter()
+            .flat_map(|season| season.months())
+            .collect();
+        months.sort_unstable();
+        assert_eq!(
+            months,
+            (0..12).collect::<Vec<_>>(),
+            "every month exactly once"
+        );
+        assert_eq!(Season::Summer.months(), [3, 4, 5, 6, 7, 8]);
+        assert_eq!(Season::Summer.span(), "April to September");
+        assert_eq!(Season::Winter.span(), "October to March");
+    }
+
+    #[test]
+    fn each_season_pools_only_its_own_months() {
+        let mut grid = Grid::new(Grouping::Month, spec(), DayWindow::new(0, 400));
+        for day in 0..10 {
+            grid.add(5, 12, 180.0, 3_600.0, day); // June, reliable at 12:00
+            grid.add(11, 12, 180.0, 1_800.0, 300 + day); // December, half the time
+            grid.add(11, 12, 0.0, 1_800.0, 300 + day);
+        }
+        // The months either side of each boundary land on the side they belong to.
+        grid.add(8, 9, 180.0, 3_600.0, 100); // September
+        grid.add(9, 10, 180.0, 3_600.0, 101); // October
+        grid.add(2, 11, 180.0, 3_600.0, 102); // March
+        grid.add(3, 13, 180.0, 3_600.0, 103); // April
+        let analysis = analyse(&grid, Metric::Exceedance, 3, &[]);
+
+        let [summer, winter] = &analysis.seasons[..] else {
+            panic!("two seasons, got {:?}", analysis.seasons.len());
+        };
+        assert_eq!(
+            (summer.season, winter.season),
+            (Season::Summer, Season::Winter)
+        );
+        assert_eq!(summer.columns[12].weight_seconds, 10.0 * 3_600.0);
+        assert_eq!(summer.columns[12].days, 10);
+        assert_eq!(winter.columns[12].weight_seconds, 10.0 * 3_600.0);
+        for (hour, in_summer) in [(9, true), (10, false), (11, false), (13, true)] {
+            assert_eq!(
+                summer.columns[hour].weight_seconds > 0.0,
+                in_summer,
+                "{hour}:00"
+            );
+            assert_eq!(
+                winter.columns[hour].weight_seconds > 0.0,
+                !in_summer,
+                "{hour}:00"
+            );
+        }
+
+        // December no longer drags June down: each half answers for itself.
+        assert!(analysis.overall_window(150.0, 1.0).is_empty());
+        assert_eq!(
+            analysis.window(&summer.columns, 150.0, 1.0).hours(),
+            Some((12, 12))
+        );
+        assert!(analysis.window(&winter.columns, 150.0, 1.0).is_empty());
+        assert_eq!(
+            analysis.window(&winter.columns, 150.0, 0.5).hours(),
+            Some((12, 12))
+        );
+    }
+
+    #[test]
+    fn a_season_nothing_was_recorded_in_is_still_there_and_says_so() {
+        let mut grid = Grid::new(Grouping::Month, spec(), DayWindow::new(0, 400));
+        grid.add(5, 12, 180.0, 3_600.0, 0);
+        let analysis = analyse(&grid, Metric::Exceedance, 1, &[]);
+        let recorded: Vec<(Season, bool)> = analysis
+            .seasons
+            .iter()
+            .map(|season| (season.season, season.is_recorded()))
+            .collect();
+        assert_eq!(recorded, [(Season::Summer, true), (Season::Winter, false)]);
+    }
+
+    #[test]
+    fn a_week_grid_takes_its_seasons_from_the_samples_by_month() {
+        // Noon every day from Monday 23 September to Sunday 6 October 2024: ISO week 40
+        // runs from 30 September to 6 October, so it straddles the turn of the season.
+        let samples: Vec<Sample> = (0..14)
+            .map(|day| {
+                let start = ts("2024-09-23 12:00:00") + day * 86_400;
+                Sample::new(start, start + 3_600, 180.0)
+            })
+            .collect();
+        let months = analyse(
+            &build_grid(&samples, Grouping::Month, spec(), UTC),
+            Metric::Exceedance,
+            1,
+            &[],
+        );
+        let mut weeks = analyse(
+            &build_grid(&samples, Grouping::Week, spec(), UTC),
+            Metric::Exceedance,
+            1,
+            &[],
+        );
+        assert!(weeks.seasons.is_empty(), "a week grid cannot say");
+
+        weeks.pool_seasons_by_month(&samples, UTC);
+        assert_eq!(weeks.seasons, months.seasons);
+        assert_eq!(weeks.seasons[0].columns[12].days, 8, "23 to 30 September");
+        assert_eq!(weeks.seasons[1].columns[12].days, 6, "1 to 6 October");
+
+        // For a month grid there is nothing to add.
+        let mut again = months.clone();
+        again.pool_seasons_by_month(&[], UTC);
+        assert_eq!(again, months);
     }
 
     #[test]

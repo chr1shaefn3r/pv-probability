@@ -385,17 +385,23 @@ impl Grid {
         &self.weights[start..start + self.buckets.len()]
     }
 
-    /// The bucket weights of one hour of day, summed over every facet.
+    /// Every facet the grid has room for, for pooling over the whole record.
+    pub fn all_facets(&self) -> Vec<usize> {
+        (0..self.grouping.facet_count()).collect()
+    }
+
+    /// The bucket weights of one hour of day, summed over `facets`.
     ///
-    /// This is the "whole record" column: pooling the seconds rather than averaging the
-    /// facets' percentages weights each month by how much of it was actually recorded,
-    /// which is what "across the whole history" honestly means.
-    pub fn pooled_column(&self, hour: usize) -> Vec<f64> {
+    /// Over [`Grid::all_facets`] this is the "whole record" column: pooling the seconds
+    /// rather than averaging the facets' percentages weights each month by how much of it
+    /// was actually recorded, which is what "across the whole history" honestly means. A
+    /// subset of months pools a season the same way.
+    pub fn pooled_column(&self, hour: usize, facets: &[usize]) -> Vec<f64> {
         let mut pooled = vec![0.0; self.buckets.len()];
         if hour >= HOURS_PER_DAY {
             return pooled;
         }
-        for facet in 0..self.grouping.facet_count() {
+        for facet in self.known(facets) {
             for (target, value) in pooled.iter_mut().zip(self.column(facet, hour).iter()) {
                 *target += value;
             }
@@ -403,30 +409,30 @@ impl Grid {
         pooled
     }
 
-    /// Total weight of one hour of day over every facet, in seconds.
-    pub fn pooled_column_weight(&self, hour: usize) -> f64 {
-        (0..self.grouping.facet_count())
+    /// Total weight of one hour of day over `facets`, in seconds.
+    pub fn pooled_column_weight(&self, hour: usize, facets: &[usize]) -> f64 {
+        self.known(facets)
             .map(|facet| self.column_weight(facet, hour))
             .sum()
     }
 
-    /// Readings that contributed to one hour of day over every facet.
-    pub fn pooled_column_samples(&self, hour: usize) -> u64 {
-        (0..self.grouping.facet_count())
+    /// Readings that contributed to one hour of day over `facets`.
+    pub fn pooled_column_samples(&self, hour: usize, facets: &[usize]) -> u64 {
+        self.known(facets)
             .map(|facet| self.column_samples(facet, hour))
             .sum()
     }
 
-    /// Distinct local days on which one hour of day was observed, over every facet.
+    /// Distinct local days on which one hour of day was observed, over `facets`.
     ///
     /// A union rather than a sum: no day belongs to two months, but a week that straddles
     /// a year boundary shares its facet with the same week of the next year.
-    pub fn pooled_column_days(&self, hour: usize) -> u32 {
+    pub fn pooled_column_days(&self, hour: usize, facets: &[usize]) -> u32 {
         if hour >= HOURS_PER_DAY {
             return 0;
         }
         let mut union = vec![0u64; self.days.words()];
-        for facet in 0..self.grouping.facet_count() {
+        for facet in self.known(facets) {
             let Some(column) = self.column_day_words(facet, hour) else {
                 continue;
             };
@@ -435,6 +441,18 @@ impl Grid {
             }
         }
         union.iter().map(|word| word.count_ones()).sum()
+    }
+
+    /// The facets of a list the grid really has, each once.
+    fn known<'a>(&self, facets: &'a [usize]) -> impl Iterator<Item = usize> + 'a {
+        let count = self.grouping.facet_count();
+        facets
+            .iter()
+            .enumerate()
+            .filter(move |(position, facet)| {
+                **facet < count && !facets[..*position].contains(facet)
+            })
+            .map(|(_, facet)| *facet)
     }
 
     /// Total weight over the whole grid, in seconds.
@@ -634,23 +652,49 @@ mod tests {
         grid.add(6, 12, 120.0, 300.0, 40); // July, same hour
         grid.add(6, 12, 20.0, 100.0, 41);
         grid.add(6, 13, 20.0, 900.0, 41); // a different hour entirely
+        let all = grid.all_facets();
+        assert_eq!(all.len(), 12);
 
-        let pooled = grid.pooled_column(12);
+        let pooled = grid.pooled_column(12, &all);
         assert_eq!(pooled[2], 900.0, "both months' 120 W time");
         assert_eq!(pooled[0], 100.0);
-        assert_eq!(grid.pooled_column_weight(12), 1_000.0);
-        assert_eq!(grid.pooled_column_samples(12), 3);
-        assert_eq!(grid.pooled_column_days(12), 3);
+        assert_eq!(grid.pooled_column_weight(12, &all), 1_000.0);
+        assert_eq!(grid.pooled_column_samples(12, &all), 3);
+        assert_eq!(grid.pooled_column_days(12, &all), 3);
 
         // The hour with a single facet behind it is simply that facet.
-        assert_eq!(grid.pooled_column(13), grid.column(6, 13).to_vec());
-        assert_eq!(grid.pooled_column_days(13), 1);
+        assert_eq!(grid.pooled_column(13, &all), grid.column(6, 13).to_vec());
+        assert_eq!(grid.pooled_column_days(13, &all), 1);
 
         // Nothing was recorded at 03:00, and there is no 25th hour.
-        assert_eq!(grid.pooled_column_weight(3), 0.0);
-        assert_eq!(grid.pooled_column_days(3), 0);
-        assert_eq!(grid.pooled_column(24), vec![0.0; spec.len()]);
-        assert_eq!(grid.pooled_column_days(24), 0);
+        assert_eq!(grid.pooled_column_weight(3, &all), 0.0);
+        assert_eq!(grid.pooled_column_days(3, &all), 0);
+        assert_eq!(grid.pooled_column(24, &all), vec![0.0; spec.len()]);
+        assert_eq!(grid.pooled_column_days(24, &all), 0);
+    }
+
+    #[test]
+    fn pooling_a_subset_leaves_the_other_facets_out() {
+        let spec = BucketSpec::new(50.0, 200.0).unwrap();
+        let mut grid = Grid::new(Grouping::Month, spec, window());
+        grid.add(5, 12, 120.0, 600.0, 10); // June
+        grid.add(6, 12, 120.0, 300.0, 40); // July
+        grid.add(11, 12, 20.0, 100.0, 41); // December
+
+        let summer = [5, 6];
+        assert_eq!(grid.pooled_column(12, &summer)[2], 900.0);
+        assert_eq!(
+            grid.pooled_column(12, &summer)[0],
+            0.0,
+            "December's 20 W is not in it"
+        );
+        assert_eq!(grid.pooled_column_weight(12, &summer), 900.0);
+        assert_eq!(grid.pooled_column_samples(12, &summer), 2);
+        assert_eq!(grid.pooled_column_days(12, &summer), 2);
+
+        // A facet listed twice counts once, and one the grid does not have counts not at all.
+        assert_eq!(grid.pooled_column_weight(12, &[5, 5, 12, 99]), 600.0);
+        assert_eq!(grid.pooled_column_days(12, &[]), 0);
     }
 
     #[test]
@@ -661,8 +705,9 @@ mod tests {
         let mut grid = Grid::new(Grouping::Week, spec, window());
         grid.add(0, 9, 120.0, 600.0, 7);
         grid.add(1, 9, 120.0, 600.0, 7);
-        assert_eq!(grid.pooled_column_days(9), 1);
-        assert_eq!(grid.pooled_column_weight(9), 1_200.0);
+        let all = grid.all_facets();
+        assert_eq!(grid.pooled_column_days(9, &all), 1);
+        assert_eq!(grid.pooled_column_weight(9, &all), 1_200.0);
     }
 
     #[test]

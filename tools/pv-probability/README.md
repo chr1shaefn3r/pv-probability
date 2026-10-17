@@ -44,6 +44,8 @@ It finishes by printing the command that opens the report, ready to paste:
 ```
 wrote pv-probability.html: 12 facets from 17520 readings (730 d), 159 kB, 9.65ms
 reliable window: 12:00 to the end of the 13:00 hour - at least 100 W in every recorded minute
+  summer (April to September): 11:00 to the end of the 16:00 hour - at least 100 W in every recorded minute
+  winter (October to March): 12:00 to the end of the 13:00 hour - at least 100 W in every recorded minute
 covers 2023-01-01 to 2024-12-31 (731 days): 730 days observed, no outage over 24 h
 
 open /home/you/pv-probability.html
@@ -128,9 +130,28 @@ every recorded minute of those hours. The window runs from 12:00 to the end of t
 13:00 hour.
 ```
 
+Below it, **Summer** and **Winter** answer the same question for each half of the year,
+pooled the same way over only their months, in one sentence each:
+
+```
+Summer
+Earliest 11:00, latest 16:00: from April to September at least 100 W is available in
+every recorded minute of those hours.
+
+Winter
+Earliest 12:00, latest 13:00: from October to March at least 100 W is available in
+every recorded minute of those hours.
+```
+
+The whole record can only promise what its worst month promises, so its window is
+usually winter's; the summer line says how much more the long days allow. The halves are
+whole calendar months under `--group week` too, pooled from the readings themselves,
+since ISO weeks straddle the month boundaries. A half the recorder never covered says so
+instead.
+
 The same sentence appears for each individual month or week, at the top of that panel's
 expandable table, so "when can I run this in November?" is answered in the panel itself.
-The line printed after a run carries the overall figure too.
+The lines printed after a run carry the overall and the seasonal figures too.
 
 * `--reliable-watts <W>` sets the power. It is rounded **up** to a bucket edge - asking
   for 120 W with 50 W steps is answered from the "at least 150 W" row, never from the

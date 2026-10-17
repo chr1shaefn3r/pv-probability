@@ -83,7 +83,8 @@ fn run() -> Result<()> {
         ),
         _ => Vec::new(),
     };
-    let analysis = analyse(&grid, args.metric, args.min_days, &possible_days);
+    let mut analysis = analyse(&grid, args.metric, args.min_days, &possible_days);
+    analysis.pool_seasons_by_month(&loaded.samples, config.recorder.tz);
     let coverage = Coverage::describe(
         &loaded.samples,
         analysis.observed_days,
@@ -137,6 +138,22 @@ fn run() -> Result<()> {
         "reliable window: {}",
         describe_window(&analysis.overall_window(args.reliable_watts, args.reliable_probability))
     );
+    for season in &analysis.seasons {
+        let window = if season.is_recorded() {
+            describe_window(&analysis.window(
+                &season.columns,
+                args.reliable_watts,
+                args.reliable_probability,
+            ))
+        } else {
+            "nothing recorded".to_string()
+        };
+        println!(
+            "  {} ({}): {window}",
+            season.season.label().to_lowercase(),
+            season.season.span()
+        );
+    }
     if let Some(coverage) = &coverage {
         println!("{}", coverage_line(coverage, config.recorder.tz));
         if args.verbose > 0 {

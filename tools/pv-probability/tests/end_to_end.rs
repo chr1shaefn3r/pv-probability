@@ -187,6 +187,52 @@ fn summer_can_be_counted_on_for_more_of_the_day_than_winter() {
 }
 
 #[test]
+fn each_season_can_promise_what_all_of_its_months_promise() {
+    let conn = database();
+    let (_, analysis) = run(&conn, Grouping::Month, Metric::Exceedance);
+    assert_eq!(analysis.seasons.len(), 2);
+
+    for season in &analysis.seasons {
+        // At "every recorded minute", pooling months is intersecting them: an hour
+        // qualifies for the season exactly when it qualifies in each of its months.
+        let pooled = analysis.window(&season.columns, 100.0, 1.0);
+        let monthly: Vec<_> = season
+            .season
+            .months()
+            .iter()
+            .map(|month| {
+                let facet = analysis
+                    .facet(*month)
+                    .expect("two full years cover every month");
+                analysis.window(&facet.columns, 100.0, 1.0)
+            })
+            .collect();
+        let earliest = monthly.iter().map(|window| window.earliest.unwrap()).max();
+        let latest = monthly.iter().map(|window| window.latest.unwrap()).min();
+        assert_eq!(pooled.earliest, earliest, "{:?}", season.season);
+        assert_eq!(pooled.latest, latest, "{:?}", season.season);
+    }
+
+    let [summer, winter] = &analysis.seasons[..] else {
+        unreachable!()
+    };
+    assert!(
+        analysis.window(&summer.columns, 100.0, 1.0).span_hours()
+            > analysis.window(&winter.columns, 100.0, 1.0).span_hours(),
+        "the long days give the longer window"
+    );
+}
+
+#[test]
+fn the_week_grouping_reports_the_same_seasons_as_the_month_grouping() {
+    let conn = database();
+    let (_, by_month) = run(&conn, Grouping::Month, Metric::Exceedance);
+    let (loaded, mut by_week) = run(&conn, Grouping::Week, Metric::Exceedance);
+    by_week.pool_seasons_by_month(&loaded.samples, Berlin);
+    assert_eq!(by_week.seasons, by_month.seasons);
+}
+
+#[test]
 fn a_threshold_the_array_never_reaches_has_no_window_at_all() {
     let conn = database();
     let (_, analysis) = run(&conn, Grouping::Month, Metric::Exceedance);
