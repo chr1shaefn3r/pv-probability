@@ -1,0 +1,24 @@
+# The house heating-energy reports on: every floor, the rooms on it, and each room's
+# thermometer. This one matches the demo database:
+#
+#   cargo run --release -p ha-testdb --example demo_database -- demo.db 730 dense
+#   cargo run --release -p heating-energy -- --db demo.db \
+#     --outside-entity sensor.outdoor_temperature --rooms tools/heating-energy/rooms.example.toml
+#
+# Floors and rooms appear in the report in the order they are listed here. Room names
+# only have to be unique on their floor; a thermometer belongs to one room.
+
+[[floor]]
+name = "Ground floor"
+rooms = [
+  { name = "Living room", sensor = "sensor.living_room_temperature" },
+  { name = "Kitchen", sensor = "sensor.kitchen_temperature" },
+  { name = "Office", sensor = "sensor.office_temperature" },
+]
+
+[[floor]]
+name = "First floor"
+rooms = [
+  { name = "Bedroom", sensor = "sensor.bedroom_temperature" },
+  { name = "Bathroom", sensor = "sensor.bathroom_temperature" },
+]

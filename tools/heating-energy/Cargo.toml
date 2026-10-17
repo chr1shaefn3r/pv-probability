@@ -1,0 +1,26 @@
+[package]
+name = "heating-energy"
+description = "Heating and cooling degree days from a Home Assistant outdoor thermometer, beside the indoor temperature of every room"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["heating", "degree-days", "home-assistant", "temperature", "energy"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+clap.workspace = true
+ha-recorder.workspace = true
+ha-report.workspace = true
+rayon.workspace = true
+serde.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+ha-testdb.workspace = true
+rusqlite.workspace = true

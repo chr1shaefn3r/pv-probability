@@ -9,6 +9,7 @@ answer one question about your home's energy as a self-contained HTML report:
 |---|---|
 | **[`pv-probability`](tools/pv-probability/README.md)** | How much solar power can I count on, hour by hour and month by month? |
 | **[`energy-storage-payback-period`](tools/energy-storage-payback-period/README.md)** | How long would a home battery take to pay for itself? |
+| **[`heating-energy`](tools/heating-energy/README.md)** | How much heating did the weather ask for, and how warm was every room kept? |
 
 ![Monthly likelihood heatmaps from pv-probability](tools/pv-probability/docs/example-light.png)
 
@@ -33,13 +34,16 @@ scp homeassistant.local:/config/home-assistant_v2.db ha.db
 ./target/release/pv-probability --db ha.db --entity sensor.solar_power --tz Europe/Berlin
 ./target/release/energy-storage-payback-period --db ha.db --tz Europe/Berlin \
   --import-entity sensor.grid_import_power --export-entity sensor.grid_export_power
+./target/release/heating-energy --db ha.db --tz Europe/Berlin \
+  --outside-entity sensor.outdoor_temperature --rooms rooms.toml
 ```
 
 Each finishes by printing the command that opens its report, ready to paste.
 
 No Home Assistant to hand? Generate a synthetic one, either solid or full of holes. It
-carries a solar power sensor, an energy counter and a pair of grid meters, so every tool
-has something to read:
+carries a solar power sensor, an energy counter, a pair of grid meters, an outdoor
+thermometer and one in each room of a two-storey house, so every tool has something to
+read:
 
 ```sh
 cargo run --release -p ha-testdb --example demo_database -- demo.db 730 dense
@@ -48,22 +52,27 @@ cargo run --release -p pv-probability -- --db demo.db --entity sensor.solar_powe
   --tz Europe/Berlin
 cargo run --release -p energy-storage-payback-period -- --db demo.db \
   --import-entity sensor.grid_import_power --export-entity sensor.grid_export_power
+cargo run --release -p heating-energy -- --db demo.db \
+  --outside-entity sensor.outdoor_temperature --rooms tools/heating-energy/rooms.example.toml
 ```
 
 ## Finding the right entity
 
-Home Assistant usually exposes **two** sensors per device, and only one of them is any use
-here:
+The tools read **measurements**: a power sensor for the solar and battery tools, a
+thermometer for the heating one. Home Assistant usually exposes **two** sensors per
+metered device, and only one of them is any use here:
 
-| Sensor | Unit | `state_class` | What it holds | Plottable |
+| Sensor | Unit | `state_class` | What it holds | Readable |
 |---|---|---|---|---|
-| `sensor.…_power` | `W` / `kW` | `measurement` | watts right now | **yes** |
+| `sensor.…_power` | `W` / `kW` | `measurement` | watts right now | **yes**, as power |
+| `sensor.…_temperature` | `°C` / `°F` | `measurement` | degrees right now | **yes**, as temperature |
 | `sensor.…_energy` | `kWh` | `total_increasing` | a running total | no |
 
 The recorder stores them differently: a measurement gets an hourly `mean`, a counter gets a
 `sum` and no mean at all, because the average of a running total means nothing. Point a
 tool at a counter and there is nothing for it to read - it says so, and names the power
-sensor to use instead.
+sensor to use instead. Point it at a sensor of the wrong quantity - a thermometer where
+power is wanted - and it says that too, with the sensors that would fit.
 
 To see what your database holds:
 
@@ -74,10 +83,13 @@ pv-probability --db ha.db --list-entities solar    # only ids containing "solar"
 
 ```
 Power sensors these tools can read:
-  sensor.solar_power   W     3408 rows  2023-01-01 to 2023-06-15
+  sensor.solar_power          W     3408 rows  2023-01-01 to 2023-06-15
+
+Temperature sensors these tools can read:
+  sensor.outdoor_temperature  °C    3408 rows  2023-01-01 to 2023-06-15
 
 Energy counters (cumulative totals - not plottable, see the README):
-  sensor.solar_energy  kWh   3408 rows  2023-01-01 to 2023-06-15
+  sensor.solar_energy         kWh   3408 rows  2023-01-01 to 2023-06-15
 ```
 
 No entity is needed when listing. Every error about an entity - unknown, empty, or the
@@ -124,8 +136,8 @@ already there. `-v` says which of the two happened.
 
 ## Which data the tools read
 
-Home Assistant keeps three different records of a power sensor, and they have very
-different retention. `--source auto` (the default) picks the one with the most history:
+Home Assistant keeps three different records of a sensor, and they have very different
+retention. `--source auto` (the default) picks the one with the most history:
 
 | Source | Table | Resolution | Retention | Good for |
 |---|---|---|---|---|
@@ -158,7 +170,7 @@ Every tool takes the same options for reading the database. `--help` lists them 
 | `--tz <TZ>` | machine zone | IANA timezone for hours and dates, e.g. `Europe/Berlin` |
 | `--from <YYYY-MM-DD>` / `--to <YYYY-MM-DD>` | all data | Local date window, `--to` exclusive |
 | `--max-gap <SECONDS>` | `900` | How long one raw state reading is assumed to hold |
-| `--scale <FACTOR>` | auto | Multiply readings; `kW`/`MW` units are converted automatically |
+| `--scale <FACTOR>` | auto | Multiply readings; `kW`/`MW` and `°F`/`K` are converted automatically |
 | `--gap-threshold-hours <H>` | `24` | Outages at least this long are reported |
 
 Each tool also takes `--threads <N>` to cap its rayon worker threads, `-o` for where to
@@ -194,6 +206,7 @@ crates/
 tools/
   pv-probability/                   the heatmap tool
   energy-storage-payback-period/    the battery payback tool
+  heating-energy/                   the degree day tool
 ```
 
 Dependencies only point one way: each tool depends on `ha-report` and `ha-recorder`,
@@ -211,9 +224,12 @@ workspace and never forces the shared dependencies to rebuild.
 ### Adding a tool
 
 1. `tools/<name>/` with a `Cargo.toml` that takes its dependencies with
-   `.workspace = true`, a `src/lib.rs` for the logic and a thin `src/main.rs`.
+   `.workspace = true`, a `src/lib.rs` for the logic and a thin `src/main.rs`. The
+   workspace's `tools/*` glob picks it up; the root `Cargo.toml` needs no edit.
 2. Flatten `ha_recorder::RecorderArgs` into its clap arguments: that brings every shared
-   option, its validation, `--list-entities` and the loader options.
+   option, its validation, `--list-entities` and the loader options. Tell
+   `load_options` which `ha_recorder::Quantity` each sensor measures - power or
+   temperature - and the readers convert its unit and suggest the right sensors.
 3. Wrap the report in `ha_report::layout::document`, passing the colour scales it draws
    with to `theme_stylesheet`, and end it with `coverage_section`.
 4. Test it end to end against a database from `ha-testdb`, adding whatever sensors it
