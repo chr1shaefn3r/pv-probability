@@ -6,6 +6,7 @@ use chrono::DateTime;
 use chrono_tz::Tz;
 use clap::Parser;
 
+use ha_recorder::Quantity;
 use ha_recorder::coverage::{Coverage, possible_days_per_facet};
 use ha_recorder::source::{self, LoadedSamples, SourceKind};
 use ha_report::{format_duration, format_watts, open_command};
@@ -44,9 +45,12 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
-    let load_options =
-        args.recorder
-            .load_options(args.entity(), &config.recorder, config.clamp_negative);
+    let load_options = args.recorder.load_options(
+        args.entity(),
+        Quantity::Power,
+        &config.recorder,
+        config.clamp_negative,
+    );
     let loaded = source::load(&conn, &load_options)?;
     if args.verbose > 0 {
         eprintln!(
@@ -241,14 +245,14 @@ fn metadata(args: &Args, loaded: &LoadedSamples, tz: Tz) -> Vec<(String, String)
         ));
     }
     if let Some(unit) = &loaded.unit {
-        let scaled = if loaded.scale == 1.0 {
+        let scaled = if loaded.conversion.scale == 1.0 {
             unit.clone()
         } else {
-            format!("{unit} x{}", loaded.scale)
+            format!("{unit} x{}", loaded.conversion.scale)
         };
         metadata.push(("Unit".to_string(), scaled));
-    } else if loaded.scale != 1.0 {
-        metadata.push(("Scale".to_string(), format!("x{}", loaded.scale)));
+    } else if loaded.conversion.scale != 1.0 {
+        metadata.push(("Scale".to_string(), format!("x{}", loaded.conversion.scale)));
     }
     if loaded.source == SourceKind::States {
         metadata.push((

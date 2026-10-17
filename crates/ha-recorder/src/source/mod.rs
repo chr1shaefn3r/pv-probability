@@ -1,4 +1,4 @@
-//! Reading power readings out of a copy of `home-assistant_v2.db`.
+//! Reading sensor readings out of a copy of `home-assistant_v2.db`.
 
 pub mod catalog;
 pub mod schema;
@@ -12,6 +12,7 @@ use chrono_tz::Tz;
 use rusqlite::{Connection, OpenFlags};
 
 use crate::model::Sample;
+use crate::quantity::{Conversion, Quantity};
 use crate::source::schema::{StatisticsTable, ValueColumn, find_statistic, table_exists};
 
 /// Which recorder table to take the readings from.
@@ -47,6 +48,8 @@ pub struct LoadOptions<'a> {
     pub from: Option<i64>,
     pub to: Option<i64>,
     pub max_gap: i64,
+    /// What the entity measures: decides the unit conversion, and what to suggest instead.
+    pub quantity: Quantity,
     pub scale: Option<f64>,
     pub clamp_negative: bool,
     /// Only used to state dates in error messages in the timezone the user asked for.
@@ -60,7 +63,8 @@ pub struct LoadedSamples {
     /// The table actually used, with `Auto` already resolved.
     pub source: SourceKind,
     pub unit: Option<String>,
-    pub scale: f64,
+    /// How the recorded values were converted into the quantity's working unit.
+    pub conversion: Conversion,
     pub rows: usize,
     pub first_ts: Option<i64>,
     pub last_ts: Option<i64>,
@@ -187,6 +191,7 @@ pub fn load(conn: &Connection, options: &LoadOptions<'_>) -> Result<LoadedSample
                     value: options.value,
                     from: options.from,
                     to: options.to,
+                    quantity: options.quantity,
                     scale: options.scale,
                     clamp_negative: options.clamp_negative,
                     tz: options.tz,
@@ -200,6 +205,7 @@ pub fn load(conn: &Connection, options: &LoadOptions<'_>) -> Result<LoadedSample
                 from: options.from,
                 to: options.to,
                 max_gap: options.max_gap,
+                quantity: options.quantity,
                 scale: options.scale,
                 clamp_negative: options.clamp_negative,
                 tz: options.tz,
@@ -215,7 +221,7 @@ pub fn load(conn: &Connection, options: &LoadOptions<'_>) -> Result<LoadedSample
         samples: loaded.samples,
         source: resolved,
         unit: loaded.unit,
-        scale: loaded.scale,
+        conversion: loaded.conversion,
         rows: loaded.rows,
         first_ts,
         last_ts,
@@ -280,7 +286,7 @@ pub fn explain_no_samples(
     tz: Tz,
 ) -> anyhow::Error {
     let entity = options.entity;
-    let hint = catalog::suggest_block(conn, entity, tz);
+    let hint = catalog::suggest_block(conn, entity, options.quantity, tz);
     let known = catalog::list_statistics(conn, Some(entity))
         .unwrap_or_default()
         .into_iter()
@@ -308,15 +314,29 @@ pub fn explain_no_samples(
             .as_deref()
             .map(|unit| format!(" Its unit is recorded as `{unit}`."))
             .unwrap_or_default();
+        let needed = match options.quantity {
+            Quantity::Power => {
+                "These tools read instantaneous power, so they need a sensor measured in W or \
+                 kW (`state_class: measurement`)."
+            }
+            Quantity::Temperature => {
+                "Temperatures are read as measurements, so they need a sensor measured in °C or \
+                 °F (`state_class: measurement`)."
+            }
+        };
+        let sibling = match options.quantity {
+            Quantity::Power => {
+                " For an energy counter the matching power sensor is usually the same name \
+                 with `_power` instead of `_energy`."
+            }
+            Quantity::Temperature => "",
+        };
         return anyhow!(
             "`{entity}` has {} rows in `statistics`, but not one of them carries a \
              `{column}`.\n\n\
              Home Assistant writes `sum` and `state` - not `{column}` - for cumulative \
              counters such as an energy total in kWh, because the average of a running \
-             total means nothing. These tools read instantaneous power, so they need a \
-             sensor measured in W or kW (`state_class: measurement`).{unit} For an energy \
-             counter the matching power sensor is usually the same name with `_power` \
-             instead of `_energy`.{hint}",
+             total means nothing. {needed}{unit}{sibling}{hint}",
             candidate.rows
         );
     }
@@ -361,6 +381,7 @@ mod tests {
             from: None,
             to: None,
             max_gap: 900,
+            quantity: Quantity::Power,
             scale: None,
             clamp_negative: true,
             tz: UTC,
@@ -417,7 +438,7 @@ mod tests {
 
         let loaded = load(&conn, &options(ENTITY)).unwrap();
         assert_eq!(loaded.source, SourceKind::States);
-        assert_eq!(loaded.samples[0].watts, 1_234.0);
+        assert_eq!(loaded.samples[0].value, 1_234.0);
     }
 
     #[test]

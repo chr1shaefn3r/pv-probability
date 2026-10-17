@@ -11,6 +11,7 @@ use anyhow::{Result, bail, ensure};
 use chrono_tz::Tz;
 use rusqlite::Connection;
 
+use crate::quantity::Quantity;
 use crate::source::schema::ValueColumn;
 use crate::source::{self, LoadOptions, SourceKind, catalog};
 use crate::timeutil::{parse_local_date, resolve_timezone};
@@ -179,10 +180,11 @@ impl RecorderArgs {
         Ok(true)
     }
 
-    /// What the loader needs to read one entity under these options.
+    /// What the loader needs to read one entity of `quantity` under these options.
     pub fn load_options<'a>(
         &self,
         entity: &'a str,
+        quantity: Quantity,
         config: &RecorderConfig,
         clamp_negative: bool,
     ) -> LoadOptions<'a> {
@@ -193,6 +195,7 @@ impl RecorderArgs {
             from: config.from,
             to: config.to,
             max_gap: self.max_gap,
+            quantity,
             scale: self.scale,
             clamp_negative,
             tz: config.tz,
@@ -323,7 +326,7 @@ mod tests {
             "1000",
         ]);
         let config = args.resolve().unwrap();
-        let options = args.load_options("sensor.x", &config, false);
+        let options = args.load_options("sensor.x", Quantity::Temperature, &config, false);
         assert_eq!(options.entity, "sensor.x");
         assert_eq!(options.source, SourceKind::States);
         assert_eq!(options.value, ValueColumn::Max);
@@ -331,6 +334,7 @@ mod tests {
         assert_eq!(options.to, None);
         assert_eq!(options.max_gap, 60);
         assert_eq!(options.scale, Some(1000.0));
+        assert_eq!(options.quantity, Quantity::Temperature);
         assert!(!options.clamp_negative);
         assert_eq!(options.tz, Berlin);
     }

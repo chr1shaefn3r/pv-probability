@@ -5,7 +5,7 @@
 //! writes `sum`/`state` and leaves `mean` NULL for a cumulative counter. Nothing in the
 //! error said so, and nothing helped find the `…_power` sibling that was actually wanted.
 //!
-//! This module answers both questions - what is in here, and what can this tool plot -
+//! This module answers both questions - what is in here, and what can the tools read -
 //! from the rows themselves rather than from metadata flags, because `has_mean` was
 //! replaced by `mean_type` in recent recorder releases and neither is worth trusting.
 
@@ -15,15 +15,16 @@ use anyhow::Result;
 use chrono_tz::Tz;
 use rusqlite::Connection;
 
-use crate::source::schema::{StatisticsTable, column_names, table_exists, unit_scale_to_watts};
+use crate::quantity::Quantity;
+use crate::source::schema::{StatisticsTable, column_names, table_exists};
 use crate::timeutil::{day_to_date, local_day};
 
 /// What the rows of a statistic really carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatisticKind {
-    /// Hourly means: a measurement, which is what this tool plots.
+    /// Hourly means: a measurement, which is what the tools read.
     Mean,
-    /// Cumulative totals: an energy counter, which it cannot.
+    /// Cumulative totals: an energy counter, which they cannot.
     Total,
     /// Both columns are populated.
     Both,
@@ -41,7 +42,7 @@ impl StatisticKind {
         }
     }
 
-    /// Whether this tool can read power out of it.
+    /// Whether there are measurements to read out of it.
     pub fn has_mean(self) -> bool {
         matches!(self, StatisticKind::Mean | StatisticKind::Both)
     }
@@ -68,14 +69,20 @@ pub struct Candidate {
 }
 
 impl Candidate {
-    /// Whether this is a power sensor either tool can read straight away.
-    pub fn is_plottable(&self) -> bool {
-        self.kind.has_mean() && self.is_power_unit() && self.rows > 0
+    /// What its recorded unit measures, if the tools know the unit.
+    pub fn quantity(&self) -> Option<Quantity> {
+        self.unit.as_deref().and_then(Quantity::of_unit)
     }
 
-    /// Whether its unit is one that converts to watts.
-    pub fn is_power_unit(&self) -> bool {
-        self.unit.as_deref().and_then(unit_scale_to_watts).is_some()
+    /// Whether a tool reading `quantity` can read it straight away.
+    pub fn is_readable_as(&self, quantity: Quantity) -> bool {
+        self.kind.has_mean() && self.quantity() == Some(quantity) && self.rows > 0
+    }
+
+    /// The quantity it can be read as, if any.
+    pub fn readable_quantity(&self) -> Option<Quantity> {
+        self.quantity()
+            .filter(|quantity| self.is_readable_as(*quantity))
     }
 
     /// Whether it looks like an energy counter rather than a power reading.
@@ -87,14 +94,13 @@ impl Candidate {
                 .is_some_and(|unit| unit.trim().ends_with("Wh"))
     }
 
-    /// Ranking group: plottable power sensors, then energy counters, then everything else.
+    /// Ranking group: power sensors, thermometers, energy counters, then everything else.
     fn group(&self) -> u8 {
-        if self.is_plottable() {
-            0
-        } else if self.is_energy_counter() {
-            1
-        } else {
-            2
+        match self.readable_quantity() {
+            Some(Quantity::Power) => 0,
+            Some(Quantity::Temperature) => 1,
+            None if self.is_energy_counter() => 2,
+            None => 3,
         }
     }
 }
@@ -231,28 +237,37 @@ fn row_summary(conn: &Connection, ids: &[i64]) -> Result<HashMap<i64, RowSummary
     Ok(summaries)
 }
 
-/// Candidates that look like a replacement for `wanted`.
+/// Sensors of `quantity` that look like a replacement for `wanted`.
 ///
 /// Entities sharing a prefix come first, so `sensor.eve_energy_x_energy` is answered with
 /// `sensor.eve_energy_x_power` rather than with whatever else happens to be in the
 /// database.
-pub fn closest_power_sensors(
+pub fn closest_sensors(
     candidates: &[Candidate],
     wanted: &str,
+    quantity: Quantity,
     limit: usize,
 ) -> Vec<Candidate> {
     let wanted = wanted.to_ascii_lowercase();
-    let mut plottable: Vec<&Candidate> = candidates
+    let mut readable: Vec<&Candidate> = candidates
         .iter()
-        .filter(|candidate| candidate.is_plottable())
+        .filter(|candidate| candidate.is_readable_as(quantity))
         .collect();
-    plottable.sort_by_key(|candidate| {
+    readable.sort_by_key(|candidate| {
         (
             usize::MAX - shared_prefix(&wanted, &candidate.statistic_id.to_ascii_lowercase()),
             -candidate.rows,
         )
     });
-    plottable.into_iter().take(limit).cloned().collect()
+    readable.into_iter().take(limit).cloned().collect()
+}
+
+/// How a listing heads the sensors of a quantity.
+fn heading(quantity: Quantity) -> &'static str {
+    match quantity {
+        Quantity::Power => "Power sensors",
+        Quantity::Temperature => "Temperature sensors",
+    }
 }
 
 /// Length of the common prefix of two ids, in bytes.
@@ -266,17 +281,21 @@ fn shared_prefix(left: &str, right: &str) -> usize {
 /// The "here is what this database does hold" block appended to entity errors.
 ///
 /// Every error about an entity ends here, because the useful next step is always the same:
-/// see which power sensors exist, ideally the sibling of whatever was asked for.
-pub fn suggest_block(conn: &Connection, wanted: &str, tz: Tz) -> String {
+/// see which sensors of the wanted quantity exist, ideally the sibling of whatever was
+/// asked for.
+pub fn suggest_block(conn: &Connection, wanted: &str, quantity: Quantity, tz: Tz) -> String {
     let candidates = list_statistics(conn, None).unwrap_or_default();
-    let closest = closest_power_sensors(&candidates, wanted, 5);
+    let closest = closest_sensors(&candidates, wanted, quantity, 5);
     if closest.is_empty() {
-        "\n\nThis database holds no power sensor with hourly statistics at all. \
-         Run with --list-entities to see what it does hold."
-            .to_string()
+        format!(
+            "\n\nThis database holds no {} with hourly statistics at all. \
+             Run with --list-entities to see what it does hold.",
+            quantity.sensor_noun()
+        )
     } else {
         format!(
-            "\n\nPower sensors in this database:\n{}\nRun with --list-entities to see them all.",
+            "\n\n{} in this database:\n{}\nRun with --list-entities to see them all.",
+            heading(quantity),
             format_candidates(&closest, tz, 5)
         )
     }
@@ -295,7 +314,7 @@ pub fn format_candidates(candidates: &[Candidate], tz: Tz, limit: usize) -> Stri
         .unwrap_or(0);
     let unit_width = shown
         .iter()
-        .map(|candidate| candidate.unit.as_deref().unwrap_or("-").len())
+        .map(|candidate| candidate.unit.as_deref().unwrap_or("-").chars().count())
         .max()
         .unwrap_or(0);
 
@@ -334,26 +353,38 @@ pub fn date_range(candidate: &Candidate, tz: Tz) -> String {
 }
 
 /// The whole listing printed by `--list-entities`, in sections.
+///
+/// Power sensors always get a section, empty or not; thermometers get one when the
+/// database holds any.
 pub fn format_listing(candidates: &[Candidate], tz: Tz, limit: usize) -> String {
-    let plottable: Vec<Candidate> = candidates
+    let readable = |quantity: Quantity| -> Vec<Candidate> {
+        candidates
+            .iter()
+            .filter(|candidate| candidate.readable_quantity() == Some(quantity))
+            .cloned()
+            .collect()
+    };
+    let unreadable = candidates
         .iter()
-        .filter(|candidate| candidate.is_plottable())
+        .filter(|candidate| candidate.readable_quantity().is_none());
+    let energy: Vec<Candidate> = unreadable
+        .clone()
+        .filter(|candidate| candidate.is_energy_counter())
         .cloned()
         .collect();
-    let energy: Vec<Candidate> = candidates
-        .iter()
-        .filter(|candidate| !candidate.is_plottable() && candidate.is_energy_counter())
-        .cloned()
-        .collect();
-    let rest: Vec<Candidate> = candidates
-        .iter()
-        .filter(|candidate| !candidate.is_plottable() && !candidate.is_energy_counter())
+    let rest: Vec<Candidate> = unreadable
+        .filter(|candidate| !candidate.is_energy_counter())
         .cloned()
         .collect();
 
     let mut out = String::new();
     out.push_str("Power sensors these tools can read:\n");
-    out.push_str(&format_candidates(&plottable, tz, limit));
+    out.push_str(&format_candidates(&readable(Quantity::Power), tz, limit));
+    let thermometers = readable(Quantity::Temperature);
+    if !thermometers.is_empty() {
+        out.push_str("\nTemperature sensors these tools can read:\n");
+        out.push_str(&format_candidates(&thermometers, tz, limit));
+    }
     if !energy.is_empty() {
         out.push_str("\nEnergy counters (cumulative totals - not plottable, see the README):\n");
         out.push_str(&format_candidates(&energy, tz, limit));
@@ -434,19 +465,19 @@ mod tests {
         let power = find(&candidates, ENTITY);
         assert_eq!(power.kind, StatisticKind::Mean);
         assert_eq!(power.rows, 10);
-        assert!(power.is_plottable());
+        assert!(power.is_readable_as(Quantity::Power));
         assert!(!power.is_energy_counter());
 
         // Its metadata says has_mean = 1, but not one row carries a mean.
         let energy = find(&candidates, "sensor.solar_energy");
         assert_eq!(energy.kind, StatisticKind::Total);
         assert_eq!(energy.rows, 6);
-        assert!(!energy.is_plottable());
+        assert!(!energy.is_readable_as(Quantity::Power));
         assert!(energy.is_energy_counter());
     }
 
     #[test]
-    fn power_sensors_rank_above_counters_and_everything_else() {
+    fn readable_sensors_rank_above_counters() {
         let candidates = list_statistics(&database(), None).unwrap();
         let order: Vec<&str> = candidates
             .iter()
@@ -454,17 +485,29 @@ mod tests {
             .collect();
         assert_eq!(
             order,
-            vec![ENTITY, "sensor.solar_energy", "sensor.attic_temp"]
+            vec![ENTITY, "sensor.attic_temp", "sensor.solar_energy"]
         );
     }
 
     #[test]
-    fn a_thermometer_is_neither_plottable_nor_a_counter() {
+    fn a_thermometer_is_read_as_temperature_and_nothing_else() {
         let candidates = list_statistics(&database(), None).unwrap();
         let temperature = find(&candidates, "sensor.attic_temp");
-        assert!(!temperature.is_plottable(), "°C is not power");
+        assert_eq!(temperature.quantity(), Some(Quantity::Temperature));
+        assert!(temperature.is_readable_as(Quantity::Temperature));
+        assert!(
+            !temperature.is_readable_as(Quantity::Power),
+            "°C is not power"
+        );
         assert!(!temperature.is_energy_counter());
         assert_eq!(temperature.kind, StatisticKind::Mean);
+
+        let power = find(&candidates, ENTITY);
+        assert_eq!(power.readable_quantity(), Some(Quantity::Power));
+        assert_eq!(
+            find(&candidates, "sensor.solar_energy").readable_quantity(),
+            None
+        );
     }
 
     #[test]
@@ -505,7 +548,7 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].kind, StatisticKind::Empty);
         assert_eq!(candidates[0].rows, 0);
-        assert!(!candidates[0].is_plottable());
+        assert!(!candidates[0].is_readable_as(Quantity::Power));
         assert_eq!(date_range(&candidates[0], UTC), "no rows");
     }
 
@@ -554,12 +597,58 @@ mod tests {
         }
 
         let candidates = list_statistics(&conn, None).unwrap();
-        let closest = closest_power_sensors(&candidates, "sensor.eve_energy_20ecm8301_energy", 2);
+        let closest = closest_sensors(
+            &candidates,
+            "sensor.eve_energy_20ecm8301_energy",
+            Quantity::Power,
+            2,
+        );
         assert_eq!(closest[0].statistic_id, "sensor.eve_energy_20ecm8301_power");
         assert_eq!(closest.len(), 2);
 
-        // Only plottable sensors are ever suggested.
-        assert!(closest.iter().all(Candidate::is_plottable));
+        // Only sensors of the wanted quantity are ever suggested.
+        assert!(
+            closest
+                .iter()
+                .all(|candidate| candidate.is_readable_as(Quantity::Power))
+        );
+    }
+
+    #[test]
+    fn suggestions_offer_the_quantity_that_was_wanted() {
+        let conn = database();
+        let power = suggest_block(&conn, "sensor.attic_power", Quantity::Power, UTC);
+        assert!(power.contains("Power sensors in this database:"), "{power}");
+        assert!(
+            power.contains(ENTITY) && !power.contains("attic_temp"),
+            "{power}"
+        );
+
+        let warmth = suggest_block(
+            &conn,
+            "sensor.attic_temperature",
+            Quantity::Temperature,
+            UTC,
+        );
+        assert!(
+            warmth.contains("Temperature sensors in this database:"),
+            "{warmth}"
+        );
+        assert!(
+            warmth.contains("sensor.attic_temp") && !warmth.contains(ENTITY),
+            "{warmth}"
+        );
+
+        let none = suggest_block(
+            &testdb::modern_database(),
+            "sensor.x",
+            Quantity::Temperature,
+            UTC,
+        );
+        assert!(
+            none.contains("no temperature sensor with hourly statistics"),
+            "{none}"
+        );
     }
 
     #[test]
@@ -575,7 +664,7 @@ mod tests {
         assert!(lines[2].contains("and 1 more"));
 
         // Columns line up, so the ids are padded to a common width.
-        let unit_at = |line: &str| line.find(" W ").or_else(|| line.find(" kWh ")).unwrap();
+        let unit_at = |line: &str| line.find(" W ").or_else(|| line.find(" °C ")).unwrap();
         assert_eq!(unit_at(lines[0]), unit_at(lines[1]));
     }
 
@@ -585,15 +674,25 @@ mod tests {
     }
 
     #[test]
-    fn the_listing_separates_power_from_counters() {
+    fn the_listing_separates_power_thermometers_and_counters() {
         let listing = format_listing(&list_statistics(&database(), None).unwrap(), UTC, 20);
-        assert!(listing.contains("Power sensors these tools can read:"));
-        assert!(listing.contains("Energy counters"));
-        assert!(listing.contains("Other statistics:"));
-
-        // The power sensor is above the counter, which is above the thermometer.
         let position = |needle: &str| listing.find(needle).expect("listed");
-        assert!(position(ENTITY) < position("sensor.solar_energy"));
-        assert!(position("sensor.solar_energy") < position("sensor.attic_temp"));
+        assert!(position("Power sensors these tools can read:") < position(ENTITY));
+        assert!(position(ENTITY) < position("Temperature sensors these tools can read:"));
+        assert!(position("Temperature sensors") < position("sensor.attic_temp"));
+        assert!(position("sensor.attic_temp") < position("Energy counters"));
+        assert!(position("Energy counters") < position("sensor.solar_energy"));
+        assert!(
+            !listing.contains("Other statistics:"),
+            "nothing is left over"
+        );
+
+        // A database without thermometers says nothing about them.
+        let power_only = format_listing(
+            &list_statistics(&testdb::modern_database(), None).unwrap(),
+            UTC,
+            20,
+        );
+        assert!(!power_only.contains("Temperature"), "{power_only}");
     }
 }

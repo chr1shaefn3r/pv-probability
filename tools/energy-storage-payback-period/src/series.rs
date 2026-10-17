@@ -187,10 +187,10 @@ pub fn accumulate_sequential(samples: &[Sample], grid: SlotGrid) -> Slots {
 }
 
 fn accumulate_one(slots: &mut Slots, sample: &Sample, grid: SlotGrid) {
-    if sample.duration() <= 0 || !sample.watts.is_finite() {
+    if sample.duration() <= 0 || !sample.value.is_finite() {
         return;
     }
-    let watts = sample.watts;
+    let watts = sample.value;
     for_each_slot_slice(sample.start_ts, sample.end_ts, grid, |index, seconds| {
         slots.add(index, watts, seconds);
     });

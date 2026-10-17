@@ -4,6 +4,7 @@ use chrono_tz::Europe::Berlin;
 use chrono_tz::Tz::UTC;
 use rusqlite::Connection;
 
+use ha_recorder::Quantity;
 use ha_recorder::source::schema::ValueColumn;
 use ha_recorder::source::{LoadOptions, SourceKind, load};
 use ha_testdb::{self as testdb, EXPORT_ENTITY, IMPORT_ENTITY};
@@ -34,6 +35,7 @@ fn options(entity: &str) -> LoadOptions<'_> {
         from: None,
         to: None,
         max_gap: 900,
+        quantity: Quantity::Power,
         scale: None,
         clamp_negative: true,
         tz: UTC,

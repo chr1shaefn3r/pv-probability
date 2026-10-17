@@ -7,6 +7,7 @@ use chrono_tz::Europe::Berlin;
 use chrono_tz::Tz::UTC;
 use rusqlite::Connection;
 
+use ha_recorder::Quantity;
 use ha_recorder::coverage::{Coverage, possible_days_per_facet};
 use ha_recorder::model::Grouping;
 use ha_recorder::source::schema::ValueColumn;
@@ -30,6 +31,7 @@ fn options<'a>(entity: &'a str) -> LoadOptions<'a> {
         from: None,
         to: None,
         max_gap: 900,
+        quantity: Quantity::Power,
         scale: None,
         clamp_negative: true,
         tz: UTC,

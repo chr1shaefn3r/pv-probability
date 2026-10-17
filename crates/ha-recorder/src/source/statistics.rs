@@ -9,9 +9,10 @@ use rusqlite::Connection;
 use rusqlite::types::Value;
 
 use crate::model::Sample;
+use crate::quantity::{Conversion, Quantity};
 use crate::source::schema::{
     self, StatisticsTable, TimeColumn, ValueColumn, find_statistic, not_found_error,
-    statistics_layout, unit_scale_to_watts, value_to_f64, value_to_timestamp,
+    statistics_layout, value_to_f64, value_to_timestamp,
 };
 
 /// What to read out of a statistics table.
@@ -22,7 +23,9 @@ pub struct Request<'a> {
     pub value: ValueColumn,
     pub from: Option<i64>,
     pub to: Option<i64>,
-    /// Explicit watt scaling; `None` derives it from the recorded unit.
+    /// What the statistic should measure, which decides the unit conversion.
+    pub quantity: Quantity,
+    /// Explicit scaling; `None` derives the conversion from the recorded unit.
     pub scale: Option<f64>,
     pub clamp_negative: bool,
     /// Only used to state dates in error messages.
@@ -34,7 +37,7 @@ pub struct Request<'a> {
 pub struct Loaded {
     pub samples: Vec<Sample>,
     pub unit: Option<String>,
-    pub scale: f64,
+    pub conversion: Conversion,
     /// Rows the query returned, including ones dropped for being NULL.
     pub rows: usize,
 }
@@ -67,11 +70,25 @@ pub fn load(conn: &Connection, request: &Request<'_>) -> Result<Loaded> {
                     request.statistic_id,
                 ),
             ),
-            crate::source::catalog::suggest_block(conn, request.statistic_id, request.tz)
+            crate::source::catalog::suggest_block(
+                conn,
+                request.statistic_id,
+                request.quantity,
+                request.tz
+            )
         )
     })?;
 
-    let scale = resolve_scale(request.scale, meta.unit.as_deref());
+    let conversion = resolve_conversion(request.quantity, request.scale, meta.unit.as_deref())
+        .ok_or_else(|| {
+            wrong_unit_error(
+                conn,
+                request.statistic_id,
+                meta.unit.as_deref().unwrap_or_default(),
+                request.quantity,
+                request.tz,
+            )
+        })?;
     let interval = request.table.interval_seconds();
     let table_name = request.table.table_name();
     let value_column = request.value.column_name();
@@ -114,9 +131,9 @@ pub fn load(conn: &Connection, request: &Request<'_>) -> Result<Loaded> {
             // weight, so the hour simply contributes no observation time.
             continue;
         };
-        let watts = scale_watts(value, scale, request.clamp_negative);
+        let value = convert(value, conversion, request.clamp_negative);
         if let Some(sample) =
-            Sample::new(start, start + interval, watts).clipped(request.from, request.to)
+            Sample::new(start, start + interval, value).clipped(request.from, request.to)
         {
             samples.push(sample);
         }
@@ -125,26 +142,59 @@ pub fn load(conn: &Connection, request: &Request<'_>) -> Result<Loaded> {
     Ok(Loaded {
         samples,
         unit: meta.unit,
-        scale,
+        conversion,
         rows: row_count,
     })
 }
 
-/// Explicit `--scale` wins; otherwise a recognised unit is converted to watts and
-/// anything else is left alone.
-pub fn resolve_scale(explicit: Option<f64>, unit: Option<&str>) -> f64 {
-    explicit
-        .or_else(|| unit.and_then(unit_scale_to_watts))
-        .unwrap_or(1.0)
+/// How readings recorded in `unit` become `quantity`'s working unit.
+///
+/// An explicit `--scale` wins, and is a plain multiplication. Otherwise a unit of the
+/// quantity converts, and a unit nobody recognises is taken as already right. `None`
+/// means the unit belongs to a *different* quantity - a thermometer handed to a power
+/// tool - which no conversion could make sense of.
+pub fn resolve_conversion(
+    quantity: Quantity,
+    explicit: Option<f64>,
+    unit: Option<&str>,
+) -> Option<Conversion> {
+    if let Some(scale) = explicit {
+        return Some(Conversion::factor(scale));
+    }
+    let Some(unit) = unit else {
+        return Some(Conversion::IDENTITY);
+    };
+    match quantity.conversion(unit) {
+        Some(conversion) => Some(conversion),
+        None if Quantity::of_unit(unit).is_some() => None,
+        None => Some(Conversion::IDENTITY),
+    }
 }
 
-/// Apply the unit scale and the negative-reading policy.
-pub fn scale_watts(value: f64, scale: f64, clamp_negative: bool) -> f64 {
-    let scaled = value * scale;
+/// The error for a statistic recorded in another quantity's unit.
+fn wrong_unit_error(
+    conn: &Connection,
+    statistic_id: &str,
+    unit: &str,
+    quantity: Quantity,
+    tz: chrono_tz::Tz,
+) -> anyhow::Error {
+    let measures = Quantity::of_unit(unit).map_or("something else", Quantity::name);
+    anyhow::anyhow!(
+        "`{statistic_id}` is recorded in {unit}, which measures {measures}, but a {} is \
+         needed here. Pass --scale to read it anyway.{}",
+        quantity.sensor_noun(),
+        crate::source::catalog::suggest_block(conn, statistic_id, quantity, tz)
+    )
+}
+
+/// Apply the unit conversion and the negative-reading policy.
+pub fn convert(value: f64, conversion: Conversion, clamp_negative: bool) -> f64 {
+    let converted = conversion.apply(value);
     if clamp_negative {
-        scaled.max(0.0)
+        converted.max(0.0)
     } else {
-        scaled
+        converted
     }
 }
 
@@ -169,6 +219,7 @@ mod tests {
             value: ValueColumn::Mean,
             from: None,
             to: None,
+            quantity: Quantity::Power,
             scale: None,
             clamp_negative: true,
             tz: chrono_tz::Tz::UTC,
@@ -184,12 +235,12 @@ mod tests {
         assert_eq!(loaded.rows, 4);
         assert_eq!(loaded.samples.len(), 3);
         assert_eq!(loaded.unit.as_deref(), Some("W"));
-        assert_eq!(loaded.scale, 1.0);
+        assert_eq!(loaded.conversion, Conversion::IDENTITY);
 
         let first = loaded.samples[0];
         assert_eq!(first.start_ts, ts("2024-06-21 09:00:00"));
         assert_eq!(first.end_ts, ts("2024-06-21 10:00:00"));
-        assert_eq!(first.watts, 1_000.0);
+        assert_eq!(first.value, 1_000.0);
         assert!(
             loaded
                 .samples
@@ -204,7 +255,7 @@ mod tests {
         let loaded = load(&db, &request(ENTITY)).unwrap();
         assert_eq!(loaded.samples.len(), 3);
         assert_eq!(loaded.samples[0].start_ts, ts("2024-06-21 09:00:00"));
-        assert_eq!(loaded.samples[0].watts, 1_000.0);
+        assert_eq!(loaded.samples[0].value, 1_000.0);
     }
 
     #[test]
@@ -224,11 +275,11 @@ mod tests {
         request.value = ValueColumn::Max;
         let loaded = load(&db, &request).unwrap();
         // The builder stores max as 1.5x the mean.
-        assert_eq!(loaded.samples[0].watts, 1_500.0);
+        assert_eq!(loaded.samples[0].value, 1_500.0);
 
         request.value = ValueColumn::Min;
         let loaded = load(&db, &request).unwrap();
-        assert_eq!(loaded.samples[0].watts, 500.0);
+        assert_eq!(loaded.samples[0].value, 500.0);
     }
 
     #[test]
@@ -272,14 +323,14 @@ mod tests {
         );
 
         let loaded = load(&conn, &request(ENTITY)).unwrap();
-        assert_eq!(loaded.scale, 1_000.0);
-        assert!((loaded.samples[0].watts - 3_200.0).abs() < 1e-9);
+        assert_eq!(loaded.conversion, Conversion::factor(1_000.0));
+        assert!((loaded.samples[0].value - 3_200.0).abs() < 1e-9);
 
         // An explicit scale overrides the unit.
         let mut explicit = request(ENTITY);
         explicit.scale = Some(1.0);
         let loaded = load(&conn, &explicit).unwrap();
-        assert_eq!(loaded.samples[0].watts, 3.2);
+        assert_eq!(loaded.samples[0].value, 3.2);
     }
 
     #[test]
@@ -296,11 +347,11 @@ mod tests {
             Some(-12.0),
         );
 
-        assert_eq!(load(&conn, &request(ENTITY)).unwrap().samples[0].watts, 0.0);
+        assert_eq!(load(&conn, &request(ENTITY)).unwrap().samples[0].value, 0.0);
 
         let mut keep_negative = request(ENTITY);
         keep_negative.clamp_negative = false;
-        assert_eq!(load(&conn, &keep_negative).unwrap().samples[0].watts, -12.0);
+        assert_eq!(load(&conn, &keep_negative).unwrap().samples[0].value, -12.0);
     }
 
     #[test]
@@ -329,18 +380,83 @@ mod tests {
         assert_eq!(row_count(&db, StatisticsTable::LongTerm, 4_242).unwrap(), 0);
     }
 
-    #[test]
-    fn scale_resolution_prefers_the_explicit_value() {
-        assert_eq!(resolve_scale(Some(2.0), Some("kW")), 2.0);
-        assert_eq!(resolve_scale(None, Some("kW")), 1_000.0);
-        assert_eq!(resolve_scale(None, Some("bananas")), 1.0);
-        assert_eq!(resolve_scale(None, None), 1.0);
+    /// A database holding one hourly mean for `id`, recorded in `unit`.
+    fn one_reading(id: &str, unit: &str, mean: f64) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        testdb::create_schema(&conn, Flavour::Modern);
+        let metadata_id = testdb::insert_statistic_meta(&conn, id, Some(unit));
+        testdb::insert_statistics_row(
+            &conn,
+            Flavour::Modern,
+            "statistics",
+            metadata_id,
+            ts("2024-01-10 06:00:00"),
+            Some(mean),
+        );
+        conn
     }
 
     #[test]
-    fn scaling_applies_the_negative_policy() {
-        assert_eq!(scale_watts(1.5, 1_000.0, true), 1_500.0);
-        assert_eq!(scale_watts(-5.0, 1.0, true), 0.0);
-        assert_eq!(scale_watts(-5.0, 1.0, false), -5.0);
+    fn converts_fahrenheit_thermometers_to_celsius() {
+        let conn = one_reading("sensor.outdoor_temperature", "°F", 23.0);
+        let mut request = request("sensor.outdoor_temperature");
+        request.quantity = Quantity::Temperature;
+        request.clamp_negative = false;
+        let loaded = load(&conn, &request).unwrap();
+        assert!(
+            (loaded.samples[0].value + 5.0).abs() < 1e-9,
+            "23 °F is -5 °C"
+        );
+        assert!(!loaded.conversion.is_identity());
+    }
+
+    #[test]
+    fn a_sensor_of_another_quantity_is_refused_by_name() {
+        let conn = one_reading("sensor.outdoor_temperature", "°C", 4.0);
+        let error = load(&conn, &request("sensor.outdoor_temperature"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("recorded in °C"), "{error}");
+        assert!(error.contains("measures temperature"), "{error}");
+        assert!(error.contains("a power sensor is needed"), "{error}");
+
+        // --scale is the way out for anyone who really means it.
+        let mut explicit = request("sensor.outdoor_temperature");
+        explicit.scale = Some(1.0);
+        assert_eq!(load(&conn, &explicit).unwrap().samples[0].value, 4.0);
+    }
+
+    #[test]
+    fn conversion_prefers_the_explicit_scale_then_the_unit() {
+        let power = Quantity::Power;
+        assert_eq!(
+            resolve_conversion(power, Some(2.0), Some("kW")),
+            Some(Conversion::factor(2.0))
+        );
+        assert_eq!(
+            resolve_conversion(power, None, Some("kW")),
+            Some(Conversion::factor(1_000.0))
+        );
+        assert_eq!(
+            resolve_conversion(power, None, Some("bananas")),
+            Some(Conversion::IDENTITY),
+            "a unit nobody knows is taken at its word"
+        );
+        assert_eq!(
+            resolve_conversion(power, None, None),
+            Some(Conversion::IDENTITY)
+        );
+        assert_eq!(resolve_conversion(power, None, Some("°C")), None);
+        assert_eq!(
+            resolve_conversion(Quantity::Temperature, None, Some("kW")),
+            None
+        );
+    }
+
+    #[test]
+    fn conversion_applies_the_negative_policy() {
+        assert_eq!(convert(1.5, Conversion::factor(1_000.0), true), 1_500.0);
+        assert_eq!(convert(-5.0, Conversion::IDENTITY, true), 0.0);
+        assert_eq!(convert(-5.0, Conversion::IDENTITY, false), -5.0);
     }
 }

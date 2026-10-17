@@ -4,8 +4,10 @@ use std::fmt;
 
 use crate::timeutil::LocalParts;
 
-/// One power reading that was in effect over the half-open UTC interval
-/// `[start_ts, end_ts)`.
+/// One reading that was in effect over the half-open UTC interval `[start_ts, end_ts)`.
+///
+/// The value is in the working unit of whatever [`crate::Quantity`] was read: watts for a
+/// power sensor, degrees Celsius for a thermometer.
 ///
 /// Long-term statistics rows cover a fixed hour, short-term rows five minutes, and raw
 /// recorder states cover the time until the next state change (capped by `--max-gap`).
@@ -15,15 +17,15 @@ use crate::timeutil::LocalParts;
 pub struct Sample {
     pub start_ts: i64,
     pub end_ts: i64,
-    pub watts: f64,
+    pub value: f64,
 }
 
 impl Sample {
-    pub fn new(start_ts: i64, end_ts: i64, watts: f64) -> Self {
+    pub fn new(start_ts: i64, end_ts: i64, value: f64) -> Self {
         Self {
             start_ts,
             end_ts,
-            watts,
+            value,
         }
     }
 
@@ -39,7 +41,7 @@ impl Sample {
         (end > start).then_some(Self {
             start_ts: start,
             end_ts: end,
-            watts: self.watts,
+            value: self.value,
         })
     }
 }

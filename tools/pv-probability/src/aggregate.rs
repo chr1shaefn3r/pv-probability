@@ -60,10 +60,10 @@ pub fn build_grid_sequential(
 }
 
 fn accumulate(grid: &mut Grid, sample: &Sample, grouping: Grouping, tz: Tz) {
-    if sample.duration() <= 0 || !sample.watts.is_finite() {
+    if sample.duration() <= 0 || !sample.value.is_finite() {
         return;
     }
-    let watts = sample.watts;
+    let watts = sample.value;
     for_each_hour_slice(sample.start_ts, sample.end_ts, tz, |parts, seconds| {
         if let Some(facet) = grouping.facet_index(&parts) {
             grid.add(facet, usize::from(parts.hour), watts, seconds, parts.day);
@@ -80,8 +80,8 @@ fn accumulate(grid: &mut Grid, sample: &Sample, grouping: Grouping, tz: Tz) {
 pub fn suggest_max_watts(samples: &[Sample], step: f64, quantile: f64) -> f64 {
     let mut weighted: Vec<(f64, f64)> = samples
         .par_iter()
-        .filter(|sample| sample.duration() > 0 && sample.watts.is_finite() && sample.watts > 0.0)
-        .map(|sample| (sample.watts, sample.duration() as f64))
+        .filter(|sample| sample.duration() > 0 && sample.value.is_finite() && sample.value > 0.0)
+        .map(|sample| (sample.value, sample.duration() as f64))
         .collect();
 
     if weighted.is_empty() {

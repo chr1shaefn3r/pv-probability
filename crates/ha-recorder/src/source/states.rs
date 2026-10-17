@@ -10,11 +10,12 @@ use rusqlite::Connection;
 use rusqlite::types::Value;
 
 use crate::model::Sample;
+use crate::quantity::{Conversion, Quantity};
 use crate::source::schema::{
     self, StatesLayout, find_state_metadata_id, not_found_error, states_layout, value_to_f64,
     value_to_timestamp,
 };
-use crate::source::statistics::{Loaded, scale_watts};
+use crate::source::statistics::{Loaded, convert};
 
 /// What to read out of the states table.
 #[derive(Debug, Clone)]
@@ -24,6 +25,10 @@ pub struct Request<'a> {
     pub to: Option<i64>,
     /// Longest span a single reading may be assumed to remain valid, in seconds.
     pub max_gap: i64,
+    /// What the entity should measure; only used to suggest alternatives.
+    pub quantity: Quantity,
+    /// Explicit scaling. Raw states carry no unit of their own (Home Assistant keeps it in
+    /// the attributes), so without this the values are taken as they are.
     pub scale: Option<f64>,
     pub clamp_negative: bool,
     /// Only used to state dates in error messages.
@@ -70,7 +75,12 @@ pub fn load(conn: &Connection, request: &Request<'_>) -> Result<Loaded> {
                                 request.entity_id
                             ),
                         ),
-                        crate::source::catalog::suggest_block(conn, request.entity_id, request.tz)
+                        crate::source::catalog::suggest_block(
+                            conn,
+                            request.entity_id,
+                            request.quantity,
+                            request.tz
+                        )
                     )
                 })?;
             (
@@ -95,7 +105,9 @@ pub fn load(conn: &Connection, request: &Request<'_>) -> Result<Loaded> {
         Ok((row.get::<_, Value>(0)?, row.get::<_, Value>(1)?))
     })?;
 
-    let scale = request.scale.unwrap_or(1.0);
+    let conversion = request
+        .scale
+        .map_or(Conversion::IDENTITY, Conversion::factor);
     let mut readings: Vec<(i64, Option<f64>)> = Vec::new();
     let mut row_count = 0usize;
     for row in rows {
@@ -106,9 +118,9 @@ pub fn load(conn: &Connection, request: &Request<'_>) -> Result<Loaded> {
         };
         // `unknown`, `unavailable` and friends keep their timestamp: they end the
         // previous reading without contributing one of their own.
-        let watts =
-            value_to_f64(&raw_state).map(|value| scale_watts(value, scale, request.clamp_negative));
-        readings.push((ts, watts));
+        let value = value_to_f64(&raw_state)
+            .map(|value| convert(value, conversion, request.clamp_negative));
+        readings.push((ts, value));
     }
 
     if readings.is_empty() && row_count == 0 {
@@ -116,7 +128,7 @@ pub fn load(conn: &Connection, request: &Request<'_>) -> Result<Loaded> {
         return Ok(Loaded {
             samples: Vec::new(),
             unit: None,
-            scale,
+            conversion,
             rows: 0,
         });
     }
@@ -130,7 +142,7 @@ pub fn load(conn: &Connection, request: &Request<'_>) -> Result<Loaded> {
     Ok(Loaded {
         samples,
         unit: None,
-        scale,
+        conversion,
         rows: row_count,
     })
 }
@@ -144,7 +156,7 @@ pub fn samples_from_readings(readings: &[(i64, Option<f64>)], max_gap: i64) -> V
     let max_gap = max_gap.max(0);
     let mut samples = Vec::with_capacity(readings.len());
     for (index, (start, value)) in readings.iter().enumerate() {
-        let Some(watts) = value else {
+        let Some(value) = value else {
             continue;
         };
         let horizon = start.saturating_add(max_gap);
@@ -154,7 +166,7 @@ pub fn samples_from_readings(readings: &[(i64, Option<f64>)], max_gap: i64) -> V
             None => horizon,
         };
         if end > *start {
-            samples.push(Sample::new(*start, end, *watts));
+            samples.push(Sample::new(*start, end, *value));
         }
     }
     samples
@@ -171,6 +183,7 @@ mod tests {
             from: None,
             to: None,
             max_gap: 900,
+            quantity: Quantity::Power,
             scale: None,
             clamp_negative: true,
             tz: chrono_tz::Tz::UTC,
@@ -248,7 +261,7 @@ mod tests {
         let db = testdb::legacy_database();
         let loaded = load(&db, &request(ENTITY)).unwrap();
         assert_eq!(loaded.samples.len(), 4);
-        assert_eq!(loaded.samples[0].watts, 500.0);
+        assert_eq!(loaded.samples[0].value, 500.0);
     }
 
     #[test]
@@ -290,12 +303,12 @@ mod tests {
         let mut request = request(ENTITY);
         request.scale = Some(1_000.0);
         let loaded = load(&conn, &request).unwrap();
-        assert_eq!(loaded.samples[0].watts, 1_500.0);
-        assert_eq!(loaded.samples[1].watts, 0.0);
+        assert_eq!(loaded.samples[0].value, 1_500.0);
+        assert_eq!(loaded.samples[1].value, 0.0);
 
         request.clamp_negative = false;
         let loaded = load(&conn, &request).unwrap();
-        assert!((loaded.samples[1].watts + 200.0).abs() < 1e-9);
+        assert!((loaded.samples[1].value + 200.0).abs() < 1e-9);
     }
 
     #[test]

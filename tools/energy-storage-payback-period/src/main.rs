@@ -10,6 +10,7 @@ use chrono::DateTime;
 use chrono_tz::Tz;
 use clap::Parser;
 
+use ha_recorder::Quantity;
 use ha_recorder::coverage::Coverage;
 use ha_recorder::model::Grouping;
 use ha_recorder::source::{self, LoadOptions, LoadedSamples};
@@ -162,7 +163,8 @@ fn read(args: &Args, config: &Config, entity: &str) -> Result<LoadedSamples> {
 
 fn load_options<'a>(args: &Args, config: &Config, entity: &'a str) -> LoadOptions<'a> {
     // A grid meter reading below zero is noise, not generation.
-    args.recorder.load_options(entity, &config.recorder, true)
+    args.recorder
+        .load_options(entity, Quantity::Power, &config.recorder, true)
 }
 
 /// What the run found, in the order it matters.
@@ -324,10 +326,10 @@ fn metadata(
         ));
     }
     if let Some(unit) = &import.unit {
-        let scaled = if import.scale == 1.0 {
+        let scaled = if import.conversion.scale == 1.0 {
             unit.clone()
         } else {
-            format!("{unit} x{}", import.scale)
+            format!("{unit} x{}", import.conversion.scale)
         };
         metadata.push(("Unit".to_string(), scaled));
     }

@@ -317,17 +317,6 @@ pub fn not_found_error(kind: &str, needle: &str, suggestions: &[String]) -> anyh
     }
 }
 
-/// Factor converting a recorder unit into watts, if it is a power unit we know.
-pub fn unit_scale_to_watts(unit: &str) -> Option<f64> {
-    match unit.trim() {
-        "W" => Some(1.0),
-        "kW" => Some(1_000.0),
-        "MW" => Some(1_000_000.0),
-        "mW" => Some(0.001),
-        _ => None,
-    }
-}
-
 /// Interpret a stored timestamp, whatever type the column happens to hold.
 pub fn value_to_timestamp(value: &Value) -> Option<i64> {
     match value {
@@ -528,15 +517,6 @@ mod tests {
             0,
             "an energy counter carries sums, never means"
         );
-    }
-
-    #[test]
-    fn converts_known_power_units() {
-        assert_eq!(unit_scale_to_watts("W"), Some(1.0));
-        assert_eq!(unit_scale_to_watts(" kW "), Some(1_000.0));
-        assert_eq!(unit_scale_to_watts("MW"), Some(1_000_000.0));
-        assert_eq!(unit_scale_to_watts("kWh"), None);
-        assert_eq!(unit_scale_to_watts(""), None);
     }
 
     #[test]

@@ -1,7 +1,8 @@
 //! Reading a copy of a Home Assistant recorder database, for every tool in the workspace.
 //!
 //! 1. [`source`] finds an entity in whichever schema generation the database uses and
-//!    reads it as weighted [`Sample`]s, each one a reading and how long it held.
+//!    reads it as weighted [`Sample`]s, each one a reading and how long it held, converted
+//!    into the working unit of its [`Quantity`].
 //! 2. [`coverage`] says what that history really covers: the days recorded and the
 //!    outages between them.
 //! 3. [`timeutil`] turns UTC timestamps into local hours, days and weeks, DST included.
@@ -14,8 +15,10 @@
 pub mod args;
 pub mod coverage;
 pub mod model;
+pub mod quantity;
 pub mod source;
 pub mod timeutil;
 
 pub use args::{RecorderArgs, RecorderConfig};
 pub use model::{Grouping, Sample};
+pub use quantity::{Conversion, Quantity};

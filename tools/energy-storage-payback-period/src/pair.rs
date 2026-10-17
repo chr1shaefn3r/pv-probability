@@ -194,7 +194,7 @@ mod tests {
         };
         let sample = step.as_sample();
         assert_eq!(sample.duration(), 3_600);
-        assert!((sample.watts - 1_500.0).abs() < 1e-9, "{}", sample.watts);
+        assert!((sample.value - 1_500.0).abs() < 1e-9, "{}", sample.value);
         assert_eq!(step.hours(), 1.0);
     }
 }
