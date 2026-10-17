@@ -17,6 +17,33 @@ pub const ENTITY: &str = "sensor.solar_power";
 pub const IMPORT_ENTITY: &str = "sensor.grid_import_power";
 pub const EXPORT_ENTITY: &str = "sensor.grid_export_power";
 
+/// The outdoor thermometer the heating tool reads.
+pub const OUTSIDE_ENTITY: &str = "sensor.outdoor_temperature";
+
+/// The synthetic house: floor, room, its thermometer, and the temperature it is heated to.
+pub const ROOMS: [(&str, &str, &str, f64); 5] = [
+    (
+        "Ground floor",
+        "Living room",
+        "sensor.living_room_temperature",
+        21.0,
+    ),
+    (
+        "Ground floor",
+        "Kitchen",
+        "sensor.kitchen_temperature",
+        20.0,
+    ),
+    ("Ground floor", "Office", "sensor.office_temperature", 20.5),
+    ("First floor", "Bedroom", "sensor.bedroom_temperature", 18.5),
+    (
+        "First floor",
+        "Bathroom",
+        "sensor.bathroom_temperature",
+        22.0,
+    ),
+];
+
 const MODERN_SCHEMA: &str = "
 CREATE TABLE statistics_meta (
     id INTEGER PRIMARY KEY,
@@ -364,9 +391,19 @@ impl Lcg {
         (self.0 >> 33) as u32
     }
 
-    /// Uniform float in `[0, 1)`.
+    /// Uniform float in `[0, 0.5]` - not `[0, 1)`, as it was meant to be.
+    ///
+    /// [`Lcg::next_u32`] keeps 31 bits, so dividing by `u32::MAX` never passes one half.
+    /// The synthetic solar and grid histories were generated with it, and the tests and
+    /// the README's figures are built on them as they are, so it stays; new generators use
+    /// [`Lcg::next_fraction`].
     pub fn next_unit(&mut self) -> f64 {
         f64::from(self.next_u32()) / f64::from(u32::MAX)
+    }
+
+    /// Uniform float in `[0, 1)`.
+    pub fn next_fraction(&mut self) -> f64 {
+        f64::from(self.next_u32()) / f64::from(1u32 << 31)
     }
 }
 
@@ -621,6 +658,108 @@ pub fn insert_synthetic_energy_counter(
     metadata_id
 }
 
+/// Outside temperature in °C at a UTC instant, around a Central European climate.
+///
+/// The season peaks in mid-July at about 19 °C and bottoms out in mid-January around
+/// 0 °C; each day is coldest before dawn and warmest mid-afternoon, about 8 °C apart.
+/// `weather` shifts a whole day warmer or colder than the season, which is what makes one
+/// January colder than the next.
+pub fn synthetic_outside_celsius(ts: i64, weather: f64) -> f64 {
+    const SECONDS_PER_DAY: f64 = 86_400.0;
+    let day_of_year = (ts as f64 / SECONDS_PER_DAY) % 365.25;
+    let hour = (ts as f64 % SECONDS_PER_DAY) / 3_600.0;
+    let season = ((day_of_year - 197.0) / 365.25 * std::f64::consts::TAU).cos();
+    let daily = ((hour - 15.0) / 24.0 * std::f64::consts::TAU).cos();
+    9.5 + 9.5 * season + 4.0 * daily + weather
+}
+
+/// A room's temperature in °C, given what it is heated to and how warm it is outside.
+///
+/// Heating holds the setpoint while it is cold out; on warm days the room drifts above it,
+/// following the outside temperature at a fraction of its swing.
+pub fn synthetic_room_celsius(setpoint: f64, outside: f64, rng: &mut Lcg) -> f64 {
+    let drift = 0.6 * (outside - (setpoint - 6.0)).max(0.0);
+    setpoint + drift + 0.4 * (rng.next_fraction() - 0.5)
+}
+
+/// Write the outdoor thermometer and every room in [`ROOMS`] as hourly means in °C, and
+/// return the outdoor thermometer's `metadata_id`.
+///
+/// The weather is a slow random walk around the season, so mild and cold spells last a
+/// few days rather than flipping every midnight.
+pub fn insert_synthetic_temperatures(
+    conn: &Connection,
+    start_ts: i64,
+    days: i64,
+    seed: u64,
+    outages: &Outages,
+) -> i64 {
+    let outside_id = insert_statistic_meta(conn, OUTSIDE_ENTITY, Some("°C"));
+    let room_ids: Vec<(i64, f64)> = ROOMS
+        .iter()
+        .map(|(_, _, sensor, setpoint)| {
+            (insert_statistic_meta(conn, sensor, Some("°C")), *setpoint)
+        })
+        .collect();
+    // Separate generators: drawing the weather at a fixed stride of one LCG would sample
+    // it at a lattice of its outputs, which an LCG makes far from random.
+    let mut weather_rng = Lcg::new(seed);
+    let mut room_rng = Lcg::new(seed ^ 0x9E37_79B9_7F4A_7C15);
+    let mut weather = 0.0;
+    conn.execute_batch("BEGIN").expect("begin transaction");
+    for day in 0..days {
+        weather = 0.75 * weather + 5.0 * (weather_rng.next_fraction() - 0.5);
+        if !outages.covers(day) {
+            continue;
+        }
+        for hour in 0..24 {
+            if !outages.covers_hour(hour) {
+                continue;
+            }
+            let start = start_ts + day * 86_400 + hour * 3_600;
+            // Average the hour, the way Home Assistant's hourly statistics do.
+            let outside = (0..6)
+                .map(|slot| synthetic_outside_celsius(start + slot * 600, weather))
+                .sum::<f64>()
+                / 6.0;
+            insert_statistics_row(
+                conn,
+                Flavour::Modern,
+                "statistics",
+                outside_id,
+                start,
+                Some(outside),
+            );
+            for (metadata_id, setpoint) in &room_ids {
+                let room = synthetic_room_celsius(*setpoint, outside, &mut room_rng);
+                insert_statistics_row(
+                    conn,
+                    Flavour::Modern,
+                    "statistics",
+                    *metadata_id,
+                    start,
+                    Some(room),
+                );
+            }
+        }
+    }
+    conn.execute_batch("COMMIT").expect("commit transaction");
+    outside_id
+}
+
+/// A modern-schema database holding `days` days of the synthetic house's thermometers.
+pub fn synthetic_temperature_database(
+    start: &str,
+    days: i64,
+    seed: u64,
+    outages: &Outages,
+) -> Connection {
+    let conn = Connection::open_in_memory().expect("open in-memory database");
+    create_schema(&conn, Flavour::Modern);
+    insert_synthetic_temperatures(&conn, ts(start), days, seed, outages);
+    conn
+}
+
 /// A modern-schema database holding `days` days of synthetic hourly statistics.
 pub fn synthetic_year_database(start: &str, days: i64, seed: u64) -> Connection {
     synthetic_history_database(start, days, seed, &Outages::none())
@@ -666,6 +805,48 @@ mod tests {
     }
 
     #[test]
+    fn the_synthetic_climate_is_cold_in_winter_and_warm_in_summer() {
+        let conn = synthetic_temperature_database("2024-01-01 00:00:00", 366, 7, &Outages::none());
+        let monthly_mean = |entity: &str, month: &str| -> f64 {
+            conn.query_row(
+                "SELECT AVG(mean) FROM statistics s JOIN statistics_meta m ON m.id = s.metadata_id \
+                 WHERE m.statistic_id = ?1 AND strftime('%m', s.start_ts, 'unixepoch') = ?2",
+                rusqlite::params![entity, month],
+                |row| row.get::<_, f64>(0),
+            )
+            .expect("a mean for that month")
+        };
+
+        let january = monthly_mean(OUTSIDE_ENTITY, "01");
+        let july = monthly_mean(OUTSIDE_ENTITY, "07");
+        assert!(
+            (-4.0..5.0).contains(&january),
+            "January averaged {january} °C"
+        );
+        assert!((15.0..23.0).contains(&july), "July averaged {july} °C");
+
+        // Rooms hold their setpoint in winter and run warmer in summer.
+        let living_january = monthly_mean("sensor.living_room_temperature", "01");
+        let living_july = monthly_mean("sensor.living_room_temperature", "07");
+        assert!((living_january - 21.0).abs() < 0.3, "{living_january}");
+        assert!(living_july > living_january + 1.0, "{living_july}");
+        let bedroom = monthly_mean("sensor.bedroom_temperature", "01");
+        assert!(
+            bedroom < living_january - 2.0,
+            "the bedroom is kept cooler: {bedroom}"
+        );
+
+        let units: Vec<String> = conn
+            .prepare("SELECT DISTINCT unit_of_measurement FROM statistics_meta")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(units, ["°C"]);
+    }
+
+    #[test]
     fn builds_both_schema_flavours() {
         for conn in [modern_database(), legacy_database()] {
             let rows: i64 = conn
@@ -687,6 +868,16 @@ mod tests {
             format_utc(ts("2024-06-21 09:00:00")),
             "2024-06-21 09:00:00.000000"
         );
+    }
+
+    #[test]
+    fn fractions_cover_the_whole_unit_interval() {
+        let mut rng = Lcg::new(3);
+        let draws: Vec<f64> = (0..10_000).map(|_| rng.next_fraction()).collect();
+        let mean = draws.iter().sum::<f64>() / draws.len() as f64;
+        assert!((mean - 0.5).abs() < 0.02, "mean {mean}");
+        assert!(draws.iter().all(|draw| (0.0..1.0).contains(draw)));
+        assert!(draws.iter().any(|draw| *draw > 0.9));
     }
 
     #[test]

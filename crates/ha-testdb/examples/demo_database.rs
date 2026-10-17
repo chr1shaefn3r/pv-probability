@@ -8,6 +8,8 @@
 //!     --tz Europe/Berlin
 //! cargo run --release --bin energy-storage-payback-period -- --db demo.db \
 //!     --import-entity sensor.grid_import_power --export-entity sensor.grid_export_power
+//! cargo run --release --bin heating-energy -- --db demo.db \
+//!     --outside-entity sensor.outdoor_temperature --rooms tools/heating-energy/rooms.example.toml
 //! ```
 
 use std::path::PathBuf;
@@ -55,13 +57,19 @@ fn main() -> Result<()> {
     // The grid meter the payback tool reads: a household load against the same array.
     testdb::insert_synthetic_grid_power(&conn, start, days, 0xC0FFEE, &outages);
 
+    // The thermometers the heating tool reads: one outside, one per room.
+    testdb::insert_synthetic_temperatures(&conn, start, days, 0xC0FFEE, &outages);
+
     println!(
         "wrote {} with {} of {days} days of hourly statistics for {ENTITY}, \
-         {} and {} (and a cumulative sensor.solar_energy counter beside them)",
+         {} and {} (and a cumulative sensor.solar_energy counter beside them), \
+         and for {} and {} room thermometers",
         path.display(),
         outages.covered_days(days),
         testdb::IMPORT_ENTITY,
-        testdb::EXPORT_ENTITY
+        testdb::EXPORT_ENTITY,
+        testdb::OUTSIDE_ENTITY,
+        testdb::ROOMS.len()
     );
     Ok(())
 }
