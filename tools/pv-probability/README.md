@@ -42,11 +42,11 @@ pv-probability --db ha.db --entity sensor.solar_power --tz Europe/Berlin
 It finishes by printing the command that opens the report, ready to paste:
 
 ```
-wrote pv-probability.html: 12 facets from 17520 readings (730 d), 159 kB, 9.65ms
+wrote pv-probability.html: 12 facets from 17520 readings (730 d), 340 kB, 26.60ms
 reliable window: 12:00 to the end of the 13:00 hour - at least 100 W in every recorded minute
   summer (April to September): 11:00 to the end of the 16:00 hour - at least 100 W in every recorded minute
   winter (October to March): 12:00 to the end of the 13:00 hour - at least 100 W in every recorded minute
-covers 2023-01-01 to 2024-12-31 (731 days): 730 days observed, no outage over 24 h
+covers 2023-01-01 to 2024-12-31 (731 days): 731 days observed (730 of them full days), no outage over 24 h
 
 open /home/you/pv-probability.html
 ```
@@ -233,7 +233,8 @@ gives the same numbers as text.
 Reading is single-threaded (SQLite), everything after it is parallel: samples are folded
 into per-facet histograms with rayon (`par_chunks` + `reduce`, since the histograms are
 additive), the power axis quantile uses a parallel sort, and the facets are rendered
-concurrently. Two years of hourly statistics (17 520 rows, 129 buckets) load, aggregate
-and render in under 10 ms on a laptop core; the work scales linearly, so even a
+concurrently. Two years of hourly statistics (17 520 rows, 147 buckets) load, aggregate
+and render in about 25 ms on four cores, almost all of it reading SQLite - the
+aggregation itself takes about 2 ms; the work scales linearly, so even a
 five-minute-resolution decade stays interactive. `--threads` caps the pool if you want to
 leave cores free.

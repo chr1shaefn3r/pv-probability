@@ -13,10 +13,10 @@ energy-storage-payback-period --db ha.db \
 ```
 
 ```
-wrote energy-storage-payback-period.html: 20 sizes over 17520 slots of 60 minutes, 25 kB, 36.5ms
-measured 17.97 MWh imported and 4.32 MWh exported
-best payback: 3 kWh for 3,000 EUR saves 257 EUR a year - paid off in 11.7 years
-for 5 years: it would have to cost 1,283 EUR instead of 3,000 EUR (57% less), which the 1,500 EUR base cost alone already exceeds
+wrote energy-storage-payback-period.html: 20 sizes over 17520 slots of 60 minutes, 25 kB, 43.27ms
+measured 14.11 MWh imported and 8.96 MWh exported
+best payback: 7 kWh for 5,000 EUR saves 559 EUR a year - paid off in 8.9 years
+for 5 years: it would have to cost 2,797 EUR instead of 5,000 EUR (44% less), or 185 EUR per kWh on top of the 1,500 EUR base cost
 covers 2023-01-01 to 2024-12-31 (731 days): 731 days paired (730 of them full days), 0 outages over 24 h
 
 open /home/you/energy-storage-payback-period.html
@@ -125,7 +125,7 @@ energy-storage-payback-period --db ha.db \
 The tool reads its two sensors on two connections at once, folds each into slots
 with the same `par_chunks` + `reduce` shape, and then simulates every battery size in
 parallel. A battery's state of charge makes one simulation inherently sequential, so the
-sizes are the unit of parallelism: 391 sizes over two years of hourly slots take 48 ms on
-four cores against 186 ms on one, so a sweep as fine as `--size-step 0.1` costs no more
+sizes are the unit of parallelism: 391 sizes over two years of hourly slots take 52 ms on
+four cores against 209 ms on one, so a sweep as fine as `--size-step 0.1` costs no more
 wall-clock time than a coarse one until it runs out of cores.
 

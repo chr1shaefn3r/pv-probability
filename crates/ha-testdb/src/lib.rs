@@ -383,6 +383,7 @@ impl Lcg {
         Self(seed)
     }
 
+    /// The next 31 bits: the top of the state, where an LCG's bits are best.
     pub fn next_u32(&mut self) -> u32 {
         self.0 = self
             .0
@@ -391,18 +392,12 @@ impl Lcg {
         (self.0 >> 33) as u32
     }
 
-    /// Uniform float in `[0, 0.5]` - not `[0, 1)`, as it was meant to be.
-    ///
-    /// [`Lcg::next_u32`] keeps 31 bits, so dividing by `u32::MAX` never passes one half.
-    /// The synthetic solar and grid histories were generated with it, and the tests and
-    /// the README's figures are built on them as they are, so it stays; new generators use
-    /// [`Lcg::next_fraction`].
-    pub fn next_unit(&mut self) -> f64 {
-        f64::from(self.next_u32()) / f64::from(u32::MAX)
-    }
-
     /// Uniform float in `[0, 1)`.
-    pub fn next_fraction(&mut self) -> f64 {
+    ///
+    /// Divided by 2^31, the span of [`Lcg::next_u32`]. It used to divide by `u32::MAX`,
+    /// which kept every draw below one half: two synthetic days in three came out
+    /// overcast rather than one in three.
+    pub fn next_unit(&mut self) -> f64 {
         f64::from(self.next_u32()) / f64::from(1u32 << 31)
     }
 }
@@ -679,7 +674,7 @@ pub fn synthetic_outside_celsius(ts: i64, weather: f64) -> f64 {
 /// following the outside temperature at a fraction of its swing.
 pub fn synthetic_room_celsius(setpoint: f64, outside: f64, rng: &mut Lcg) -> f64 {
     let drift = 0.6 * (outside - (setpoint - 6.0)).max(0.0);
-    setpoint + drift + 0.4 * (rng.next_fraction() - 0.5)
+    setpoint + drift + 0.4 * (rng.next_unit() - 0.5)
 }
 
 /// Write the outdoor thermometer and every room in [`ROOMS`] as hourly means in °C, and
@@ -708,7 +703,7 @@ pub fn insert_synthetic_temperatures(
     let mut weather = 0.0;
     conn.execute_batch("BEGIN").expect("begin transaction");
     for day in 0..days {
-        weather = 0.75 * weather + 5.0 * (weather_rng.next_fraction() - 0.5);
+        weather = 0.75 * weather + 5.0 * (weather_rng.next_unit() - 0.5);
         if !outages.covers(day) {
             continue;
         }
@@ -871,9 +866,9 @@ mod tests {
     }
 
     #[test]
-    fn fractions_cover_the_whole_unit_interval() {
+    fn unit_draws_cover_the_whole_unit_interval() {
         let mut rng = Lcg::new(3);
-        let draws: Vec<f64> = (0..10_000).map(|_| rng.next_fraction()).collect();
+        let draws: Vec<f64> = (0..10_000).map(|_| rng.next_unit()).collect();
         let mean = draws.iter().sum::<f64>() / draws.len() as f64;
         assert!((mean - 0.5).abs() < 0.02, "mean {mean}");
         assert!(draws.iter().all(|draw| (0.0..1.0).contains(draw)));
