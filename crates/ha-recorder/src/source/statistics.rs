@@ -14,6 +14,7 @@ use crate::source::schema::{
     self, StatisticsTable, TimeColumn, ValueColumn, find_statistic, not_found_error,
     statistics_layout, value_to_f64, value_to_timestamp,
 };
+use crate::source::slices::{self, Slice};
 
 /// What to read out of a statistics table.
 #[derive(Debug, Clone)]
@@ -42,7 +43,7 @@ pub struct Loaded {
     pub rows: usize,
 }
 
-/// How many rows a statistic has in a table; used to resolve `--source auto`.
+/// How many rows a statistic has in a table.
 pub fn row_count(conn: &Connection, table: StatisticsTable, metadata_id: i64) -> Result<i64> {
     let sql = format!(
         "SELECT COUNT(*) FROM \"{}\" WHERE metadata_id = ?1",
@@ -54,7 +55,25 @@ pub fn row_count(conn: &Connection, table: StatisticsTable, metadata_id: i64) ->
     Ok(count)
 }
 
+/// Whether a statistic has any row in a table; used to resolve `--source auto`.
+///
+/// Counting them would walk every index entry the statistic has, which for years of
+/// hourly rows costs a good part of what reading them does.
+pub fn has_rows(conn: &Connection, table: StatisticsTable, metadata_id: i64) -> Result<bool> {
+    let sql = format!(
+        "SELECT EXISTS (SELECT 1 FROM \"{}\" WHERE metadata_id = ?1)",
+        table.table_name()
+    );
+    let exists = conn
+        .query_row(&sql, [metadata_id], |row| row.get(0))
+        .with_context(|| format!("failed to look for rows in {}", table.table_name()))?;
+    Ok(exists)
+}
+
 /// Load statistics rows as time-weighted samples.
+///
+/// A long history is read in time slices, each on a connection of its own, in parallel,
+/// and put back together in order - the same rows, in the same order, as one query.
 pub fn load(conn: &Connection, request: &Request<'_>) -> Result<Loaded> {
     let time = statistics_layout(conn, request.table, request.value)?;
     let meta = find_statistic(conn, request.statistic_id)?.ok_or_else(|| {
@@ -93,57 +112,71 @@ pub fn load(conn: &Connection, request: &Request<'_>) -> Result<Loaded> {
     let table_name = request.table.table_name();
     let value_column = request.value.column_name();
     let time_column = time.name();
+    let key = Value::Integer(meta.metadata_id);
 
-    // A row that starts just before the window can still reach into it.
-    let (where_clause, params): (String, Vec<Value>) = if time.supports_range_pushdown() {
-        let mut clause = String::new();
-        let mut params = vec![Value::Integer(meta.metadata_id)];
-        if let Some(from) = request.from {
-            params.push(Value::Integer(from - interval));
-            clause.push_str(&format!(" AND \"{time_column}\" >= ?{}", params.len()));
+    // A row that starts just before the window can still reach into it. Text timestamps
+    // cannot be compared in SQL, so a legacy table is read whole, in one query, and
+    // clipped below.
+    let slices = if time.supports_range_pushdown() {
+        let window = Slice::window(request.from.map(|from| from - interval), request.to);
+        match slices::time_bounds(conn, table_name, "metadata_id", &key, time_column, window)? {
+            Some((first, last)) => slices::plan(
+                window,
+                first,
+                last,
+                (last - first) / interval + 1,
+                rayon::current_num_threads(),
+            ),
+            None => vec![window],
         }
-        if let Some(to) = request.to {
-            params.push(Value::Integer(to));
-            clause.push_str(&format!(" AND \"{time_column}\" < ?{}", params.len()));
-        }
-        (clause, params)
     } else {
-        (String::new(), vec![Value::Integer(meta.metadata_id)])
+        vec![Slice::window(None, None)]
     };
 
-    let sql = format!(
-        "SELECT \"{time_column}\", \"{value_column}\" FROM \"{table_name}\" \
-         WHERE metadata_id = ?1{where_clause} ORDER BY \"{time_column}\""
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
-        Ok((row.get::<_, Value>(0)?, row.get::<_, Value>(1)?))
+    let parts = slices::read_all(conn, &slices, |conn, slice| {
+        let mut params = vec![key.clone()];
+        let condition = slice.condition(time_column, &mut params);
+        let sql = format!(
+            "SELECT \"{time_column}\", \"{value_column}\" FROM \"{table_name}\" \
+             WHERE metadata_id = ?1{condition} ORDER BY \"{time_column}\""
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
+            Ok((row.get::<_, Value>(0)?, row.get::<_, Value>(1)?))
+        })?;
+
+        let mut samples = Vec::new();
+        let mut row_count = 0usize;
+        for row in rows {
+            let (raw_time, raw_value) = row?;
+            row_count += 1;
+            let (Some(start), Some(value)) =
+                (value_to_timestamp(&raw_time), value_to_f64(&raw_value))
+            else {
+                // NULL means the sensor reported nothing that hour; there is no reading to
+                // weight, so the hour simply contributes no observation time.
+                continue;
+            };
+            let value = convert(value, conversion, request.clamp_negative);
+            if let Some(sample) =
+                Sample::new(start, start + interval, value).clipped(request.from, request.to)
+            {
+                samples.push(sample);
+            }
+        }
+        Ok((samples, row_count))
     })?;
 
-    let mut samples = Vec::new();
-    let mut row_count = 0usize;
-    for row in rows {
-        let (raw_time, raw_value) = row?;
-        row_count += 1;
-        let (Some(start), Some(value)) = (value_to_timestamp(&raw_time), value_to_f64(&raw_value))
-        else {
-            // NULL means the sensor reported nothing that hour; there is no reading to
-            // weight, so the hour simply contributes no observation time.
-            continue;
-        };
-        let value = convert(value, conversion, request.clamp_negative);
-        if let Some(sample) =
-            Sample::new(start, start + interval, value).clipped(request.from, request.to)
-        {
-            samples.push(sample);
-        }
+    let rows = parts.iter().map(|(_, rows)| rows).sum();
+    let mut samples = Vec::with_capacity(parts.iter().map(|(samples, _)| samples.len()).sum());
+    for (part, _) in parts {
+        samples.extend(part);
     }
-
     Ok(Loaded {
         samples,
         unit: meta.unit,
         conversion,
-        rows: row_count,
+        rows,
     })
 }
 

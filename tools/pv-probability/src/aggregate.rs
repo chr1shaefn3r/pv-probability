@@ -4,14 +4,20 @@ use chrono_tz::Tz;
 use rayon::prelude::*;
 
 use ha_recorder::model::{Grouping, Sample};
-use ha_recorder::timeutil::for_each_hour_slice;
+use ha_recorder::timeutil::{DayNumber, for_each_hour_slice};
 
 use crate::model::{BucketSpec, DayWindow, Grid, HOURS_PER_DAY, Metric};
 
-/// Samples per rayon work unit. Each work unit allocates one partial [`Grid`], so this
-/// trades allocation overhead against parallelism; a few tens of thousands of samples
-/// per chunk keeps both small.
-const CHUNK_SIZE: usize = 32_768;
+/// Fewest samples worth a rayon task of their own: placing them on the local calendar
+/// takes a few hundred microseconds, well above what handing out the task costs.
+const MIN_SAMPLES_PER_CHUNK: usize = 2_048;
+
+/// How many samples each rayon worker places: an even share per thread.
+fn chunk_len(samples: usize) -> usize {
+    samples
+        .div_ceil(rayon::current_num_threads())
+        .max(MIN_SAMPLES_PER_CHUNK)
+}
 
 /// The span of local days the samples touch, which sizes the grid's day bitset.
 pub fn day_window(samples: &[Sample], tz: Tz) -> DayWindow {
@@ -28,21 +34,86 @@ pub fn day_window(samples: &[Sample], tz: Tz) -> DayWindow {
     }
 }
 
+/// One sample's share of one local hour, placed on the grid ahead of the fold.
+#[derive(Debug, Clone, Copy)]
+struct Placed {
+    facet: u16,
+    hour: u8,
+    bucket: u32,
+    /// Whole seconds, at most an hour's worth.
+    seconds: u32,
+    day: DayNumber,
+}
+
 /// Fold every sample into a facet × hour × bucket grid of observation seconds.
 ///
-/// Grids are additive, so disjoint chunks are folded independently and merged.
+/// Placing a sample - cutting it at local hour boundaries and finding the month or week,
+/// hour and day of each piece - is nearly all the work, so the samples are placed in
+/// parallel and the pieces then added to one grid in a single pass. A grid per worker,
+/// merged at the end, would cost more than it saves: each is mostly zeros, and zeroing
+/// that much fresh memory takes longer than placing a few thousand samples.
+///
+/// The weights are whole seconds, which a double adds exactly, so the grid comes out the
+/// same to the last bit however the samples are split.
 pub fn build_grid(samples: &[Sample], grouping: Grouping, buckets: BucketSpec, tz: Tz) -> Grid {
-    let days = day_window(samples, tz);
-    samples
-        .par_chunks(CHUNK_SIZE)
+    build_grid_in_chunks(samples, grouping, buckets, tz, chunk_len(samples.len()))
+}
+
+fn build_grid_in_chunks(
+    samples: &[Sample],
+    grouping: Grouping,
+    buckets: BucketSpec,
+    tz: Tz,
+    chunk_len: usize,
+) -> Grid {
+    let placed: Vec<Vec<Placed>> = samples
+        .par_chunks(chunk_len.max(1))
         .map(|chunk| {
-            let mut grid = Grid::new(grouping, buckets, days);
+            let mut placed = Vec::with_capacity(chunk.len() + chunk.len() / 8);
             for sample in chunk {
-                accumulate(&mut grid, sample, grouping, tz);
+                place(sample, grouping, &buckets, tz, &mut placed);
             }
-            grid
+            placed
         })
-        .reduce(|| Grid::new(grouping, buckets, days), Grid::merge)
+        .collect();
+
+    let mut grid = Grid::new(grouping, buckets, day_window(samples, tz));
+    for piece in placed.iter().flatten() {
+        grid.add_to_bucket(
+            usize::from(piece.facet),
+            usize::from(piece.hour),
+            piece.bucket as usize,
+            f64::from(piece.seconds),
+            piece.day,
+        );
+    }
+    grid
+}
+
+/// Cut a sample at local hour boundaries and say where each piece belongs.
+fn place(
+    sample: &Sample,
+    grouping: Grouping,
+    buckets: &BucketSpec,
+    tz: Tz,
+    placed: &mut Vec<Placed>,
+) {
+    if sample.duration() <= 0 || !sample.value.is_finite() {
+        return;
+    }
+    let bucket = buckets.index(sample.value) as u32;
+    for_each_hour_slice(sample.start_ts, sample.end_ts, tz, |parts, seconds| {
+        if let Some(facet) = grouping.facet_index(&parts) {
+            placed.push(Placed {
+                facet: facet as u16,
+                hour: parts.hour,
+                bucket,
+                // A slice never runs past the end of its hour.
+                seconds: seconds as u32,
+                day: parts.day,
+            });
+        }
+    });
 }
 
 /// Sequential equivalent of [`build_grid`], kept for tests and tiny inputs.
@@ -285,8 +356,15 @@ impl Analysis {
         if self.grouping == Grouping::Month {
             return;
         }
-        let months = build_grid(samples, Grouping::Month, self.buckets, tz);
-        self.seasons = seasons(&months, self.metric, self.min_days);
+        self.pool_seasons(&build_grid(samples, Grouping::Month, self.buckets, tz));
+    }
+
+    /// Pool [`Analysis::seasons`] from a grid of the same samples grouped by month, for a
+    /// caller that built it beside this analysis's own grid rather than after it.
+    pub fn pool_seasons(&mut self, months: &Grid) {
+        if self.grouping != Grouping::Month {
+            self.seasons = seasons(months, self.metric, self.min_days);
+        }
     }
 }
 
@@ -613,6 +691,37 @@ mod tests {
             build_grid(&samples, Grouping::Week, buckets, Berlin),
             build_grid_sequential(&samples, Grouping::Week, buckets, Berlin)
         );
+    }
+
+    #[test]
+    fn the_grid_is_the_same_however_the_samples_are_split() {
+        let mut rng = Lcg(0xC0FFEE);
+        let base = ts("2023-03-20 00:00:00");
+        // Uneven readings straddling hours, days and the change to summer time.
+        let samples: Vec<Sample> = (0..20_000)
+            .map(|index| {
+                let start = base + i64::from(index) * 97 + i64::from(rng.next_in(40));
+                let end = start + 1 + i64::from(rng.next_in(5_000));
+                Sample::new(start, end, f64::from(rng.next_in(9_000)) + 0.25)
+            })
+            .collect();
+        let buckets = BucketSpec::new(100.0, 8_000.0).unwrap();
+        for grouping in [Grouping::Month, Grouping::Week] {
+            let whole = build_grid_sequential(&samples, grouping, buckets, Berlin);
+            for chunk_len in [333, 2_048, 4_999, 20_000] {
+                assert_eq!(
+                    build_grid_in_chunks(&samples, grouping, buckets, Berlin, chunk_len),
+                    whole,
+                    "{grouping} in chunks of {chunk_len}"
+                );
+            }
+        }
+        assert_eq!(
+            chunk_len(100),
+            MIN_SAMPLES_PER_CHUNK,
+            "a short record is one chunk"
+        );
+        assert!(chunk_len(1 << 20) <= (1 << 20) / rayon::current_num_threads() + 1);
     }
 
     #[test]

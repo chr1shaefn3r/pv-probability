@@ -1,7 +1,6 @@
 //! How long a home battery would take to pay for itself, from the grid import and export
 //! power sensors a Home Assistant recorder database already holds.
 
-use std::collections::HashMap;
 use std::fs;
 use std::time::Instant;
 
@@ -14,9 +13,9 @@ use ha_recorder::Quantity;
 use ha_recorder::coverage::Coverage;
 use ha_recorder::model::Grouping;
 use ha_recorder::source::{self, LoadOptions, LoadedSamples};
-use ha_recorder::timeutil::{local_day, local_parts};
 use ha_report::{format_kwh, format_money, format_percent, format_years, open_command};
 
+use energy_storage_payback_period::calendar::calendar;
 use energy_storage_payback_period::cli::{Args, Config};
 use energy_storage_payback_period::pair::{Paired, pair};
 use energy_storage_payback_period::report::{PaybackOptions, page as payback_page};
@@ -107,7 +106,23 @@ fn run() -> Result<()> {
         );
     }
 
-    let result = sweep(&paired, &config.sizes, &config.battery, &config.economics);
+    // What the History block says about the timeline does not depend on the batteries,
+    // so it is worked out beside them.
+    let (result, coverage) = rayon::join(
+        || sweep(&paired, &config.sizes, &config.battery, &config.economics),
+        || {
+            let calendar = calendar(&paired, config.recorder.tz);
+            Coverage::describe(
+                &paired.samples(),
+                calendar.observed_days,
+                calendar.full_days,
+                &calendar.months,
+                Grouping::Month,
+                config.recorder.tz,
+                config.recorder.gap_threshold_seconds,
+            )
+        },
+    );
     if args.verbose > 0 {
         eprintln!(
             "simulated {} sizes over {} slots in {:.2?}",
@@ -116,18 +131,6 @@ fn run() -> Result<()> {
             aggregation_started.elapsed()
         );
     }
-
-    let samples = paired.samples();
-    let (observed_days, full_days) = day_counts(&paired, config.recorder.tz);
-    let coverage = Coverage::describe(
-        &samples,
-        observed_days,
-        full_days,
-        &present_months(&paired, config.recorder.tz),
-        Grouping::Month,
-        config.recorder.tz,
-        config.recorder.gap_threshold_seconds,
-    );
 
     let html = payback_page(
         &result,
@@ -253,32 +256,6 @@ fn trim(capacity_kwh: f64) -> String {
         .trim_end_matches('0')
         .trim_end_matches('.')
         .to_string()
-}
-
-/// Local days the paired timeline touched, and how many of those were whole days.
-fn day_counts(paired: &Paired, tz: Tz) -> (u32, u32) {
-    let mut seconds_per_day: HashMap<i32, f64> = HashMap::new();
-    for step in &paired.steps {
-        *seconds_per_day
-            .entry(local_day(step.start_ts, tz))
-            .or_default() += step.seconds;
-    }
-    let full = seconds_per_day
-        .values()
-        .filter(|seconds| **seconds >= 20.0 * 3_600.0)
-        .count();
-    (seconds_per_day.len() as u32, full as u32)
-}
-
-fn present_months(paired: &Paired, tz: Tz) -> Vec<usize> {
-    let mut months: Vec<usize> = paired
-        .steps
-        .iter()
-        .map(|step| usize::from(local_parts(step.start_ts, tz).month) - 1)
-        .collect();
-    months.sort_unstable();
-    months.dedup();
-    months
 }
 
 /// One line saying what the recorder really covered.

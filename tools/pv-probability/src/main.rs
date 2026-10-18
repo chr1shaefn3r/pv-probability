@@ -8,6 +8,7 @@ use clap::Parser;
 
 use ha_recorder::Quantity;
 use ha_recorder::coverage::{Coverage, possible_days_per_facet};
+use ha_recorder::model::Grouping;
 use ha_recorder::source::{self, LoadedSamples, SourceKind};
 use ha_report::{format_duration, format_watts, open_command};
 
@@ -77,31 +78,40 @@ fn run() -> Result<()> {
     let buckets = BucketSpec::new(args.step_watts, max_watts)?;
 
     let aggregation_started = Instant::now();
-    let grid = build_grid(&loaded.samples, args.group, buckets, config.recorder.tz);
+    let tz = config.recorder.tz;
+    // ISO weeks straddle the months the summer and winter windows pool, so a report by
+    // week needs the same samples grouped by month as well: folded beside its own grid.
+    let (grid, months) = rayon::join(
+        || build_grid(&loaded.samples, args.group, buckets, tz),
+        || {
+            (args.group != Grouping::Month)
+                .then(|| build_grid(&loaded.samples, Grouping::Month, buckets, tz))
+        },
+    );
     let possible_days = match (loaded.first_ts, loaded.last_ts) {
-        (Some(first), Some(last)) => possible_days_per_facet(
-            first,
-            last.saturating_sub(1).max(first),
-            config.recorder.tz,
-            args.group,
-        ),
+        (Some(first), Some(last)) => {
+            possible_days_per_facet(first, last.saturating_sub(1).max(first), tz, args.group)
+        }
         _ => Vec::new(),
     };
-    let mut analysis = analyse(&grid, args.metric, args.min_days, &possible_days);
-    analysis.pool_seasons_by_month(&loaded.samples, config.recorder.tz);
-    let coverage = Coverage::describe(
-        &loaded.samples,
-        analysis.observed_days,
-        grid.days_covering_hours(20),
-        &analysis
-            .facets
-            .iter()
-            .map(|facet| facet.index)
-            .collect::<Vec<_>>(),
-        args.group,
-        config.recorder.tz,
-        config.recorder.gap_threshold_seconds,
+    // The History block needs the grid but not the probabilities: worked out beside them.
+    let (mut analysis, coverage) = rayon::join(
+        || analyse(&grid, args.metric, args.min_days, &possible_days),
+        || {
+            Coverage::describe(
+                &loaded.samples,
+                grid.observed_days(),
+                grid.days_covering_hours(20),
+                &grid.non_empty_facets(),
+                args.group,
+                tz,
+                config.recorder.gap_threshold_seconds,
+            )
+        },
     );
+    if let Some(months) = &months {
+        analysis.pool_seasons(months);
+    }
     if args.verbose > 0 {
         eprintln!(
             "aggregated {} samples into {} facets x 24 hours x {} buckets in {:.2?}",

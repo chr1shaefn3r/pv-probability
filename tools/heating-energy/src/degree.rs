@@ -13,6 +13,7 @@
 use std::collections::BTreeMap;
 
 use chrono::{Datelike, NaiveDate};
+use rayon::prelude::*;
 
 use ha_recorder::model::Grouping;
 use ha_recorder::timeutil::DayNumber;
@@ -219,7 +220,7 @@ pub fn analyse(
         .zip(outside.last().and_then(DayMean::date));
 
     let indoor: Vec<BTreeMap<DayNumber, f64>> = rooms
-        .iter()
+        .par_iter()
         .map(|days| {
             days.iter()
                 .filter(|day| day.coverage() >= min_coverage)
@@ -283,22 +284,23 @@ pub fn analyse(
         periods.dedup();
         periods
     };
-    let periods = distinct(&|date| Period::of(date, grouping))
-        .into_iter()
-        .map(summarise)
-        .collect();
-    let years = distinct(&|date| Period::Year { year: date.year() })
-        .into_iter()
-        .map(summarise)
-        .collect();
+    // Every summary is worked out on its own, over the same days in the same order, so
+    // they are spread over the cores - the record and the years beside the periods.
+    let mut summaries: Vec<Period> = distinct(&|date| Period::of(date, grouping));
+    let period_count = summaries.len();
+    summaries.extend(distinct(&|date| Period::Year { year: date.year() }));
+    summaries.push(Period::Record);
+    let mut summaries: Vec<Summary> = summaries.into_par_iter().map(summarise).collect();
+    let record = summaries.pop().expect("the record is always summarised");
+    let years = summaries.split_off(period_count);
 
     Analysis {
         bases,
         grouping,
         min_coverage,
-        periods,
+        periods: summaries,
         years,
-        record: summarise(Period::Record),
+        record,
         short_days,
         span,
     }

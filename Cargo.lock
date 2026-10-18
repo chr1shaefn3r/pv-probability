@@ -283,6 +283,7 @@ dependencies = [
  "chrono-tz",
  "clap",
  "ha-testdb",
+ "rayon",
  "rusqlite",
 ]
 

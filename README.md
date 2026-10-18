@@ -179,7 +179,7 @@ write the report, and `-v` for timings and row counts.
 ## Development
 
 ```sh
-cargo test --workspace                            # 320+ unit and integration tests
+cargo test --workspace                            # about 400 unit and integration tests
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all
 cargo test -p pv-probability                      # one tool and what it depends on
@@ -190,6 +190,18 @@ synthetic recorder databases in both schema generations, including reproducible
 synthetic histories - with or without outages - for each tool's end-to-end test.
 GitHub Actions runs formatting, clippy, the whole suite and a release build on every push
 to `main` and on every pull request (`.github/workflows/ci.yml`).
+
+### Reading in parallel
+
+Every tool reads its sensors in parallel, and each sensor's history in time slices, every
+slice on a read-only connection of its own (`crates/ha-recorder/src/source/slices.rs`).
+The slices are put back together in order, so the rows are exactly those one query would
+return. That only pays off with the bundled SQLite built without its process-wide locks:
+by default every connection shares one page cache behind a single mutex, and connections
+reading side by side spend their time waiting for each other. `.cargo/config.toml` sets
+`LIBSQLITE3_FLAGS` to turn them off, and a test fails if that did not reach the build. A
+build that skips the file, such as `cargo install --git`, still works - it just reads more
+slowly.
 
 ### Layout
 

@@ -42,7 +42,7 @@ pv-probability --db ha.db --entity sensor.solar_power --tz Europe/Berlin
 It finishes by printing the command that opens the report, ready to paste:
 
 ```
-wrote pv-probability.html: 12 facets from 17520 readings (730 d), 340 kB, 26.60ms
+wrote pv-probability.html: 12 facets from 17520 readings (730 d), 340 kB, 9.70ms
 reliable window: 12:00 to the end of the 13:00 hour - at least 100 W in every recorded minute
   summer (April to September): 11:00 to the end of the 16:00 hour - at least 100 W in every recorded minute
   winter (October to March): 12:00 to the end of the 13:00 hour - at least 100 W in every recorded minute
@@ -230,11 +230,15 @@ gives the same numbers as text.
 
 ## Performance
 
-Reading is single-threaded (SQLite), everything after it is parallel: samples are folded
-into per-facet histograms with rayon (`par_chunks` + `reduce`, since the histograms are
-additive), the power axis quantile uses a parallel sort, and the facets are rendered
-concurrently. Two years of hourly statistics (17 520 rows, 147 buckets) load, aggregate
-and render in about 25 ms on four cores, almost all of it reading SQLite - the
-aggregation itself takes about 2 ms; the work scales linearly, so even a
-five-minute-resolution decade stays interactive. `--threads` caps the pool if you want to
-leave cores free.
+Every stage runs on all cores. The history is read in time slices, each on a connection
+of its own. Every sample is placed on the local calendar in parallel - cut at the hour
+boundaries, each piece given its month or week, hour and day - and the pieces are then
+added into one histogram in a single pass. The power axis quantile uses a parallel sort,
+the History block is worked out beside the probabilities, a report by week folds the
+month grid behind the summer and winter windows beside its own, and the facets are
+rendered concurrently.
+
+Two years of hourly statistics (17 520 rows, 147 buckets) load, aggregate and render in
+about 8 ms on four cores against 15 ms on one; by week, with 53 heatmaps to draw, in about
+17 ms. The work scales linearly, so even a five-minute-resolution decade stays
+interactive. `--threads` caps the pool if you want to leave cores free.

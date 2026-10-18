@@ -1,0 +1,17 @@
+# Build the bundled SQLite without its process-wide locks.
+#
+# The readers cut a long history into time slices and read each on a connection of its
+# own, in parallel. By default libsqlite3-sys builds SQLite so that every connection in
+# the process shares one page cache behind one mutex (SQLITE_ENABLE_MEMORY_MANAGEMENT),
+# and counts every allocation behind another (memory statistics on). Slices running
+# side by side then spend their time waiting for each other: each costs twice what it
+# does alone, and the parallel read is no faster than the serial one.
+#
+# Without them every connection keeps a page cache of its own and nothing is shared, so
+# the slices scale with the cores. Nothing here uses what the two buy - releasing cache
+# memory on demand and the sqlite3_memory_used() figures.
+#
+# `crates/ha-recorder` has a test that fails if these did not reach the build. An
+# LIBSQLITE3_FLAGS set in the environment takes precedence over this one.
+[env]
+LIBSQLITE3_FLAGS = "-USQLITE_ENABLE_MEMORY_MANAGEMENT -DSQLITE_DEFAULT_MEMSTATUS=0"

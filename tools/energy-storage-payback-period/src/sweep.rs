@@ -3,7 +3,7 @@
 use rayon::prelude::*;
 
 use crate::pair::Paired;
-use crate::simulate::{BatterySpec, Simulation, simulate};
+use crate::simulate::{BatterySpec, LANES, Simulation, simulate_group};
 
 /// Seconds in a mean Gregorian year, used to annualise a partial history.
 pub const SECONDS_PER_YEAR: f64 = 365.2425 * 86_400.0;
@@ -173,8 +173,10 @@ pub fn size_range(min: f64, max: f64, step: f64) -> Vec<f64> {
 /// Simulate every size and price the results.
 ///
 /// The state of charge makes a single simulation inherently sequential, so the sizes are
-/// the unit of parallelism: every core replays the whole history for a different battery,
-/// which is why a finer sweep costs almost nothing until it outnumbers the cores.
+/// the unit of parallelism, twice over: every core replays the whole history for a
+/// different group of [`LANES`] batteries, and replays the group side by side in SIMD
+/// lanes - which is why a finer sweep costs almost nothing until it outnumbers the lanes
+/// of all the cores.
 pub fn sweep(
     paired: &Paired,
     sizes: &[f64],
@@ -187,14 +189,14 @@ pub fn sweep(
         0.0
     };
 
+    let simulations: Vec<Simulation> = sizes
+        .par_chunks(LANES)
+        .flat_map_iter(|group| simulate_group(&paired.steps, template, group))
+        .collect();
     let mut results: Vec<SizeResult> = sizes
-        .par_iter()
-        .map(|capacity_kwh| {
-            let spec = BatterySpec {
-                capacity_kwh: *capacity_kwh,
-                ..*template
-            };
-            let simulation = simulate(&paired.steps, &spec);
+        .iter()
+        .zip(simulations)
+        .map(|(capacity_kwh, simulation)| {
             let observed_savings =
                 simulation.savings(economics.price_per_kwh, economics.feed_in_price);
             let annual_savings = observed_savings * annualisation;

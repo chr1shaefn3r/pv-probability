@@ -37,7 +37,7 @@ heating-energy --db ha.db --outside-entity sensor.outdoor_temperature \
 ```
 
 ```
-wrote heating-energy.html: 24 months from 730 days, 30 kB, 101.11ms
+wrote heating-energy.html: 24 months from 730 days, 30 kB, 24.35ms
 degree days: 4,716 heating and 7.4 cooling over 730 days (bases 15 °C and 21 °C)
 coldest: January 2024 with 449 heating degree days at 0.5 °C on average
 indoors: Ground floor 21.2 °C, First floor 21 °C on the same days
@@ -146,7 +146,12 @@ heating-energy --db ha.db --outside-entity sensor.outdoor_temperature \
 
 ## Performance
 
-Every thermometer is read on its own connection in parallel, and each one's daily means
-are folded in parallel too; the counting itself is a pass over the days. Two years of
-hourly statistics for the outside and five rooms - 105 000 rows - load, count and render
-in about 100 ms on four cores.
+Every thermometer is read on a connection of its own, in parallel and itself in time
+slices, and its daily means are worked out as soon as it is in. Those are summed in
+parallel too, in runs of whole local days, so that every day is still added up in the
+order of its readings and comes out the same to the last bit. The summaries per month,
+week and year are independent and spread over the cores, with the History block worked
+out beside them.
+
+Two years of hourly statistics for the outside and five rooms - 105 000 rows - load,
+count and render in about 25 ms on four cores against 67 ms on one.

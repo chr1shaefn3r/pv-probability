@@ -6,11 +6,14 @@
 //! 1. [`ha_recorder::source`] loads the two grid power sensors as weighted samples.
 //! 2. [`series`] integrates each into energy per time slot, and [`pair`] keeps the slots
 //!    both sensors really covered.
-//! 3. [`simulate`] replays one battery over that timeline, and [`sweep`] does it for every
-//!    size at once, in parallel, then prices the result.
+//! 3. [`simulate`] replays one battery over that timeline, or eight side by side in SIMD
+//!    lanes, and [`sweep`] does it for every size at once, in parallel, then prices the
+//!    result. [`calendar`] places the same timeline on the local calendar for the History
+//!    block, beside the sweep.
 //! 4. [`report`] writes the answer out as a self-contained HTML page, in the shell every
 //!    report shares.
 
+pub mod calendar;
 pub mod cli;
 pub mod pair;
 pub mod report;

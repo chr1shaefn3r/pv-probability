@@ -15,6 +15,7 @@ use crate::source::schema::{
     self, StatesLayout, find_state_metadata_id, not_found_error, states_layout, value_to_f64,
     value_to_timestamp,
 };
+use crate::source::slices::{self, Slice};
 use crate::source::statistics::{Loaded, convert};
 
 /// What to read out of the states table.
@@ -54,12 +55,23 @@ pub fn entity_exists(conn: &Connection, entity_id: &str) -> Result<bool> {
     }
 }
 
+/// How far apart raw states are guessed to be, in seconds, to decide how many slices a
+/// read is worth. They arrive whenever the value changes - every few seconds for a busy
+/// power sensor, every few minutes for a thermometer - and guessing on the busy side
+/// costs no more than a spare connection or two.
+const STATE_SPACING_GUESS: i64 = 30;
+
 /// Load raw states as time-weighted samples.
+///
+/// The readings of a long history are fetched in time slices, each on a connection of its
+/// own, in parallel; the samples are then built from all of them in order, because a
+/// reading holds until the next one, which may sit in the next slice.
 pub fn load(conn: &Connection, request: &Request<'_>) -> Result<Loaded> {
     let layout = states_layout(conn)?;
-    let time_column = layout.time().name();
+    let time = layout.time();
+    let time_column = time.name();
 
-    let (sql, params): (String, Vec<Value>) = match layout {
+    let (key_column, key) = match layout {
         StatesLayout::MetadataId { .. } => {
             let metadata_id =
                 find_state_metadata_id(conn, request.entity_id)?.ok_or_else(|| {
@@ -83,44 +95,69 @@ pub fn load(conn: &Connection, request: &Request<'_>) -> Result<Loaded> {
                         )
                     )
                 })?;
-            (
-                format!(
-                    "SELECT \"{time_column}\", state FROM states WHERE metadata_id = ?1 \
-                     ORDER BY \"{time_column}\""
-                ),
-                vec![Value::Integer(metadata_id)],
-            )
+            ("metadata_id", Value::Integer(metadata_id))
         }
-        StatesLayout::InlineEntityId { .. } => (
-            format!(
-                "SELECT \"{time_column}\", state FROM states WHERE entity_id = ?1 \
-                 ORDER BY \"{time_column}\""
-            ),
-            vec![Value::Text(request.entity_id.to_string())],
-        ),
+        StatesLayout::InlineEntityId { .. } => {
+            ("entity_id", Value::Text(request.entity_id.to_string()))
+        }
     };
 
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
-        Ok((row.get::<_, Value>(0)?, row.get::<_, Value>(1)?))
-    })?;
+    // Every reading is read, whatever the window: the one before it says what held when
+    // the window opened. Text timestamps cannot be compared in SQL, so a legacy table is
+    // read in one query.
+    let window = Slice::window(None, None);
+    let bounds = if time.supports_range_pushdown() {
+        slices::time_bounds(conn, "states", key_column, &key, time_column, window)?
+    } else {
+        None
+    };
+    let slices = match bounds {
+        Some((first, last)) => slices::plan(
+            window,
+            first,
+            last,
+            (last - first) / STATE_SPACING_GUESS + 1,
+            rayon::current_num_threads(),
+        ),
+        None => vec![window],
+    };
 
     let conversion = request
         .scale
         .map_or(Conversion::IDENTITY, Conversion::factor);
-    let mut readings: Vec<(i64, Option<f64>)> = Vec::new();
-    let mut row_count = 0usize;
-    for row in rows {
-        let (raw_time, raw_state) = row?;
-        row_count += 1;
-        let Some(ts) = value_to_timestamp(&raw_time) else {
-            continue;
-        };
-        // `unknown`, `unavailable` and friends keep their timestamp: they end the
-        // previous reading without contributing one of their own.
-        let value = value_to_f64(&raw_state)
-            .map(|value| convert(value, conversion, request.clamp_negative));
-        readings.push((ts, value));
+    let parts = slices::read_all(conn, &slices, |conn, slice| {
+        let mut params = vec![key.clone()];
+        let condition = slice.condition(time_column, &mut params);
+        let sql = format!(
+            "SELECT \"{time_column}\", state FROM states WHERE {key_column} = ?1{condition} \
+             ORDER BY \"{time_column}\""
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
+            Ok((row.get::<_, Value>(0)?, row.get::<_, Value>(1)?))
+        })?;
+
+        let mut readings: Vec<(i64, Option<f64>)> = Vec::new();
+        let mut row_count = 0usize;
+        for row in rows {
+            let (raw_time, raw_state) = row?;
+            row_count += 1;
+            let Some(ts) = value_to_timestamp(&raw_time) else {
+                continue;
+            };
+            // `unknown`, `unavailable` and friends keep their timestamp: they end the
+            // previous reading without contributing one of their own.
+            let value = value_to_f64(&raw_state)
+                .map(|value| convert(value, conversion, request.clamp_negative));
+            readings.push((ts, value));
+        }
+        Ok((readings, row_count))
+    })?;
+
+    let row_count: usize = parts.iter().map(|(_, rows)| rows).sum();
+    let mut readings = Vec::with_capacity(parts.iter().map(|(readings, _)| readings.len()).sum());
+    for (part, _) in parts {
+        readings.extend(part);
     }
 
     if readings.is_empty() && row_count == 0 {

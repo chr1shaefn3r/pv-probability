@@ -6,7 +6,8 @@ use chrono::{NaiveDate, NaiveTime, TimeZone};
 use chrono_tz::Tz;
 
 use ha_recorder::Sample;
-use ha_recorder::timeutil::{DayNumber, day_to_date, for_each_hour_slice};
+use ha_recorder::timeutil::{DayNumber, day_to_date, for_each_hour_slice, local_day};
+use rayon::prelude::*;
 
 /// One local day's mean temperature, and how much of the day stands behind it.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -32,13 +33,45 @@ impl DayMean {
     }
 }
 
+/// Fewest samples worth a rayon task of their own: placing them on the local calendar
+/// takes a few hundred microseconds.
+const MIN_SAMPLES_PER_CHUNK: usize = 2_048;
+
 /// The time-weighted mean of every local day the samples touch, in day order.
 ///
 /// Each reading counts for as long as it held, split at local midnight, so an hourly
 /// statistic and a chatty raw history of the same weather give the same mean - and a day
 /// with its night missing is visible as such in [`DayMean::coverage`] instead of
 /// silently reading warm.
+///
+/// The samples are summed in parallel, cut into runs of whole local days so that every
+/// day is still summed by one worker, in the order of the samples - the same additions,
+/// to the last bit, as one pass over them all. Should a day turn up in two runs anyway,
+/// the samples being out of order, it is all done again in that one pass.
 pub fn daily_means(samples: &[Sample], tz: Tz) -> Vec<DayMean> {
+    let runs = whole_day_runs(samples, tz, rayon::current_num_threads());
+    let sums: Vec<Vec<(DayNumber, (f64, f64))>> = runs
+        .par_iter()
+        .map(|run| day_sums(run, tz).into_iter().collect())
+        .collect();
+    let mut days: Vec<(DayNumber, (f64, f64))> = sums.into_iter().flatten().collect();
+    if !days.windows(2).all(|pair| pair[0].0 < pair[1].0) {
+        days = day_sums(samples, tz).into_iter().collect();
+    }
+
+    days.into_par_iter()
+        .filter(|(_, (_, covered))| *covered > 0.0)
+        .map(|(day, (weighted, covered))| DayMean {
+            day,
+            mean: weighted / covered,
+            covered_seconds: covered,
+            day_seconds: day_seconds(day, tz),
+        })
+        .collect()
+}
+
+/// Every local day's time-weighted sum and covered seconds, in one pass.
+fn day_sums(samples: &[Sample], tz: Tz) -> BTreeMap<DayNumber, (f64, f64)> {
     let mut days: BTreeMap<DayNumber, (f64, f64)> = BTreeMap::new();
     for sample in samples {
         if sample.duration() <= 0 || !sample.value.is_finite() {
@@ -50,15 +83,41 @@ pub fn daily_means(samples: &[Sample], tz: Tz) -> Vec<DayMean> {
             *covered += seconds;
         });
     }
-    days.into_iter()
-        .filter(|(_, (_, covered))| *covered > 0.0)
-        .map(|(day, (weighted, covered))| DayMean {
-            day,
-            mean: weighted / covered,
-            covered_seconds: covered,
-            day_seconds: day_seconds(day, tz),
-        })
+    days
+}
+
+/// Cut time-ordered samples into up to `runs` runs that each start at a local midnight,
+/// with no sample reaching across it.
+///
+/// A cut that cannot be made cleanly near where it should go - the clocks skip that
+/// midnight, or a reading spans it - is left out, so the runs may be fewer.
+fn whole_day_runs(samples: &[Sample], tz: Tz, runs: usize) -> Vec<&[Sample]> {
+    let runs = (samples.len() / MIN_SAMPLES_PER_CHUNK).clamp(1, runs.max(1));
+    let mut cuts = vec![0];
+    for run in 1..runs {
+        let nominal = samples.len() * run / runs;
+        let Some(midnight) = midnight_after(samples[nominal].start_ts, tz) else {
+            continue;
+        };
+        // The first sample from that midnight on, if the one before it is over by then.
+        let cut = samples.partition_point(|sample| sample.start_ts < midnight);
+        let clean = cut > 0 && cut < samples.len() && samples[cut - 1].end_ts <= midnight;
+        if clean && cut > *cuts.last().unwrap_or(&0) {
+            cuts.push(cut);
+        }
+    }
+    cuts.push(samples.len());
+    cuts.windows(2)
+        .map(|pair| &samples[pair[0]..pair[1]])
         .collect()
+}
+
+/// The first local midnight after the instant `ts`.
+fn midnight_after(ts: i64, tz: Tz) -> Option<i64> {
+    let tomorrow = day_to_date(local_day(ts, tz))?.succ_opt()?;
+    tz.from_local_datetime(&tomorrow.and_time(NaiveTime::MIN))
+        .earliest()
+        .map(|instant| instant.timestamp())
 }
 
 /// Length of a local day in seconds, from one local midnight to the next.
@@ -151,6 +210,98 @@ mod tests {
         let days = daily_means(&hourly("2024-03-30 23:00:00", &[8.0; 23]), Berlin);
         let short = days.iter().find(|day| day.day == spring).unwrap();
         assert_eq!(short.coverage(), 1.0);
+    }
+
+    /// Readings every `step` seconds from `start` with a value that never repeats a
+    /// pattern for long, so a different order of additions would show in the last bits.
+    fn uneven(start: &str, count: i64, step: i64) -> Vec<Sample> {
+        (0..count)
+            .map(|index| {
+                let from = ts(start) + index * step;
+                let value = (index as f64 * 0.731).sin() * 7.3 + (index % 13) as f64 * 0.917;
+                Sample::new(from, from + step, value)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn summing_in_parallel_changes_no_bit_of_any_day() {
+        let cases = [
+            // Hours across two changes of the clocks.
+            (uneven("2023-01-01 00:00:00", 17_520, 3_600), Berlin),
+            // Raw readings every 97 seconds, none of them on a midnight.
+            (uneven("2024-03-20 00:00:13", 40_000, 97), Berlin),
+            (uneven("2024-03-20 00:00:13", 40_000, 97), UTC),
+        ];
+        for (samples, tz) in cases {
+            let one_pass: Vec<DayMean> = day_sums(&samples, tz)
+                .into_iter()
+                .map(|(day, (weighted, covered))| DayMean {
+                    day,
+                    mean: weighted / covered,
+                    covered_seconds: covered,
+                    day_seconds: day_seconds(day, tz),
+                })
+                .collect();
+            for threads in [1, 2, 3, 8] {
+                let parallel = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap()
+                    .install(|| daily_means(&samples, tz));
+                assert_eq!(parallel.len(), one_pass.len());
+                for (left, right) in parallel.iter().zip(&one_pass) {
+                    assert_eq!(left.day, right.day);
+                    assert_eq!(
+                        left.mean.to_bits(),
+                        right.mean.to_bits(),
+                        "{threads} threads"
+                    );
+                    assert_eq!(left.covered_seconds, right.covered_seconds);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn runs_start_at_local_midnights() {
+        let samples = uneven("2024-01-01 00:00:00", 24 * 400, 3_600);
+        let runs = whole_day_runs(&samples, Berlin, 4);
+        assert_eq!(runs.len(), 4);
+        assert_eq!(
+            runs.iter().map(|run| run.len()).sum::<usize>(),
+            samples.len()
+        );
+        for run in &runs[1..] {
+            let first = run[0].start_ts;
+            assert_eq!(
+                midnight_after(first - 1, Berlin),
+                Some(first),
+                "a run opens a day"
+            );
+        }
+        // Too few samples to be worth cutting.
+        assert_eq!(whole_day_runs(&samples[..100], Berlin, 4).len(), 1);
+    }
+
+    #[test]
+    fn readings_out_of_order_are_summed_in_one_pass() {
+        let mut samples = uneven("2024-01-01 00:00:00", 24 * 400, 3_600);
+        // A late reading for the first day, at the very end.
+        samples.push(Sample::new(
+            ts("2024-01-01 05:00:00"),
+            ts("2024-01-01 05:30:00"),
+            40.0,
+        ));
+        let means = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap()
+            .install(|| daily_means(&samples, UTC));
+        let first = means[0];
+        assert_eq!(first.covered_seconds, 86_400.0 + 1_800.0);
+        assert_eq!(means.len(), 400);
+        assert!(means.windows(2).all(|pair| pair[0].day < pair[1].day));
     }
 
     #[test]

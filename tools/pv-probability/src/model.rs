@@ -232,14 +232,28 @@ impl Grid {
     /// Add `seconds` of observation time at `watts`, recorded on local day `day`, to one
     /// facet/hour column.
     pub fn add(&mut self, facet: usize, hour: usize, watts: f64, seconds: f64, day: DayNumber) {
-        if facet >= self.grouping.facet_count() || hour >= HOURS_PER_DAY {
+        self.add_to_bucket(facet, hour, self.buckets.index(watts), seconds, day);
+    }
+
+    /// [`Grid::add`] for a reading whose bucket has already been worked out.
+    pub fn add_to_bucket(
+        &mut self,
+        facet: usize,
+        hour: usize,
+        bucket: usize,
+        seconds: f64,
+        day: DayNumber,
+    ) {
+        if facet >= self.grouping.facet_count()
+            || hour >= HOURS_PER_DAY
+            || bucket >= self.buckets.len()
+        {
             return;
         }
         if !seconds.is_finite() || seconds <= 0.0 {
             return;
         }
         let column = self.column_index(facet, hour);
-        let bucket = self.buckets.index(watts);
         self.weights[column * self.buckets.len() + bucket] += seconds;
         self.column_weight[column] += seconds;
         self.column_samples[column] += 1;

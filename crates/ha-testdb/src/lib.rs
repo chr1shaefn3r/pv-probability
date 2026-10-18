@@ -90,6 +90,12 @@ CREATE TABLE states (
     last_changed_ts FLOAT,
     attributes_id INTEGER
 );
+CREATE UNIQUE INDEX ix_statistics_meta_statistic_id ON statistics_meta (statistic_id);
+CREATE UNIQUE INDEX ix_statistics_statistic_id_start_ts ON statistics (metadata_id, start_ts);
+CREATE UNIQUE INDEX ix_statistics_short_term_statistic_id_start_ts
+    ON statistics_short_term (metadata_id, start_ts);
+CREATE UNIQUE INDEX ix_states_meta_entity_id ON states_meta (entity_id);
+CREATE INDEX ix_states_metadata_id_last_updated_ts ON states (metadata_id, last_updated_ts);
 ";
 
 const LEGACY_SCHEMA: &str = "
@@ -133,9 +139,15 @@ CREATE TABLE states (
     last_updated DATETIME,
     last_changed DATETIME
 );
+CREATE UNIQUE INDEX ix_statistics_meta_statistic_id ON statistics_meta (statistic_id);
+CREATE UNIQUE INDEX ix_statistics_statistic_id_start ON statistics (metadata_id, start);
+CREATE UNIQUE INDEX ix_statistics_short_term_statistic_id_start
+    ON statistics_short_term (metadata_id, start);
+CREATE INDEX ix_states_entity_id_last_updated ON states (entity_id, last_updated);
 ";
 
-/// Which recorder generation to emulate.
+/// Which recorder generation to emulate, indexes included: a reader that is fast against a
+/// table without them is not fast against Home Assistant's, and the other way round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Flavour {
     /// Epoch timestamps and `states_meta` (Home Assistant 2023.4 and later).

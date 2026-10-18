@@ -2,6 +2,7 @@
 
 pub mod catalog;
 pub mod schema;
+pub mod slices;
 pub mod states;
 pub mod statistics;
 
@@ -142,14 +143,25 @@ pub fn open_database(path: &Path) -> Result<Connection> {
         ),
         OpenMode::ReadOnly => Connection::open_with_flags(path, flags),
     };
-    opened.with_context(|| {
+    let conn = opened.with_context(|| {
         format!(
             "failed to open {} read-only. If Home Assistant is still writing to it, copy it first \
              with: sqlite3 home-assistant_v2.db \"VACUUM INTO 'copy.db'\"",
             path.display()
         )
-    })
+    })?;
+    conn.pragma_update(None, "cache_size", -PAGE_CACHE_KIB)
+        .context("failed to size the page cache")?;
+    Ok(conn)
 }
+
+/// How much page cache each connection keeps, in KiB, against SQLite's 2 MiB default.
+///
+/// The readers walk an index in order and visit each page once, so all a connection
+/// needs to keep is the path down to the page it is on. A large cache only means more
+/// fresh memory to fill: with a connection per slice, per thermometer, the default
+/// doubled the page faults of a run and cost a fifth of its time.
+const PAGE_CACHE_KIB: i64 = 256;
 
 /// A path as a SQLite `file:` URI with `query` appended.
 ///
@@ -246,7 +258,7 @@ pub fn resolve_auto(conn: &Connection, entity: &str) -> Result<SourceKind> {
             (SourceKind::ShortTerm, StatisticsTable::ShortTerm),
         ] {
             if table_exists(conn, table.table_name())?
-                && statistics::row_count(conn, table, meta.metadata_id)? > 0
+                && statistics::has_rows(conn, table, meta.metadata_id)?
             {
                 // Rows that carry no usable value still stop the search here: falling
                 // through to `states` for a counter would plot a climbing kWh total as if
@@ -758,5 +770,140 @@ mod tests {
         assert_eq!(SourceKind::Statistics.to_string(), "statistics");
         assert_eq!(SourceKind::ShortTerm.to_string(), "statistics_short_term");
         assert_eq!(SourceKind::States.to_string(), "states");
+    }
+
+    #[test]
+    fn reading_in_parallel_slices_returns_exactly_what_one_query_does() {
+        let dir = std::env::temp_dir().join(format!("ha-recorder-slices-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("slices.db");
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            testdb::create_schema(&conn, Flavour::Modern);
+            let start = ts("2023-01-01 00:00:00");
+            testdb::insert_synthetic_history(&conn, start, 400, 3, &testdb::Outages::spotty(400));
+            // Raw states every 37 seconds for three days, some of them unavailable.
+            let id = testdb::insert_states_meta(&conn, ENTITY);
+            conn.execute_batch("BEGIN").unwrap();
+            for index in 0..7_000i64 {
+                let state = if index % 97 == 0 {
+                    "unavailable".to_string()
+                } else {
+                    (index % 500).to_string()
+                };
+                testdb::insert_state(
+                    &conn,
+                    Flavour::Modern,
+                    ENTITY,
+                    id,
+                    start + index * 37,
+                    &state,
+                );
+            }
+            conn.execute_batch("COMMIT").unwrap();
+            // Rows without a time: dropped, but counted, and read on their own.
+            conn.execute(
+                "INSERT INTO statistics (metadata_id, start_ts, mean) VALUES (1, NULL, 5.0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO states (metadata_id, state, last_updated_ts) VALUES (?1, '7', NULL)",
+                [id],
+            )
+            .unwrap();
+        }
+
+        let read = |threads: usize, source: SourceKind, from: Option<i64>, to: Option<i64>| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| {
+                    let conn = open_database(&path).unwrap();
+                    let mut options = options(ENTITY);
+                    options.source = source;
+                    options.from = from;
+                    options.to = to;
+                    load(&conn, &options).unwrap()
+                })
+        };
+        // The four-thread reads below really are cut into four spans, on connections of
+        // their own, after the untimed rows.
+        let conn = open_database(&path).unwrap();
+        assert!(conn.path().is_some_and(|path| !path.is_empty()));
+        let window = slices::Slice::window(None, None);
+        let (first, last) = slices::time_bounds(
+            &conn,
+            "statistics",
+            "metadata_id",
+            &rusqlite::types::Value::Integer(1),
+            "start_ts",
+            window,
+        )
+        .unwrap()
+        .unwrap();
+        let plan = slices::plan(window, first, last, (last - first) / 3_600 + 1, 4);
+        assert_eq!(plan.len(), 5);
+        assert_eq!(plan[0], slices::Slice::Untimed);
+
+        for (source, from, to) in [
+            (SourceKind::Statistics, None, None),
+            (
+                SourceKind::Statistics,
+                Some(ts("2023-03-01 12:00:00")),
+                Some(ts("2023-11-20 00:00:00")),
+            ),
+            (SourceKind::States, None, None),
+            (SourceKind::States, Some(ts("2023-01-02 00:00:00")), None),
+        ] {
+            let one = read(1, source, from, to);
+            let many = read(4, source, from, to);
+            assert!(one.samples.len() > 1_000, "{source}: {}", one.samples.len());
+            assert_eq!(one, many, "{source} from {from:?} to {to:?}");
+            if from.is_none() && to.is_none() {
+                let sql = match source {
+                    SourceKind::Statistics => {
+                        "SELECT COUNT(*) FROM statistics WHERE metadata_id = \
+                         (SELECT id FROM statistics_meta WHERE statistic_id = ?1)"
+                    }
+                    _ => {
+                        "SELECT COUNT(*) FROM states WHERE metadata_id = \
+                         (SELECT metadata_id FROM states_meta WHERE entity_id = ?1)"
+                    }
+                };
+                let every: i64 = conn.query_row(sql, [ENTITY], |row| row.get(0)).unwrap();
+                assert_eq!(
+                    one.rows as i64, every,
+                    "{source}: the untimed row is read too"
+                );
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Parallel slices only scale when SQLite shares nothing between connections: see
+    /// `.cargo/config.toml`, which this checks reached the build.
+    #[test]
+    fn sqlite_is_built_without_process_wide_locks() {
+        let conn = Connection::open_in_memory().unwrap();
+        let options: Vec<String> = conn
+            .prepare("PRAGMA compile_options")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            !options
+                .iter()
+                .any(|option| option == "ENABLE_MEMORY_MANAGEMENT"),
+            "one page cache shared by every connection: {options:?}"
+        );
+        assert!(
+            options.iter().any(|option| option == "DEFAULT_MEMSTATUS=0"),
+            "every allocation counted under one lock: {options:?}"
+        );
     }
 }

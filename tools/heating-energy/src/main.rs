@@ -55,20 +55,34 @@ fn run() -> Result<()> {
     // rather than after every thermometer has been loaded.
     let house = args.rooms.as_deref().map(House::read).transpose()?;
 
-    let outside = read(&args, &config, args.outside_entity())?;
-    let rooms: Vec<LoadedSamples> = match &house {
-        Some(house) => house
-            .rooms()
-            .collect::<Vec<_>>()
-            .into_par_iter()
-            .map(|(floor, room)| {
-                read(&args, &config, &room.sensor).with_context(|| {
+    // Every thermometer is read on a connection of its own, the outside one among the
+    // rooms', and its daily means are worked out as soon as it is in, while the others
+    // are still being read.
+    let mut thermometers = vec![(args.outside_entity(), None)];
+    if let Some(house) = &house {
+        thermometers.extend(
+            house
+                .rooms()
+                .map(|(floor, room)| (room.sensor.as_str(), Some((floor, room)))),
+        );
+    }
+    let read_all: Vec<Result<(LoadedSamples, Vec<DayMean>)>> = thermometers
+        .par_iter()
+        .map(|(entity, room)| {
+            let loaded = match room {
+                Some((floor, room)) => read(&args, &config, entity).with_context(|| {
                     format!("reading the thermometer of {} / {}", floor.name, room.name)
-                })
-            })
-            .collect::<Result<_>>()?,
-        None => Vec::new(),
-    };
+                })?,
+                None => read(&args, &config, entity)?,
+            };
+            let days = daily_means(&loaded.samples, tz);
+            Ok((loaded, days))
+        })
+        .collect();
+    // The first thermometer that failed, in the file's order, is the one reported.
+    let mut read_all = read_all.into_iter().collect::<Result<Vec<_>>>()?;
+    let (outside, outside_days) = read_all.remove(0);
+    let (rooms, room_days): (Vec<LoadedSamples>, Vec<Vec<DayMean>>) = read_all.into_iter().unzip();
     if args.verbose > 0 {
         eprintln!(
             "read {} outside rows from `{}` and {} rows for {} rooms in {:.2?} on {} threads",
@@ -81,19 +95,33 @@ fn run() -> Result<()> {
         );
     }
 
+    // The History block only needs the outside thermometer: worked out beside the count.
     let counting_started = Instant::now();
-    let outside_days = daily_means(&outside.samples, tz);
-    let room_days: Vec<Vec<DayMean>> = rooms
-        .par_iter()
-        .map(|room| daily_means(&room.samples, tz))
-        .collect();
-    let analysis = analyse(
-        &outside_days,
-        &room_days,
-        house.as_ref(),
-        config.bases,
-        config.min_day_coverage,
-        args.group,
+    let (analysis, coverage) = rayon::join(
+        || {
+            analyse(
+                &outside_days,
+                &room_days,
+                house.as_ref(),
+                config.bases,
+                config.min_day_coverage,
+                args.group,
+            )
+        },
+        || {
+            Coverage::describe(
+                &outside.samples,
+                outside_days.len() as u32,
+                outside_days
+                    .iter()
+                    .filter(|day| day.covered_seconds >= 20.0 * 3_600.0)
+                    .count() as u32,
+                &present_months(&outside_days),
+                Grouping::Month,
+                tz,
+                config.recorder.gap_threshold_seconds,
+            )
+        },
     );
     if args.verbose > 0 {
         eprintln!(
@@ -104,19 +132,6 @@ fn run() -> Result<()> {
             counting_started.elapsed()
         );
     }
-
-    let coverage = Coverage::describe(
-        &outside.samples,
-        outside_days.len() as u32,
-        outside_days
-            .iter()
-            .filter(|day| day.covered_seconds >= 20.0 * 3_600.0)
-            .count() as u32,
-        &present_months(&outside_days),
-        Grouping::Month,
-        tz,
-        config.recorder.gap_threshold_seconds,
-    );
 
     let html = page(
         &analysis,
