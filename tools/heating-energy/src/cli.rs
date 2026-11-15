@@ -29,7 +29,7 @@ pub struct Args {
     )]
     pub outside_entity: Option<String>,
 
-    /// TOML file naming every floor, the rooms on it and each room's thermometer.
+    /// TOML file naming every floor, the rooms on it and each room's thermometers.
     ///
     /// See rooms.example.toml beside this tool's README. Without it the report covers the
     /// outside alone.

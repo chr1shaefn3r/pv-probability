@@ -1,4 +1,4 @@
-//! The house: its floors, the rooms on each, and the thermometer in every room.
+//! The house: its floors, the rooms on each, and the thermometers in every room.
 //!
 //! Far too many pairs to type as command line arguments, so they live in a TOML file:
 //!
@@ -14,6 +14,14 @@
 //! name = "First floor"
 //! rooms = [
 //!   { name = "Bedroom", sensor = "sensor.bedroom_temperature" },
+//! ]
+//! ```
+//!
+//! A room with more than one thermometer lists them all, and is counted by their mean:
+//!
+//! ```toml
+//! rooms = [
+//!   { name = "Living room", sensors = ["sensor.sofa_temperature", "sensor.desk_temperature"] },
 //! ]
 //! ```
 //!
@@ -41,8 +49,9 @@ pub struct Floor {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Room {
     pub name: String,
-    /// The room's thermometer, as a Home Assistant entity or statistic id.
-    pub sensor: String,
+    /// The room's thermometers, as Home Assistant entity or statistic ids: one or more,
+    /// in the file's order.
+    pub sensors: Vec<String>,
 }
 
 /// The file as written, before it is checked.
@@ -65,7 +74,10 @@ struct FloorEntry {
 #[serde(deny_unknown_fields)]
 struct RoomEntry {
     name: String,
-    sensor: String,
+    /// The one thermometer of a room that has one...
+    sensor: Option<String>,
+    /// ... or every thermometer of a room that has several.
+    sensors: Option<Vec<String>>,
 }
 
 impl House {
@@ -102,7 +114,6 @@ impl House {
             let mut rooms: Vec<Room> = Vec::with_capacity(entry.rooms.len());
             for room in entry.rooms {
                 let name = room.name.trim().to_string();
-                let sensor = room.sensor.trim().to_string();
                 let label = format!("{floor_name} / {name}");
                 ensure!(
                     !name.is_empty(),
@@ -112,15 +123,42 @@ impl House {
                     !rooms.iter().any(|other| other.name == name),
                     "{floor_name:?} has two rooms called {name:?}"
                 );
-                ensure!(!sensor.is_empty(), "the room {label:?} has an empty sensor");
-                if let Some(owner) = owners.get(&sensor) {
-                    bail!(
-                        "{sensor} is the thermometer of both {owner:?} and {label:?}; list an \
-                         open-plan space once, as one room"
+                let sensors = match (room.sensor, room.sensors) {
+                    (Some(sensor), None) => vec![sensor],
+                    (None, Some(sensors)) => {
+                        ensure!(
+                            !sensors.is_empty(),
+                            "the room {label:?} lists no sensors; give it at least one"
+                        );
+                        sensors
+                    }
+                    (None, None) => bail!(
+                        "the room {label:?} has no sensor; give it one with sensor = ..., or \
+                         several with sensors = [...]"
+                    ),
+                    (Some(_), Some(_)) => bail!(
+                        "the room {label:?} has both sensor and sensors; list all its \
+                         thermometers under sensors"
+                    ),
+                };
+                let mut own: Vec<String> = Vec::with_capacity(sensors.len());
+                for sensor in sensors {
+                    let sensor = sensor.trim().to_string();
+                    ensure!(!sensor.is_empty(), "the room {label:?} has an empty sensor");
+                    ensure!(
+                        !own.contains(&sensor),
+                        "{sensor} is listed twice for {label:?}"
                     );
+                    if let Some(owner) = owners.get(&sensor) {
+                        bail!(
+                            "{sensor} is the thermometer of both {owner:?} and {label:?}; list \
+                             an open-plan space once, as one room"
+                        );
+                    }
+                    owners.insert(sensor.clone(), label.clone());
+                    own.push(sensor);
                 }
-                owners.insert(sensor.clone(), label);
-                rooms.push(Room { name, sensor });
+                rooms.push(Room { name, sensors: own });
             }
             floors.push(Floor {
                 name: floor_name,
@@ -139,6 +177,15 @@ impl House {
 
     pub fn room_count(&self) -> usize {
         self.floors.iter().map(|floor| floor.rooms.len()).sum()
+    }
+
+    /// Every thermometer of every room, with its room, in the file's order.
+    pub fn sensors(&self) -> impl Iterator<Item = (&Floor, &Room, &str)> {
+        self.rooms().flat_map(|(floor, room)| {
+            room.sensors
+                .iter()
+                .map(move |sensor| (floor, room, sensor.as_str()))
+        })
     }
 }
 
@@ -172,14 +219,8 @@ mod tests {
         assert_eq!(house.floors[0].name, "Ground floor");
         assert_eq!(house.room_count(), 3);
         let rooms: Vec<(&str, &str, &str)> = house
-            .rooms()
-            .map(|(floor, room)| {
-                (
-                    floor.name.as_str(),
-                    room.name.as_str(),
-                    room.sensor.as_str(),
-                )
-            })
+            .sensors()
+            .map(|(floor, room, sensor)| (floor.name.as_str(), room.name.as_str(), sensor))
             .collect();
         assert_eq!(
             rooms,
@@ -198,10 +239,7 @@ mod tests {
     #[test]
     fn the_example_file_matches_the_demo_database() {
         let house = House::parse(include_str!("../rooms.example.toml")).unwrap();
-        let sensors: Vec<&str> = house
-            .rooms()
-            .map(|(_, room)| room.sensor.as_str())
-            .collect();
+        let sensors: Vec<&str> = house.sensors().map(|(_, _, sensor)| sensor).collect();
         let demo: Vec<&str> = ha_testdb::ROOMS
             .iter()
             .map(|(_, _, sensor, _)| *sensor)
@@ -264,6 +302,68 @@ mod tests {
             "{shared}"
         );
         assert!(error("[[floor]]\nname = \"  \"\nrooms = []").contains("empty name"));
+    }
+
+    #[test]
+    fn a_room_may_have_several_thermometers() {
+        let house = House::parse(
+            r#"
+            [[floor]]
+            name = "Ground floor"
+            rooms = [
+              { name = "Living room", sensors = [" sensor.sofa ", "sensor.desk"] },
+              { name = "Kitchen", sensor = "sensor.kitchen" },
+            ]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(house.room_count(), 2);
+        assert_eq!(
+            house.floors[0].rooms[0].sensors,
+            ["sensor.sofa", "sensor.desk"]
+        );
+        assert_eq!(house.floors[0].rooms[1].sensors, ["sensor.kitchen"]);
+        let all: Vec<(&str, &str)> = house
+            .sensors()
+            .map(|(_, room, sensor)| (room.name.as_str(), sensor))
+            .collect();
+        assert_eq!(
+            all,
+            [
+                ("Living room", "sensor.sofa"),
+                ("Living room", "sensor.desk"),
+                ("Kitchen", "sensor.kitchen")
+            ]
+        );
+    }
+
+    #[test]
+    fn several_thermometers_are_checked_like_one() {
+        let room = |entry: &str| {
+            format!(
+                "{:#}",
+                House::parse(&format!(
+                    "[[floor]]\nname = \"A\"\nrooms = [{{ name = \"X\"{entry} }}, \
+                     {{ name = \"Y\", sensor = \"s.y\" }}]"
+                ))
+                .unwrap_err()
+            )
+        };
+        assert!(room(", sensors = []").contains("lists no sensors"));
+        assert!(
+            room(", sensor = \"s.x\", sensors = [\"s.z\"]").contains("both sensor and sensors")
+        );
+        assert!(room("").contains("has no sensor"));
+        assert!(
+            room(", sensors = [\"s.x\", \" s.x\"]").contains("s.x is listed twice for \"A / X\"")
+        );
+        assert!(room(", sensors = [\"s.x\", \"\"]").contains("empty sensor"));
+        assert!(
+            room(", sensors = [\"s.x\", \"s.y\"]")
+                .contains("s.y is the thermometer of both \"A / X\" and \"A / Y\""),
+            "{}",
+            room(", sensors = [\"s.x\", \"s.y\"]")
+        );
     }
 
     #[test]

@@ -25,8 +25,9 @@ pub struct ReportOptions {
     pub metadata: Vec<(String, String)>,
     pub coverage: Option<Coverage>,
     pub tz: Tz,
-    /// `(room, what was taken out)` for every room whose thermostat offset was taken back
-    /// out of its readings.
+    /// `(room, what to say about it)`: a room counted from several thermometers, or one
+    /// whose thermostat offset was taken back out of its readings. The sentence follows
+    /// the room's name.
     pub room_notes: Vec<(String, String)>,
 }
 
@@ -452,8 +453,7 @@ fn rooms_section(analysis: &Analysis, house: &House, notes: &[(String, String)])
     for (room, note) in notes {
         let _ = write!(
             html,
-            "<p class=\"note\"><strong>{}</strong> is shown as its thermostat measured rather \
-             than as it reported: {}.</p>",
+            "<p class=\"note\"><strong>{}</strong> {}.</p>",
             escape(room),
             escape(note)
         );

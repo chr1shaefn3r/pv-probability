@@ -59,7 +59,7 @@ power sensors.
 ## The rooms file
 
 The rooms are far too many pairs for the command line, so they live in a TOML file:
-every floor, the rooms on it, and each room's thermometer. `--rooms` is optional - without
+every floor, the rooms on it, and each room's thermometers. `--rooms` is optional - without
 it the report covers the outside alone.
 
 ```toml
@@ -77,12 +77,26 @@ rooms = [
 ]
 ```
 
+A room with more than one thermometer lists them all under `sensors` instead:
+
+```toml
+rooms = [
+  { name = "Living room", sensors = ["sensor.sofa_temperature", "sensor.desk_temperature"] },
+]
+```
+
+The room is then their mean: on each day, the plain mean of the thermometers that covered
+it, every one counting alike. One that saw too little of a day is left out of that day
+rather than counted on a few hours, so such a day stands on the others; the run says on
+how many days that happened, and the report says which thermometers make up the room.
+
 [`rooms.example.toml`](rooms.example.toml) is a complete one, matching the demo database.
 Floors and rooms appear in the report in the file's order. Room names only have to be
 unique on their floor - a bathroom upstairs and one downstairs are fine - but a
 thermometer belongs to one room. Mistakes are named rather than guessed around: an
-unknown key, a floor without rooms, a sensor listed twice, and a room whose sensor is not
-a thermometer all stop the run with the room's name in the message.
+unknown key, a floor without rooms, a room with both `sensor` and `sensors` or neither, a
+sensor listed twice, and a sensor that is not a thermometer all stop the run with the
+room's name in the message.
 
 ### Thermostats with an offset
 
@@ -96,9 +110,9 @@ nothing to configure:
 * **It is found by its id.** A thermostat's reading and its offset setting belong to one
   device, so their ids start with the same device name:
   `sensor.bad_og_heizkorper_temperature` and `number.bad_og_heizkorper_temperature_offset`
-  (or `..._local_temperature_calibration`, `..._temperaturversatz`). A room whose
-  thermometer has such a setting beside it is corrected; one that has none, or whose
-  device has two that fit, is left as reported.
+  (or `..._local_temperature_calibration`, `..._temperaturversatz`). Every thermometer
+  with such a setting beside it is corrected - in a room with several, before they are
+  averaged; one that has none, or whose device has two that fit, is left as reported.
 * **It is always said.** The run prints by how much each corrected room's readings were
   raised or lowered and which setting that came from, and the report says the same under
   Indoor temperatures.
@@ -131,8 +145,10 @@ nothing to configure:
   extrapolated. A month or a year at the edge of the record is partial for the same
   reason.
 * **Indoor means cover the same days.** A room's figure for a month is the mean of its
-  daily means over the month's counted days, wherever its own thermometer covered the day
-  too. A floor's figure is the plain mean of its rooms, every room counting alike.
+  daily means over the month's counted days, wherever its own thermometers covered the day
+  too. A room with several thermometers has the mean of those that covered each day, and a
+  floor's figure is the plain mean of its rooms: every thermometer counts alike in its
+  room, and every room alike on its floor.
 * **Units are converted.** A thermometer recorded in °F (or K) is read in °C; the header
   says so. Raw `states` carry no unit of their own, so a °F sensor should be read from its
   statistics, which `--source auto` does anyway.

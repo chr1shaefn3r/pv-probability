@@ -13,7 +13,7 @@ use ha_recorder::source::schema::ValueColumn;
 use ha_recorder::source::{LoadOptions, SourceKind, load};
 use ha_testdb::{self as testdb, Flavour, OUTSIDE_ENTITY, Outages, ROOMS, ts};
 
-use heating_energy::daily::daily_means;
+use heating_energy::daily::{daily_means, room_days};
 use heating_energy::degree::{Analysis, Bases, analyse};
 use heating_energy::report::{ReportOptions, page};
 use heating_energy::rooms::House;
@@ -44,8 +44,15 @@ fn run(conn: &Connection, grouping: Grouping) -> Analysis {
     let rooms: Vec<_> = house
         .rooms()
         .map(|(_, room)| {
-            let loaded = load(conn, &options(&room.sensor)).expect("room loads");
-            daily_means(&loaded.samples, UTC)
+            let thermometers: Vec<_> = room
+                .sensors
+                .iter()
+                .map(|sensor| {
+                    let loaded = load(conn, &options(sensor)).expect("room loads");
+                    daily_means(&loaded.samples, UTC)
+                })
+                .collect();
+            room_days(&thermometers, 0.9).days
         })
         .collect();
     analyse(
@@ -519,5 +526,130 @@ fn a_thermostat_subtracting_its_offset_is_read_from_its_readings() {
     assert!(
         stdout.contains("readings raised by 1 °C, then raised by 2 °C"),
         "{stdout}"
+    );
+}
+
+/// Ten days at 5 °C outside, and every `(thermometer, °C, days)` reporting that constant
+/// hourly mean from the first day for that many days.
+fn living_room_database(path: &Path, thermometers: &[(&str, f64, i64)]) {
+    let conn = Connection::open(path).unwrap();
+    testdb::create_schema(&conn, Flavour::Modern);
+    let start = ts("2024-01-01 00:00:00");
+    let mut all = vec![(OUTSIDE_ENTITY, 5.0, 10)];
+    all.extend_from_slice(thermometers);
+    for (entity, value, days) in all {
+        let id = testdb::insert_statistic_meta(&conn, entity, Some("°C"));
+        for hour in 0..days * 24 {
+            testdb::insert_statistics_row(
+                &conn,
+                Flavour::Modern,
+                "statistics",
+                id,
+                start + hour * 3_600,
+                Some(value),
+            );
+        }
+    }
+}
+
+/// Run the binary on `db` with one room, written as `entry`.
+fn one_room(scratch: &Scratch, db: &Path, entry: &str) -> std::process::Output {
+    let rooms = scratch.path("rooms.toml");
+    std::fs::write(
+        &rooms,
+        format!(
+            "[[floor]]\nname = \"Ground floor\"\nrooms = [{{ name = \"Living room\"{entry} }}]\n"
+        ),
+    )
+    .unwrap();
+    heating_energy(&[
+        "--db".as_ref(),
+        db.as_os_str(),
+        "--outside-entity".as_ref(),
+        OUTSIDE_ENTITY.as_ref(),
+        "--rooms".as_ref(),
+        rooms.as_os_str(),
+        "--tz".as_ref(),
+        "UTC".as_ref(),
+        "-o".as_ref(),
+        scratch.path("report.html").as_os_str(),
+    ])
+}
+
+#[test]
+fn a_room_with_several_thermometers_is_their_mean() {
+    let scratch = Scratch::new("several");
+    let db = scratch.path("ha.db");
+    living_room_database(
+        &db,
+        &[
+            ("sensor.sofa_temperature", 20.0, 10),
+            ("sensor.desk_temperature", 22.0, 10),
+        ],
+    );
+
+    let output = one_room(
+        &scratch,
+        &db,
+        ", sensors = [\"sensor.sofa_temperature\", \"sensor.desk_temperature\"]",
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(stdout.contains("indoors: Ground floor 21 °C"), "{stdout}");
+    assert!(!stdout.contains("note:"), "{stdout}");
+    let html = std::fs::read_to_string(scratch.path("report.html")).unwrap();
+    assert!(
+        html.contains(
+            "<strong>Ground floor / Living room</strong> is the mean of its 2 thermometers, \
+             sensor.sofa_temperature and sensor.desk_temperature, every one counting alike on \
+             the days it covered.</p>"
+        ),
+        "the report says what the room is made of"
+    );
+}
+
+#[test]
+fn days_only_some_thermometers_covered_rest_on_those_and_are_counted() {
+    let scratch = Scratch::new("several-partial");
+    let db = scratch.path("ha.db");
+    // The desk thermometer only recorded the first four days.
+    living_room_database(
+        &db,
+        &[
+            ("sensor.sofa_temperature", 20.0, 10),
+            ("sensor.desk_temperature", 22.0, 4),
+        ],
+    );
+
+    let output = one_room(
+        &scratch,
+        &db,
+        ", sensors = [\"sensor.sofa_temperature\", \"sensor.desk_temperature\"]",
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    // Four days at 21 °C and six at 20 °C.
+    assert!(stdout.contains("indoors: Ground floor 20.4 °C"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "note: Ground floor / Living room: on 6 days only some of its 2 thermometers \
+             covered enough of the day; they are the mean of those that did"
+        ),
+        "{stdout}"
+    );
+
+    // A thermometer that is not there at all is named, with the room.
+    let output = one_room(
+        &scratch,
+        &db,
+        ", sensors = [\"sensor.sofa_temperature\", \"sensor.window_temperature\"]",
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains(
+            "reading the thermometer sensor.window_temperature of Ground floor / Living room"
+        ),
+        "{stderr}"
     );
 }

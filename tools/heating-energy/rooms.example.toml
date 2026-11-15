@@ -6,7 +6,10 @@
 #     --outside-entity sensor.outdoor_temperature --rooms tools/heating-energy/rooms.example.toml
 #
 # Floors and rooms appear in the report in the order they are listed here. Room names
-# only have to be unique on their floor; a thermometer belongs to one room.
+# only have to be unique on their floor; a thermometer belongs to one room. A room with
+# several thermometers lists them all, and is counted by their mean:
+#
+#   { name = "Living room", sensors = ["sensor.sofa_temperature", "sensor.desk_temperature"] },
 
 [[floor]]
 name = "Ground floor"

@@ -17,7 +17,7 @@ use ha_recorder::{Quantity, Sample};
 use ha_report::{format_duration, open_command};
 
 use heating_energy::cli::{Args, Config};
-use heating_energy::daily::{DayMean, daily_means};
+use heating_energy::daily::{DayMean, daily_means, room_days};
 use heating_energy::degree::{Analysis, analyse};
 use heating_energy::offset::{self, Check, Correction, Finding, format_offset, local_stamp};
 use heating_energy::report::{ReportOptions, format_celsius, format_degree_days, page};
@@ -63,21 +63,26 @@ fn run() -> Result<()> {
     if let Some(house) = &house {
         thermometers.extend(
             house
-                .rooms()
-                .map(|(floor, room)| (room.sensor.as_str(), Some((floor, room)))),
+                .sensors()
+                .map(|(floor, room, sensor)| (sensor, Some((floor, room)))),
         );
     }
-    // A room's thermostat offset is looked for and taken back out in the room's own task,
-    // before its days are counted.
+    // A thermostat's offset is looked for and taken back out in its own task, before its
+    // days are counted.
     let read_all: Vec<Result<Thermometer>> = thermometers
         .par_iter()
         .map(|(entity, room)| {
             let (loaded, finding) = match room {
-                Some((floor, room)) => {
-                    read_room(&args, &config, &room.sensor).with_context(|| {
+                Some((floor, room)) => read_room(&args, &config, entity).with_context(|| {
+                    if room.sensors.len() == 1 {
                         format!("reading the thermometer of {} / {}", floor.name, room.name)
-                    })?
-                }
+                    } else {
+                        format!(
+                            "reading the thermometer {entity} of {} / {}",
+                            floor.name, room.name
+                        )
+                    }
+                })?,
                 None => (read(&args, &config, entity)?, None),
             };
             let days = daily_means(&loaded.samples, tz);
@@ -92,28 +97,69 @@ fn run() -> Result<()> {
     let mut read_all = read_all.into_iter().collect::<Result<Vec<_>>>()?;
     let outside = read_all.remove(0);
     let (outside, outside_days) = (outside.loaded, outside.days);
-    let labels: Vec<String> = house
-        .iter()
-        .flat_map(House::rooms)
-        .map(|(floor, room)| format!("{} / {}", floor.name, room.name))
-        .collect();
-    let mut rooms = Vec::with_capacity(read_all.len());
-    let mut room_days = Vec::with_capacity(read_all.len());
+    // Each room's thermometers, read in the file's order, become the room's days.
+    let mut read_all = read_all.into_iter();
+    let mut indoor_days = Vec::new();
     let mut findings: Vec<(String, Finding)> = Vec::new();
-    for (thermometer, label) in read_all.into_iter().zip(&labels) {
-        rooms.push(thermometer.loaded);
-        room_days.push(thermometer.days);
-        if let Some(finding) = thermometer.finding {
-            findings.push((label.clone(), finding));
+    let mut partial: Vec<(String, u32, usize)> = Vec::new();
+    let mut room_notes: Vec<(String, String)> = Vec::new();
+    let mut room_rows = 0;
+    for (floor, room) in house.iter().flat_map(House::rooms) {
+        let label = format!("{} / {}", floor.name, room.name);
+        let mut thermometers = Vec::with_capacity(room.sensors.len());
+        let mut corrections = Vec::new();
+        for sensor in &room.sensors {
+            let thermometer = read_all.next().expect("one thermometer read per sensor");
+            room_rows += thermometer.loaded.rows;
+            thermometers.push(thermometer.days);
+            if let Some(finding) = thermometer.finding {
+                let label = if room.sensors.len() == 1 {
+                    label.clone()
+                } else {
+                    format!("{label}, {sensor}")
+                };
+                if let Finding::Corrected(correction) = &finding {
+                    corrections.push((
+                        label.clone(),
+                        format!(
+                            "is shown as its thermostat measured rather than as it reported: {}",
+                            correction.sentence(tz)
+                        ),
+                    ));
+                }
+                findings.push((label, finding));
+            }
         }
+        let days = room_days(&thermometers, config.min_day_coverage);
+        if room.sensors.len() > 1 {
+            room_notes.push((
+                label.clone(),
+                format!(
+                    "is the mean of its {} thermometers, {}, every one counting alike on the days \
+                     it covered{}",
+                    room.sensors.len(),
+                    joined(&room.sensors),
+                    match days.partial_days {
+                        0 => String::new(),
+                        1 => "; on one day only some of them did".to_string(),
+                        days => format!("; on {days} days only some of them did"),
+                    }
+                ),
+            ));
+        }
+        if days.partial_days > 0 {
+            partial.push((label, days.partial_days, room.sensors.len()));
+        }
+        room_notes.extend(corrections);
+        indoor_days.push(days.days);
     }
     if args.verbose > 0 {
         eprintln!(
             "read {} outside rows from `{}` and {} rows for {} rooms in {:.2?} on {} threads",
             outside.rows,
             outside.source,
-            rooms.iter().map(|room| room.rows).sum::<usize>(),
-            rooms.len(),
+            room_rows,
+            house.as_ref().map_or(0, House::room_count),
             started.elapsed(),
             rayon::current_num_threads()
         );
@@ -125,7 +171,7 @@ fn run() -> Result<()> {
         || {
             analyse(
                 &outside_days,
-                &room_days,
+                &indoor_days,
                 house.as_ref(),
                 config.bases,
                 config.min_day_coverage,
@@ -165,15 +211,7 @@ fn run() -> Result<()> {
             metadata: metadata(&args, &outside, tz),
             coverage: coverage.clone(),
             tz,
-            room_notes: findings
-                .iter()
-                .filter_map(|(label, finding)| match finding {
-                    Finding::Corrected(correction) => {
-                        Some((label.clone(), correction.sentence(tz)))
-                    }
-                    Finding::Ambiguous(_) | Finding::Unrecorded(_) => None,
-                })
-                .collect(),
+            room_notes,
         },
     );
     fs::write(&args.out, &html)
@@ -182,6 +220,14 @@ fn run() -> Result<()> {
     report(&args, &analysis, house.as_ref(), html.len(), started);
     for line in finding_lines(&findings, tz) {
         println!("{line}");
+    }
+    for (label, days, thermometers) in &partial {
+        println!(
+            "note: {label}: on {days} day{} only some of its {thermometers} thermometers \
+             covered enough of the day; {} the mean of those that did",
+            if *days == 1 { "" } else { "s" },
+            if *days == 1 { "it is" } else { "they are" }
+        );
     }
     if let Some(coverage) = &coverage {
         println!("{}", coverage_line(coverage, tz));
@@ -384,6 +430,15 @@ fn check_line(label: &str, correction: &Correction, tz: Tz) -> String {
              against it at {subtracted}; it is taken to be added, as Zigbee and Matter \
              thermostats do"
         ),
+    }
+}
+
+/// `a`, `a and b`, `a, b and c`.
+fn joined(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [only] => only.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
     }
 }
 

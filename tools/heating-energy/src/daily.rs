@@ -120,6 +120,65 @@ fn midnight_after(ts: i64, tz: Tz) -> Option<i64> {
         .map(|instant| instant.timestamp())
 }
 
+/// A room's daily means, from all of its thermometers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoomDays {
+    /// One per day at least one thermometer covered `min_coverage` of, in day order.
+    pub days: Vec<DayMean>,
+    /// Of those, the days some of the thermometers did not cover well enough, so the
+    /// others stood in for them.
+    pub partial_days: u32,
+}
+
+/// A room's daily means: on each day, the plain mean of its thermometers that covered at
+/// least `min_coverage` of it, every thermometer counting alike.
+///
+/// A thermometer that fell short on a day is left out of that day rather than counted on
+/// what little it saw, so a day stands on the thermometers that saw it; how many days
+/// that happened on is counted in [`RoomDays::partial_days`]. With one thermometer the
+/// days are its own, unchanged.
+pub fn room_days(thermometers: &[Vec<DayMean>], min_coverage: f64) -> RoomDays {
+    if let [only] = thermometers {
+        return RoomDays {
+            days: only.clone(),
+            partial_days: 0,
+        };
+    }
+    // Sums in the file's order of the thermometers, so the mean is the same every run.
+    let mut days: BTreeMap<DayNumber, (f64, u32, f64, f64)> = BTreeMap::new();
+    for thermometer in thermometers {
+        for day in thermometer
+            .iter()
+            .filter(|day| day.coverage() >= min_coverage)
+        {
+            let (sum, count, covered, _) =
+                days.entry(day.day)
+                    .or_insert((0.0, 0, 0.0, day.day_seconds));
+            *sum += day.mean;
+            *count += 1;
+            *covered = covered.max(day.covered_seconds);
+        }
+    }
+    let partial_days = days
+        .values()
+        .filter(|(_, count, _, _)| (*count as usize) < thermometers.len())
+        .count() as u32;
+    RoomDays {
+        days: days
+            .into_iter()
+            .map(
+                |(day, (sum, count, covered_seconds, day_seconds))| DayMean {
+                    day,
+                    mean: sum / f64::from(count),
+                    covered_seconds,
+                    day_seconds,
+                },
+            )
+            .collect(),
+        partial_days,
+    }
+}
+
 /// Length of a local day in seconds, from one local midnight to the next.
 pub fn day_seconds(day: DayNumber, tz: Tz) -> f64 {
     let midnight = |date: NaiveDate| {
@@ -302,6 +361,56 @@ mod tests {
         assert_eq!(first.covered_seconds, 86_400.0 + 1_800.0);
         assert_eq!(means.len(), 400);
         assert!(means.windows(2).all(|pair| pair[0].day < pair[1].day));
+    }
+
+    fn day(day: DayNumber, mean: f64, coverage: f64) -> DayMean {
+        DayMean {
+            day,
+            mean,
+            covered_seconds: coverage * 86_400.0,
+            day_seconds: 86_400.0,
+        }
+    }
+
+    #[test]
+    fn a_room_is_the_mean_of_its_thermometers() {
+        let sofa = vec![day(1, 20.0, 1.0), day(2, 21.0, 1.0), day(3, 22.0, 1.0)];
+        let desk = vec![day(1, 22.0, 1.0), day(2, 23.0, 0.95), day(4, 19.0, 1.0)];
+        let room = room_days(&[sofa, desk], 0.9);
+        let means: Vec<(DayNumber, f64)> =
+            room.days.iter().map(|day| (day.day, day.mean)).collect();
+        assert_eq!(means, [(1, 21.0), (2, 22.0), (3, 22.0), (4, 19.0)]);
+        assert_eq!(
+            room.partial_days, 2,
+            "days 3 and 4 stand on one thermometer each"
+        );
+        assert!(room.days.iter().all(|day| day.coverage() >= 0.9));
+    }
+
+    #[test]
+    fn a_thermometer_that_saw_too_little_of_a_day_is_left_out_of_it() {
+        let sofa = vec![day(1, 20.0, 1.0)];
+        let desk = vec![day(1, 30.0, 0.25)];
+        let room = room_days(&[sofa, desk], 0.9);
+        assert_eq!(room.days.len(), 1);
+        assert_eq!(
+            room.days[0].mean, 20.0,
+            "not dragged up by a quarter of a day"
+        );
+        assert_eq!(room.partial_days, 1);
+
+        // A day none of them covered well enough is not a day of the room's at all.
+        let room = room_days(&[vec![day(1, 20.0, 0.5)], vec![day(1, 21.0, 0.5)]], 0.9);
+        assert!(room.days.is_empty());
+        assert_eq!(room.partial_days, 0);
+    }
+
+    #[test]
+    fn one_thermometer_is_its_own_room() {
+        let only = vec![day(1, 20.0, 1.0), day(2, -0.0, 0.5)];
+        let room = room_days(std::slice::from_ref(&only), 0.9);
+        assert_eq!(room.days, only, "unchanged, thin days and all");
+        assert_eq!(room.partial_days, 0);
     }
 
     #[test]
