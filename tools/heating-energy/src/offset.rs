@@ -5,8 +5,13 @@
 //! room is warm enough. The reading Home Assistant records then has the offset in it, and
 //! cannot be compared with a plain thermometer's. Knowing the offset at every moment, the
 //! tool takes it back out again: what remains is what the thermostat measured.
+//!
+//! Nothing has to be configured. A thermostat's reading and its offset setting are
+//! entities of one device, so their ids start with the same device name:
+//! `sensor.bad_og_heizkorper_temperature` and `number.bad_og_heizkorper_temperature_offset`.
+//! A room's thermometer with such a setting beside it is corrected, and the run says so.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::Result;
 use chrono_tz::Tz;
 use rusqlite::Connection;
 
@@ -14,10 +19,8 @@ use ha_recorder::Sample;
 use ha_recorder::source::{LoadedSamples, states};
 use ha_recorder::timeutil::{day_to_date, local_day};
 
-use crate::rooms::{Applied, Offset, Room};
-
 /// Words an offset setting's entity id is made of, in the languages Home Assistant names
-/// them in.
+/// them in. Matched within a word too, so `temperaturversatz` counts.
 pub const OFFSET_WORDS: [&str; 5] = [
     "offset",
     "calibration",
@@ -25,6 +28,38 @@ pub const OFFSET_WORDS: [&str; 5] = [
     "versatz",
     "korrektur",
 ];
+
+/// Words that say what an entity of a thermostat measures or sets rather than which
+/// device it belongs to, as they end its id: `_temperature`, `_local_temperature`.
+const MEASURE_WORDS: [&str; 6] = [
+    "temperature",
+    "temperatur",
+    "local",
+    "lokale",
+    "lokaler",
+    "current",
+];
+
+/// How a thermostat applies its offset to what it measures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Applied {
+    /// It reports what it measures plus the offset: an offset of -2 reads two degrees
+    /// low. This is how Zigbee and Matter define a thermostat's calibration.
+    Added,
+    /// It reports what it measures minus the offset.
+    Subtracted,
+}
+
+impl Applied {
+    /// The sign the offset was applied with: the reading is what was measured plus this
+    /// times the offset.
+    pub fn sign(self) -> f64 {
+        match self {
+            Applied::Added => 1.0,
+            Applied::Subtracted => -1.0,
+        }
+    }
+}
 
 /// The values a thermostat's offset took, and from when, earliest first.
 ///
@@ -36,11 +71,6 @@ pub const OFFSET_WORDS: [&str; 5] = [
 pub struct Steps(Vec<(i64, f64)>);
 
 impl Steps {
-    /// The same offset at every moment.
-    pub fn fixed(degrees: f64) -> Self {
-        Self(vec![(i64::MIN, degrees)])
-    }
-
     /// The steps a recorded history of the setting makes, or `None` when it holds no value.
     /// Repeats of the value in force - written at every restart - are not changes.
     pub fn from_history(history: &[(i64, f64)]) -> Option<Self> {
@@ -53,12 +83,9 @@ impl Steps {
         (!steps.is_empty()).then_some(Self(steps))
     }
 
-    /// When the first value is on record, or `None` for a fixed offset.
-    pub fn recorded_from(&self) -> Option<i64> {
-        self.0
-            .first()
-            .map(|(ts, _)| *ts)
-            .filter(|ts| *ts != i64::MIN)
+    /// When the first value is on record.
+    pub fn first_ts(&self) -> i64 {
+        self.0[0].0
     }
 
     /// The values, in the order they were set.
@@ -131,32 +158,46 @@ const AFTER_WINDOW: i64 = 300;
 /// Readings this close before a change may already carry the new offset.
 const GRACE: i64 = 60;
 
+/// One change of the offset - when, from what, to what - and how far the reading moved.
+pub type Moved = ((i64, f64, f64), f64);
+
 /// What the recorded readings say about how the offset is applied.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Check {
     /// No change of the offset with readings on both sides of it to judge by.
     Untested,
-    /// The reading moved the way `offset_applied` says at every change judged.
-    Agrees { changes: usize },
-    /// The reading moved the other way: the thermostat applies its offset the other way
-    /// round. The first such change, and how far the reading moved.
-    Disagrees { change: (i64, f64, f64), moved: f64 },
+    /// At every change judged, the reading moved with the offset: it is added.
+    Added { changes: usize },
+    /// At every change judged, the reading moved against it: it is subtracted. The first
+    /// such change.
+    Subtracted { changes: usize, first: Moved },
     /// The reading did not move when the offset changed, as though it were reported
     /// without the offset in it. The first such change.
-    Unmoved { change: (i64, f64, f64) },
+    Unmoved { first: Moved },
     /// Some changes one way, some the other.
-    Mixed { with: usize, against: usize },
+    Mixed { added: usize, subtracted: usize },
 }
 
-/// Judge from the thermostat's raw readings, `(time, value)` in time order, whether it
-/// applies its offset the way `applied` says.
+impl Check {
+    /// Which way the offset is taken out: the way the readings show, or as Zigbee and
+    /// Matter define it when they show nothing clear.
+    pub fn applied(&self) -> Applied {
+        match self {
+            Check::Subtracted { .. } => Applied::Subtracted,
+            _ => Applied::Added,
+        }
+    }
+}
+
+/// Judge from the thermostat's raw readings, `(time, value)` in time order, how it applies
+/// its offset.
 ///
 /// When the offset changes by some amount, the reported reading jumps by the same amount:
 /// up for an offset that is added and raised, down for one that is subtracted. The room
 /// itself barely moves in the few minutes it takes the thermostat to report.
-pub fn check(readings: &[(i64, f64)], steps: &Steps, applied: Applied) -> Check {
-    let (mut with, mut against) = (0, 0);
-    let (mut first_against, mut first_still) = (None, None);
+pub fn check(readings: &[(i64, f64)], steps: &Steps) -> Check {
+    let (mut added, mut subtracted) = (0, 0);
+    let (mut first_subtracted, mut first_still) = (None, None);
     for change @ (at, from, to) in steps.changes() {
         let step = to - from;
         if step.abs() < MIN_JUDGED_CHANGE {
@@ -177,73 +218,64 @@ pub fn check(readings: &[(i64, f64)], steps: &Steps, applied: Applied) -> Check 
         let Some(moved) = moved else {
             continue;
         };
-        let expected = applied.sign() * step;
         if moved.abs() < step.abs() / 2.0 {
-            first_still.get_or_insert(change);
-        } else if moved.signum() == expected.signum() {
-            with += 1;
+            first_still.get_or_insert((change, moved));
+        } else if moved.signum() == step.signum() {
+            added += 1;
         } else {
-            against += 1;
-            first_against.get_or_insert((change, moved));
+            subtracted += 1;
+            first_subtracted.get_or_insert((change, moved));
         }
     }
-    match (with, against, first_against, first_still) {
+    match (added, subtracted, first_subtracted, first_still) {
         (0, 0, _, None) => Check::Untested,
-        (0, 0, _, Some(change)) => Check::Unmoved { change },
-        (with, 0, _, _) => Check::Agrees { changes: with },
-        (0, _, Some((change, moved)), _) => Check::Disagrees { change, moved },
-        (with, against, _, _) => Check::Mixed { with, against },
+        (0, 0, _, Some(first)) => Check::Unmoved { first },
+        (added, 0, _, _) => Check::Added { changes: added },
+        (0, changes, Some(first), _) => Check::Subtracted { changes, first },
+        (added, subtracted, _, _) => Check::Mixed { added, subtracted },
     }
 }
 
-/// The candidate that looks like `sensor`'s own offset setting, if exactly one does.
+/// The candidates that are `sensor`'s own offset setting: the same device name, followed
+/// by nothing but words for a temperature and its offset.
 ///
-/// Entity ids are made from device names, so a thermostat's reading and its offset
-/// usually share most of their words - `sensor.bad_og_heizkorper_temperature` and
-/// `number.bad_heizkorper_temperature_offset` share all but one. More than half of the
-/// two ids' device words have to be shared, and no other candidate may match as well.
-pub fn suggest<'a>(sensor: &str, candidates: &'a [String]) -> Option<&'a String> {
-    let own = device_words(sensor);
-    let mut best: Option<(f64, &String)> = None;
-    let mut tied = false;
-    for candidate in candidates {
-        let words = device_words(candidate);
-        let shared = words.iter().filter(|word| own.contains(word)).count();
-        let all = own.len() + words.len() - shared;
-        if shared == 0 || all == 0 {
-            continue;
-        }
-        let score = shared as f64 / all as f64;
-        match best {
-            Some((top, _)) if score < top => {}
-            Some((top, _)) if score == top => tied = true,
-            _ => {
-                best = Some((score, candidate));
-                tied = false;
-            }
-        }
+/// `sensor.bad_og_heizkorper_temperature` is the device `bad_og_heizkorper` measuring a
+/// temperature, so `number.bad_og_heizkorper_temperature_offset` and
+/// `number.bad_og_heizkorper_local_temperature_calibration` are its offset, while
+/// `number.bad_temperature_offset` belongs to another device, and so does
+/// `number.bad_og_heizkorper_2_temperature_offset`.
+pub fn find<'a>(sensor: &str, candidates: &'a [String]) -> Vec<&'a String> {
+    let mut device: Vec<&str> = object_id(sensor).split('_').collect();
+    while device
+        .last()
+        .is_some_and(|word| MEASURE_WORDS.contains(word))
+    {
+        device.pop();
     }
-    best.filter(|(score, _)| *score > 0.5 && !tied)
-        .map(|(_, candidate)| candidate)
+    if device.is_empty() {
+        return Vec::new();
+    }
+    let prefix = format!("{}_", device.join("_"));
+
+    candidates
+        .iter()
+        .filter(|candidate| {
+            let Some(rest) = object_id(candidate).strip_prefix(&prefix) else {
+                return false;
+            };
+            let is_offset = |word: &str| OFFSET_WORDS.iter().any(|offset| word.contains(offset));
+            let words: Vec<&str> = rest.split('_').collect();
+            words.iter().any(|word| is_offset(word))
+                && words
+                    .iter()
+                    .all(|word| MEASURE_WORDS.contains(word) || is_offset(word))
+        })
+        .collect()
 }
 
-/// The words of an entity id that name its device rather than what it is.
-fn device_words(entity: &str) -> Vec<&str> {
-    const GENERIC: [&str; 9] = [
-        "temperature",
-        "temperatur",
-        "local",
-        "current",
-        "offset",
-        "calibration",
-        "kalibrierung",
-        "versatz",
-        "korrektur",
-    ];
-    let id = entity.split_once('.').map_or(entity, |(_, id)| id);
-    id.split('_')
-        .filter(|word| !word.is_empty() && !GENERIC.contains(word))
-        .collect()
+/// An entity id without its domain: `bad_temperature` for `sensor.bad_temperature`.
+fn object_id(entity: &str) -> &str {
+    entity.split_once('.').map_or(entity, |(_, object)| object)
 }
 
 /// What became of one room's offset.
@@ -251,17 +283,20 @@ fn device_words(entity: &str) -> Vec<&str> {
 pub enum Finding {
     /// It was taken back out of the readings.
     Corrected(Correction),
-    /// The rooms file names none, but this entity looks like the thermostat's offset.
-    Suggested(String),
+    /// More than one setting is this thermostat's offset by its id; none was used.
+    Ambiguous(Vec<String>),
+    /// The thermostat's offset setting has no value on record; the readings are as
+    /// reported.
+    Unrecorded(String),
 }
 
 /// An offset that was taken back out, and what is known about it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Correction {
-    /// The setting it came from; `None` for a value the rooms file gives.
-    pub entity: Option<String>,
+    /// The setting it came from.
+    pub entity: String,
     pub steps: Steps,
-    pub applied: Applied,
+    /// What the readings say about how it is applied, which decides how it is taken out.
     pub check: Check,
     /// The unit the thermostat records in, which its offset is in too.
     pub unit: String,
@@ -271,101 +306,115 @@ pub struct Correction {
 }
 
 impl Correction {
-    /// The values it took, in order: `-2 °C`, or `-1 °C, then -2 °C`.
+    /// The values the setting took, in order: `-2 °C`, or `-1 °C, then -2 °C`.
     pub fn values(&self) -> String {
-        let values: Vec<String> = self
-            .steps
-            .values()
-            .map(|degrees| format_offset(degrees, &self.unit))
-            .collect();
-        match values.as_slice() {
-            [first, .., last] if values.len() > 3 => {
-                format!("{first}, then {} more, then {last}", values.len() - 2)
+        listed(
+            self.steps
+                .values()
+                .map(|degrees| format_offset(degrees, &self.unit)),
+        )
+    }
+
+    /// What taking it out did to the readings: `raised by 2 °C`, or `raised by 1 °C,
+    /// then raised by 2 °C`.
+    pub fn effect(&self) -> String {
+        let sign = self.check.applied().sign();
+        listed(self.steps.values().map(|degrees| {
+            let change = -sign * degrees;
+            let size = format_offset(change.abs(), &self.unit);
+            let size = size.trim_start_matches('+');
+            if change > 0.0 {
+                format!("raised by {size}")
+            } else if change < 0.0 {
+                format!("lowered by {size}")
+            } else {
+                "left as they were".to_string()
             }
-            _ => values.join(", then "),
-        }
+        }))
     }
 
-    /// Where the offset came from and how far back it is known.
-    pub fn source(&self, tz: Tz) -> String {
-        match (&self.entity, self.assumed_before) {
-            (Some(entity), Some(from)) => format!(
-                "from {entity} (on record since {}; the first value is assumed before that)",
+    /// How far back the setting is on record, when the readings go back further.
+    pub fn since(&self, tz: Tz) -> Option<String> {
+        self.assumed_before.map(|from| {
+            format!(
+                "on record since {}, and taken to have been the same before",
                 local_date(from, tz)
-            ),
-            (Some(entity), None) => format!("from {entity}"),
-            (None, _) => "as the rooms file gives it".to_string(),
-        }
+            )
+        })
     }
 
-    /// What was taken out, and where it came from, as the report says it.
+    /// Everything that was done, as the report says it.
     pub fn sentence(&self, tz: Tz) -> String {
-        let source = self.source(tz);
-        let separator = if self.entity.is_some() { " " } else { ", " };
-        format!("{}{separator}{source}", self.values())
+        let mut sentence = format!(
+            "readings {}, taking out its thermostat's offset {} ({})",
+            self.effect(),
+            self.entity,
+            self.values()
+        );
+        if let Some(since) = self.since(tz) {
+            sentence.push_str(", ");
+            sentence.push_str(&since);
+        }
+        sentence
     }
 }
 
-/// Do what the rooms file says about `room`'s offset to its loaded readings, and say what
-/// was done.
+/// `a`, `a, then b`, `a, then b, then c`; for longer lists the first, how many more, and
+/// the last.
+fn listed(items: impl Iterator<Item = String>) -> String {
+    let items: Vec<String> = items.collect();
+    match items.as_slice() {
+        [first, .., last] if items.len() > 3 => {
+            format!("{first}, then {} more, then {last}", items.len() - 2)
+        }
+        _ => items.join(", then "),
+    }
+}
+
+/// Look for the offset setting of the thermostat behind `sensor`, and take it back out of
+/// its loaded readings if there is one.
 ///
-/// A named setting is read from the raw states, and its changes are checked against the
-/// thermostat's own raw readings. A room that names nothing is only given a suggestion,
-/// from the offset settings no other room names: its readings stay as they are, because a
-/// name that merely looks right is not enough to change what a room reports.
+/// The setting is read from the raw states. Which way it is taken out is read from the
+/// thermostat's own raw readings where they show it, and is otherwise the Zigbee and
+/// Matter convention.
 pub fn resolve(
     conn: &Connection,
-    room: &Room,
+    sensor: &str,
     loaded: &mut LoadedSamples,
-    named_elsewhere: &[&str],
 ) -> Result<Option<Finding>> {
-    let unit = loaded.unit.clone().unwrap_or_else(|| "°C".to_string());
-    let (steps, entity, applied) = match &room.offset {
-        Offset::Off => return Ok(None),
-        Offset::Unset => {
-            let candidates: Vec<String> = states::entities_matching(conn, "number", &OFFSET_WORDS)?
-                .into_iter()
-                .filter(|candidate| !named_elsewhere.contains(&candidate.as_str()))
-                .collect();
-            return Ok(suggest(&room.sensor, &candidates)
-                .cloned()
-                .map(Finding::Suggested));
-        }
-        Offset::Fixed { degrees, applied } => (Steps::fixed(*degrees), None, *applied),
-        Offset::Entity { entity, applied } => {
-            let history = states::history(conn, entity)
-                .with_context(|| format!("reading its thermostat's offset, {entity}"))?;
-            let steps = Steps::from_history(&history).ok_or_else(|| {
-                anyhow!(
-                    "{entity}, its thermostat's offset, has no value on record. Home Assistant \
-                     keeps a setting only in its raw states, ten days by default, and only if \
-                     the recorder includes it; give the offset as a number instead, e.g. \
-                     offset = -2"
-                )
-            })?;
-            (steps, Some(entity.clone()), *applied)
+    let candidates = states::entities_matching(conn, "number", &OFFSET_WORDS)?;
+    let entity = match find(sensor, &candidates).as_slice() {
+        [] => return Ok(None),
+        [one] => (*one).clone(),
+        several => {
+            return Ok(Some(Finding::Ambiguous(
+                several.iter().map(|id| (*id).clone()).collect(),
+            )));
         }
     };
+    let Some(steps) = Steps::from_history(&states::history(conn, &entity)?) else {
+        return Ok(Some(Finding::Unrecorded(entity)));
+    };
 
-    // Raw readings are what can show which way the offset is applied; a thermostat
-    // without any just goes unchecked.
+    // A thermostat without raw readings just goes unchecked.
     let check = if steps.changes().next().is_some() {
-        states::history(conn, &room.sensor).map_or(Check::Untested, |readings| {
-            check(&readings, &steps, applied)
-        })
+        states::history(conn, sensor).map_or(Check::Untested, |readings| check(&readings, &steps))
     } else {
         Check::Untested
     };
-    let assumed_before = steps
-        .recorded_from()
-        .filter(|from| loaded.first_ts.is_some_and(|first| first < *from));
-    loaded.samples = take_out(&loaded.samples, &steps, applied, loaded.conversion.scale);
+    let assumed_before =
+        Some(steps.first_ts()).filter(|from| loaded.first_ts.is_some_and(|first| first < *from));
+    loaded.samples = take_out(
+        &loaded.samples,
+        &steps,
+        check.applied(),
+        loaded.conversion.scale,
+    );
     Ok(Some(Finding::Corrected(Correction {
         entity,
         steps,
-        applied,
         check,
-        unit,
+        unit: loaded.unit.clone().unwrap_or_else(|| "°C".to_string()),
         assumed_before,
     })))
 }
@@ -403,6 +452,11 @@ mod tests {
         Steps::from_history(history).unwrap()
     }
 
+    /// One offset, in force since long before any reading.
+    fn constant(degrees: f64) -> Steps {
+        steps(&[(-1_000 * HOUR, degrees)])
+    }
+
     #[test]
     fn a_recorded_history_becomes_the_steps_it_changed_in() {
         let steps = steps(&[(100, -1.0), (200, -1.0), (300, -2.0), (400, -2.0)]);
@@ -411,14 +465,12 @@ mod tests {
             [(100, -1.0), (300, -2.0)],
             "restarts repeat a value"
         );
-        assert_eq!(steps.recorded_from(), Some(100));
+        assert_eq!(steps.first_ts(), 100);
         assert_eq!(steps.changes().collect::<Vec<_>>(), [(300, -1.0, -2.0)]);
         assert_eq!(steps.at(0), -1.0, "the first value is assumed before it");
         assert_eq!(steps.at(299), -1.0);
         assert_eq!(steps.at(300), -2.0);
         assert!(Steps::from_history(&[]).is_none());
-        assert_eq!(Steps::fixed(1.5).recorded_from(), None);
-        assert_eq!(Steps::fixed(1.5).at(i64::MIN), 1.5);
     }
 
     #[test]
@@ -428,7 +480,7 @@ mod tests {
             Sample::new(0, HOUR, 19.0),
             Sample::new(HOUR, 2 * HOUR, 19.5),
         ];
-        let corrected = take_out(&samples, &Steps::fixed(-2.0), Applied::Added, 1.0);
+        let corrected = take_out(&samples, &constant(-2.0), Applied::Added, 1.0);
         assert_eq!(
             corrected,
             [
@@ -437,7 +489,7 @@ mod tests {
             ]
         );
         // One that subtracts its offset of 2 reported the same 19 °C.
-        let corrected = take_out(&samples, &Steps::fixed(2.0), Applied::Subtracted, 1.0);
+        let corrected = take_out(&samples, &constant(2.0), Applied::Subtracted, 1.0);
         assert_eq!(corrected[0].value, 21.0);
     }
 
@@ -469,7 +521,7 @@ mod tests {
     fn a_fahrenheit_offset_is_taken_out_in_celsius() {
         // Readings converted from °F, so an offset of -3.6 °F is two degrees Celsius.
         let samples = [Sample::new(0, HOUR, 19.0)];
-        let corrected = take_out(&samples, &Steps::fixed(-3.6), Applied::Added, 5.0 / 9.0);
+        let corrected = take_out(&samples, &constant(-3.6), Applied::Added, 5.0 / 9.0);
         assert!((corrected[0].value - 21.0).abs() < 1e-12);
     }
 
@@ -489,29 +541,32 @@ mod tests {
     fn the_readings_say_which_way_the_offset_is_applied() {
         let at = 2 * HOUR;
         let steps = steps(&[(0, -1.0), (at, -2.0)]);
-        let added = readings(at, -1.0, -2.0, 1.0);
-        let subtracted = readings(at, -1.0, -2.0, -1.0);
+        let added = check(&readings(at, -1.0, -2.0, 1.0), &steps);
+        assert_eq!(added, Check::Added { changes: 1 });
+        assert_eq!(added.applied(), Applied::Added);
+
+        let subtracted = check(&readings(at, -1.0, -2.0, -1.0), &steps);
         assert_eq!(
-            check(&added, &steps, Applied::Added),
-            Check::Agrees { changes: 1 }
-        );
-        assert_eq!(
-            check(&subtracted, &steps, Applied::Subtracted),
-            Check::Agrees { changes: 1 }
-        );
-        assert_eq!(
-            check(&subtracted, &steps, Applied::Added),
-            Check::Disagrees {
-                change: (at, -1.0, -2.0),
-                moved: 1.0
+            subtracted,
+            Check::Subtracted {
+                changes: 1,
+                first: ((at, -1.0, -2.0), 1.0)
             }
         );
-        let unmoved: Vec<(i64, f64)> = (0..48).map(|index| (index * 300, 21.0)).collect();
+        assert_eq!(subtracted.applied(), Applied::Subtracted);
+
+        let still: Vec<(i64, f64)> = (0..48).map(|index| (index * 300, 21.0)).collect();
+        let unmoved = check(&still, &steps);
         assert_eq!(
-            check(&unmoved, &steps, Applied::Added),
+            unmoved,
             Check::Unmoved {
-                change: (at, -1.0, -2.0)
+                first: ((at, -1.0, -2.0), 0.0)
             }
+        );
+        assert_eq!(
+            unmoved.applied(),
+            Applied::Added,
+            "taken out as Zigbee says"
         );
     }
 
@@ -524,101 +579,118 @@ mod tests {
         readings.push((at - 2, 18.0));
         readings.sort_by_key(|(ts, _)| *ts);
         let steps = steps(&[(0, 0.0), (at, -2.0)]);
-        assert_eq!(
-            check(&readings, &steps, Applied::Added),
-            Check::Agrees { changes: 1 }
-        );
+        assert_eq!(check(&readings, &steps), Check::Added { changes: 1 });
     }
 
     #[test]
     fn nothing_to_judge_by_is_untested() {
         let readings = readings(2 * HOUR, -1.0, -2.0, 1.0);
-        assert_eq!(
-            check(&readings, &Steps::fixed(-2.0), Applied::Added),
-            Check::Untested,
-            "a fixed offset never changes"
-        );
+        assert_eq!(check(&readings, &constant(-2.0)), Check::Untested);
         let small = steps(&[(0, -1.0), (2 * HOUR, -1.2)]);
         assert_eq!(
-            check(&readings, &small, Applied::Added),
+            check(&readings, &small),
             Check::Untested,
             "a change smaller than the room's own drift proves nothing"
         );
         let unrecorded = steps(&[(0, -1.0), (100 * HOUR, -2.0)]);
         assert_eq!(
-            check(&readings, &unrecorded, Applied::Added),
+            check(&readings, &unrecorded),
             Check::Untested,
             "no readings around the change"
         );
+        assert_eq!(Check::Untested.applied(), Applied::Added);
     }
 
     #[test]
     fn changes_both_ways_are_mixed() {
         let steps = steps(&[(0, 0.0), (HOUR, -1.0), (3 * HOUR, 0.0)]);
-        let mut readings: Vec<(i64, f64)> = Vec::new();
-        for index in 0..48 {
-            let ts = index * 300 + 13;
-            // Moves with the first change and against the second.
-            let value = if ts < HOUR {
-                21.0
-            } else if ts < 3 * HOUR {
-                20.0
-            } else {
-                19.0
-            };
-            readings.push((ts, value));
-        }
+        let readings: Vec<(i64, f64)> = (0..48)
+            .map(|index| {
+                let ts = index * 300 + 13;
+                // Moves with the first change and against the second.
+                let value = if ts < HOUR {
+                    21.0
+                } else if ts < 3 * HOUR {
+                    20.0
+                } else {
+                    19.0
+                };
+                (ts, value)
+            })
+            .collect();
+        let mixed = check(&readings, &steps);
         assert_eq!(
-            check(&readings, &steps, Applied::Added),
+            mixed,
             Check::Mixed {
-                with: 1,
-                against: 1
+                added: 1,
+                subtracted: 1
             }
         );
+        assert_eq!(mixed.applied(), Applied::Added);
     }
 
     #[test]
-    fn a_thermostats_offset_is_found_by_the_words_they_share() {
+    fn a_thermostats_offset_is_the_setting_of_the_same_device() {
         let candidates: Vec<String> = [
-            "number.bad_heizkorper_temperature_offset",
-            "number.wohnzimmer_heizkorper_temperature_offset",
+            "number.bad_og_heizkorper_temperature_offset",
+            "number.bad_og_heizkorper_2_temperature_offset",
+            "number.bad_temperature_offset",
+            "number.bad_og_heizkorper_window_open_offset",
             "number.kuche_local_temperature_calibration",
+            "number.wohnzimmer_heizkorper_temperaturversatz",
         ]
         .map(String::from)
         .to_vec();
-        let suggest = |sensor| suggest(sensor, &candidates).map(String::as_str);
+        let find = |sensor| -> Vec<&str> {
+            find(sensor, &candidates)
+                .into_iter()
+                .map(String::as_str)
+                .collect()
+        };
         assert_eq!(
-            suggest("sensor.bad_og_heizkorper_temperature"),
-            Some("number.bad_heizkorper_temperature_offset")
+            find("sensor.bad_og_heizkorper_temperature"),
+            ["number.bad_og_heizkorper_temperature_offset"]
         );
         assert_eq!(
-            suggest("sensor.wohnzimmer_heizkorper_temperature"),
-            Some("number.wohnzimmer_heizkorper_temperature_offset")
+            find("sensor.bad_og_heizkorper_local_temperature"),
+            ["number.bad_og_heizkorper_temperature_offset"],
+            "the measurement's own words are not the device's"
         );
         assert_eq!(
-            suggest("sensor.kuche_temperature"),
-            Some("number.kuche_local_temperature_calibration")
+            find("sensor.kuche_temperature"),
+            ["number.kuche_local_temperature_calibration"]
         );
         assert_eq!(
-            suggest("sensor.bad_temperature"),
-            None,
-            "a plain thermometer in the same room shares too little"
+            find("sensor.wohnzimmer_heizkorper_temperature"),
+            ["number.wohnzimmer_heizkorper_temperaturversatz"]
         );
-        assert_eq!(suggest("sensor.office_temperature"), None);
+        assert_eq!(
+            find("sensor.bad_temperature"),
+            ["number.bad_temperature_offset"],
+            "and not the thermostat next to it, whose name only starts the same"
+        );
+        assert!(find("sensor.office_temperature").is_empty());
+        assert!(
+            find("sensor.temperature").is_empty(),
+            "no device name at all"
+        );
 
-        let twins: Vec<String> = ["number.bad_a_offset", "number.bad_b_offset"]
-            .map(String::from)
-            .to_vec();
-        assert_eq!(
-            super::suggest("sensor.bad_temperature", &twins),
-            None,
-            "two equally good matches are no match"
-        );
+        let both: Vec<String> = [
+            "number.bad_temperature_offset",
+            "number.bad_local_temperature_calibration",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(super::find("sensor.bad_temperature", &both).len(), 2);
     }
 
     /// A database with one thermostat reporting `reported` °C every hour for two days,
-    /// and the `(hours from the start, value)` its offset setting took.
-    fn thermostat(reported: f64, offsets: &[(i64, &str)]) -> (Connection, LoadedSamples) {
+    /// and the `(hour from the start, value)`s its offset setting `offset` took.
+    fn thermostat(
+        reported: f64,
+        offset: &str,
+        values: &[(i64, &str)],
+    ) -> (Connection, LoadedSamples) {
         use ha_testdb::{self as testdb, Flavour, ts};
         let conn = Connection::open_in_memory().unwrap();
         testdb::create_schema(&conn, Flavour::Modern);
@@ -635,10 +707,16 @@ mod tests {
                 Some(reported),
             );
         }
-        let offset = testdb::insert_states_meta(&conn, "number.bath_radiator_temperature_offset");
-        for (hour, value) in offsets {
-            let at = start + hour * HOUR;
-            testdb::insert_state(&conn, Flavour::Modern, "", offset, at, value);
+        let offset_id = testdb::insert_states_meta(&conn, offset);
+        for (hour, value) in values {
+            testdb::insert_state(
+                &conn,
+                Flavour::Modern,
+                "",
+                offset_id,
+                start + hour * HOUR,
+                value,
+            );
         }
         let loaded = ha_recorder::source::load(
             &conn,
@@ -659,136 +737,92 @@ mod tests {
         (conn, loaded)
     }
 
-    fn room(offset: Offset) -> Room {
-        Room {
-            name: "Bath".to_string(),
-            sensor: "sensor.bath_radiator_temperature".to_string(),
-            offset,
-        }
-    }
+    const SENSOR: &str = "sensor.bath_radiator_temperature";
+    const OFFSET: &str = "number.bath_radiator_temperature_offset";
 
     #[test]
-    fn a_named_setting_is_read_and_taken_back_out() {
-        let (conn, mut loaded) = thermostat(19.0, &[(12, "-2"), (30, "unavailable"), (31, "-2")]);
-        let entity = "number.bath_radiator_temperature_offset".to_string();
-        let finding = resolve(
-            &conn,
-            &room(Offset::Entity {
-                entity: entity.clone(),
-                applied: Applied::Added,
-            }),
-            &mut loaded,
-            &[],
-        )
-        .unwrap();
+    fn the_thermostats_offset_is_found_and_taken_back_out() {
+        let (conn, mut loaded) =
+            thermostat(19.0, OFFSET, &[(12, "-2"), (30, "unavailable"), (31, "-2")]);
+        let finding = resolve(&conn, SENSOR, &mut loaded).unwrap();
         let Some(Finding::Corrected(correction)) = finding else {
             panic!("{finding:?}");
         };
         assert!(loaded.samples.iter().all(|sample| sample.value == 21.0));
+        assert_eq!(correction.entity, OFFSET);
         assert_eq!(correction.values(), "-2 °C");
+        assert_eq!(correction.effect(), "raised by 2 °C");
         assert_eq!(correction.check, Check::Untested, "it never changed");
-        let from = ha_testdb::ts("2024-11-01 12:00:00");
-        assert_eq!(
-            correction.assumed_before,
-            Some(from),
-            "the first 12 hours rest on it"
-        );
         assert_eq!(
             correction.sentence(Tz::UTC),
-            "-2 °C from number.bath_radiator_temperature_offset (on record since 2024-11-01; \
-             the first value is assumed before that)"
+            "readings raised by 2 °C, taking out its thermostat's offset \
+             number.bath_radiator_temperature_offset (-2 °C), on record since 2024-11-01, and \
+             taken to have been the same before"
         );
     }
 
     #[test]
-    fn a_setting_with_nothing_on_record_is_an_error_that_says_what_to_do() {
-        let (conn, mut loaded) = thermostat(19.0, &[(3, "unavailable")]);
-        let error = resolve(
-            &conn,
-            &room(Offset::Entity {
-                entity: "number.bath_radiator_temperature_offset".to_string(),
-                applied: Applied::Added,
-            }),
-            &mut loaded,
-            &[],
-        )
-        .unwrap_err();
-        let text = format!("{error:#}");
-        assert!(text.contains("has no value on record"), "{text}");
-        assert!(text.contains("offset = -2"), "{text}");
-        assert!(loaded.samples.iter().all(|sample| sample.value == 19.0));
+    fn another_devices_setting_is_left_alone() {
+        let (conn, mut loaded) = thermostat(19.0, "number.bath_temperature_offset", &[(0, "-2")]);
+        let before = loaded.clone();
+        assert_eq!(resolve(&conn, SENSOR, &mut loaded).unwrap(), None);
+        assert_eq!(loaded, before);
     }
 
     #[test]
-    fn a_room_that_names_no_offset_is_only_given_a_suggestion() {
-        let (conn, mut loaded) = thermostat(19.0, &[(0, "-2")]);
+    fn a_setting_with_nothing_on_record_changes_nothing() {
+        let (conn, mut loaded) = thermostat(19.0, OFFSET, &[(3, "unavailable")]);
         let before = loaded.clone();
         assert_eq!(
-            resolve(&conn, &room(Offset::Unset), &mut loaded, &[]).unwrap(),
-            Some(Finding::Suggested(
-                "number.bath_radiator_temperature_offset".to_string()
-            ))
+            resolve(&conn, SENSOR, &mut loaded).unwrap(),
+            Some(Finding::Unrecorded(OFFSET.to_string()))
         );
-        assert_eq!(loaded, before, "nothing is taken out on a guess");
-        assert_eq!(
-            resolve(
-                &conn,
-                &room(Offset::Unset),
-                &mut loaded,
-                &["number.bath_radiator_temperature_offset"]
-            )
-            .unwrap(),
-            None,
-            "another room's offset is not suggested"
-        );
-        assert_eq!(
-            resolve(&conn, &room(Offset::Off), &mut loaded, &[]).unwrap(),
-            None
-        );
+        assert_eq!(loaded, before);
     }
 
     #[test]
-    fn a_fixed_offset_needs_nothing_from_the_database() {
-        let (conn, mut loaded) = thermostat(19.0, &[]);
-        let finding = resolve(
-            &conn,
-            &room(Offset::Fixed {
-                degrees: 1.5,
-                applied: Applied::Subtracted,
-            }),
-            &mut loaded,
-            &[],
-        )
-        .unwrap();
-        let Some(Finding::Corrected(correction)) = finding else {
-            panic!("{finding:?}");
-        };
-        assert!(loaded.samples.iter().all(|sample| sample.value == 20.5));
+    fn two_settings_that_both_fit_change_nothing() {
+        let (conn, mut loaded) = thermostat(19.0, OFFSET, &[(0, "-2")]);
+        ha_testdb::insert_states_meta(&conn, "number.bath_radiator_local_temperature_calibration");
+        let before = loaded.clone();
         assert_eq!(
-            correction.sentence(Tz::UTC),
-            "+1.5 °C, as the rooms file gives it"
+            resolve(&conn, SENSOR, &mut loaded).unwrap(),
+            Some(Finding::Ambiguous(vec![
+                "number.bath_radiator_local_temperature_calibration".to_string(),
+                OFFSET.to_string()
+            ]))
         );
+        assert_eq!(loaded, before);
     }
 
     #[test]
-    fn many_values_are_summed_up() {
-        let correction = |values: &[f64]| Correction {
-            entity: None,
+    fn effects_say_which_way_the_readings_moved() {
+        let correction = |values: &[f64], check: Check| Correction {
+            entity: OFFSET.to_string(),
             steps: Steps(
                 values
                     .iter()
                     .enumerate()
-                    .map(|(i, v)| (i as i64, *v))
+                    .map(|(index, value)| (index as i64, *value))
                     .collect(),
             ),
-            applied: Applied::Added,
-            check: Check::Untested,
+            check,
             unit: "°C".to_string(),
             assumed_before: None,
         };
-        assert_eq!(correction(&[-1.0, -2.0]).values(), "-1 °C, then -2 °C");
+        let added = correction(&[-1.0, -2.0], Check::Untested);
+        assert_eq!(added.values(), "-1 °C, then -2 °C");
+        assert_eq!(added.effect(), "raised by 1 °C, then raised by 2 °C");
+        let subtracted = Check::Subtracted {
+            changes: 1,
+            first: ((1, -1.0, -2.0), 1.0),
+        };
         assert_eq!(
-            correction(&[-1.0, -2.0, -1.5, -3.0, -2.5]).values(),
+            correction(&[-1.0, 0.0], subtracted).effect(),
+            "lowered by 1 °C, then left as they were"
+        );
+        assert_eq!(
+            correction(&[-1.0, -2.0, -1.5, -3.0, -2.5], Check::Untested).values(),
             "-1 °C, then 3 more, then -2.5 °C"
         );
     }

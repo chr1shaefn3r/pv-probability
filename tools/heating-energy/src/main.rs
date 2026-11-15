@@ -21,7 +21,7 @@ use heating_energy::daily::{DayMean, daily_means};
 use heating_energy::degree::{Analysis, analyse};
 use heating_energy::offset::{self, Check, Correction, Finding, format_offset, local_stamp};
 use heating_energy::report::{ReportOptions, format_celsius, format_degree_days, page};
-use heating_energy::rooms::{Applied, House, Offset, Room};
+use heating_energy::rooms::House;
 
 fn main() {
     if let Err(error) = run() {
@@ -67,24 +67,17 @@ fn run() -> Result<()> {
                 .map(|(floor, room)| (room.sensor.as_str(), Some((floor, room)))),
         );
     }
-    // A room's thermostat offset is taken back out in the room's own task, before its
-    // days are counted.
-    let named_offsets: Vec<&str> = house
-        .iter()
-        .flat_map(House::rooms)
-        .filter_map(|(_, room)| match &room.offset {
-            Offset::Entity { entity, .. } => Some(entity.as_str()),
-            _ => None,
-        })
-        .collect();
+    // A room's thermostat offset is looked for and taken back out in the room's own task,
+    // before its days are counted.
     let read_all: Vec<Result<Thermometer>> = thermometers
         .par_iter()
         .map(|(entity, room)| {
             let (loaded, finding) = match room {
-                Some((floor, room)) => read_room(&args, &config, room, &named_offsets)
-                    .with_context(|| {
+                Some((floor, room)) => {
+                    read_room(&args, &config, &room.sensor).with_context(|| {
                         format!("reading the thermometer of {} / {}", floor.name, room.name)
-                    })?,
+                    })?
+                }
                 None => (read(&args, &config, entity)?, None),
             };
             let days = daily_means(&loaded.samples, tz);
@@ -178,7 +171,7 @@ fn run() -> Result<()> {
                     Finding::Corrected(correction) => {
                         Some((label.clone(), correction.sentence(tz)))
                     }
-                    Finding::Suggested(_) => None,
+                    Finding::Ambiguous(_) | Finding::Unrecorded(_) => None,
                 })
                 .collect(),
         },
@@ -212,16 +205,15 @@ fn read(args: &Args, config: &Config, entity: &str) -> Result<LoadedSamples> {
     load_thermometer(&conn, args, config, entity)
 }
 
-/// Load a room's thermometer and take its offset back out, if the rooms file says to.
+/// Load a room's thermometer, and take its thermostat's offset back out if it has one.
 fn read_room(
     args: &Args,
     config: &Config,
-    room: &Room,
-    named_offsets: &[&str],
+    sensor: &str,
 ) -> Result<(LoadedSamples, Option<Finding>)> {
     let conn = source::open_database(&args.recorder.db)?;
-    let mut loaded = load_thermometer(&conn, args, config, &room.sensor)?;
-    let finding = offset::resolve(&conn, room, &mut loaded, named_offsets)?;
+    let mut loaded = load_thermometer(&conn, args, config, sensor)?;
+    let finding = offset::resolve(&conn, sensor, &mut loaded)?;
     Ok((loaded, finding))
 }
 
@@ -311,34 +303,41 @@ fn report(args: &Args, analysis: &Analysis, house: Option<&House>, bytes: usize,
     }
 }
 
-/// What became of every room's offset, as lines for the terminal: what was taken out,
-/// what the readings say about it, and what looks like an offset nobody named.
+/// What became of every room's thermostat offset, as lines for the terminal: what was
+/// taken out and by how much, and what the readings say about which way.
 fn finding_lines(findings: &[(String, Finding)], tz: Tz) -> Vec<String> {
     let mut lines = Vec::new();
     for (label, finding) in findings {
         match finding {
             Finding::Corrected(correction) => {
                 lines.push(format!(
-                    "offset: {label}: {} taken back out, {}",
-                    correction.values(),
-                    correction.source(tz)
+                    "offset: {label}: readings {} to take out its thermostat's offset {} ({})",
+                    correction.effect(),
+                    correction.entity,
+                    correction.values()
                 ));
-                if let Some(line) = check_line(label, correction, tz) {
-                    lines.push(line);
+                if let Some(since) = correction.since(tz) {
+                    lines.push(format!("  the offset is {since}"));
                 }
+                lines.push(check_line(label, correction, tz));
             }
-            Finding::Suggested(entity) => lines.push(format!(
-                "note: {label}: {entity} looks like its thermostat's offset; add offset = \
-                 \"{entity}\" to the room to take it back out, or offset = false to keep the \
-                 reading as it is"
+            Finding::Ambiguous(entities) => lines.push(format!(
+                "note: {label}: {} all look like its thermostat's offset, so none is taken out",
+                entities.join(", ")
+            )),
+            Finding::Unrecorded(entity) => lines.push(format!(
+                "note: {label}: its thermostat's offset {entity} has no value on record - Home \
+                 Assistant keeps settings only in its raw states, ten days by default - so its \
+                 readings are used as reported"
             )),
         }
     }
     lines
 }
 
-/// What the raw readings say about which way a room's offset is applied.
-fn check_line(label: &str, correction: &Correction, tz: Tz) -> Option<String> {
+/// What the raw readings say about which way a room's offset is applied, and so how it
+/// was taken out.
+fn check_line(label: &str, correction: &Correction, tz: Tz) -> String {
     let unit = &correction.unit;
     let change = |(at, from, to): (i64, f64, f64)| {
         format!(
@@ -348,40 +347,43 @@ fn check_line(label: &str, correction: &Correction, tz: Tz) -> Option<String> {
             local_stamp(at, tz)
         )
     };
-    let other = match correction.applied {
-        Applied::Added => Applied::Subtracted,
-        Applied::Subtracted => Applied::Added,
+    let times = |count: usize| {
+        if count == 1 {
+            "once".to_string()
+        } else {
+            format!("{count} times")
+        }
     };
     match &correction.check {
-        Check::Agrees { changes } => Some(format!(
-            "  checked: the reading moved with the offset at {changes} recorded change{}, as an \
-             offset that is {} should",
-            if *changes == 1 { "" } else { "s" },
-            correction.applied.name()
-        )),
-        Check::Untested if correction.entity.is_some() => Some(format!(
-            "  not checked: no change of the offset is on record with readings around it, so \
-             it is taken to be {} (offset_applied)",
-            correction.applied.name()
-        )),
-        Check::Untested => None,
-        Check::Disagrees { change: at, moved } => Some(format!(
-            "warning: {label}: when its offset {}, the reading moved by {} - the other way: \
-             this thermostat seems to have it {}; set offset_applied = \"{}\" for the room",
+        Check::Added { changes } => format!(
+            "  checked: the reading moved with the offset when it changed ({}), so the \
+             thermostat adds it to what it measures",
+            times(*changes)
+        ),
+        Check::Subtracted {
+            changes,
+            first: (at, moved),
+        } => format!(
+            "  checked: when the offset {}, the reading moved by {} - the other way ({}), so \
+             this thermostat subtracts it from what it measures, and it is taken out that way",
             change(*at),
             format_offset(*moved, unit),
-            other.name(),
-            other.name()
-        )),
-        Check::Unmoved { change: at } => Some(format!(
-            "warning: {label}: the reading did not move when its offset {}: it may be recorded \
-             without the offset, in which case the room wants offset = false",
+            times(*changes)
+        ),
+        Check::Untested => "  not checked: the offset has not changed while raw readings were \
+             kept, so it is taken to be added to what the thermostat measures, as Zigbee and \
+             Matter thermostats do"
+            .to_string(),
+        Check::Unmoved { first: (at, _) } => format!(
+            "warning: {label}: the reading did not move when its offset {}, as though it were \
+             recorded without it; it is taken out all the same",
             change(*at)
-        )),
-        Check::Mixed { with, against } => Some(format!(
-            "warning: {label}: the reading moved with the offset at {with} of its changes and \
-             against it at {against}; check offset_applied"
-        )),
+        ),
+        Check::Mixed { added, subtracted } => format!(
+            "warning: {label}: the reading moved with the offset at {added} of its changes and \
+             against it at {subtracted}; it is taken to be added, as Zigbee and Matter \
+             thermostats do"
+        ),
     }
 }
 

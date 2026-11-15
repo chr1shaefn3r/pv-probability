@@ -350,13 +350,13 @@ fn a_broken_rooms_file_is_reported_before_anything_is_read() {
 
 /// The thermostat on the bathroom radiator, as Home Assistant names it.
 const THERMOSTAT: &str = "sensor.bad_og_heizkorper_temperature";
-/// Its offset setting, named from the device before it was renamed.
-const THERMOSTAT_OFFSET: &str = "number.bad_heizkorper_temperature_offset";
+/// Its offset setting: another entity of the same device.
+const THERMOSTAT_OFFSET: &str = "number.bad_og_heizkorper_temperature_offset";
 
-/// Ten days at 5 °C outside, the thermostat reporting 19 °C every hour, its offset
-/// setting taking the `(hour, value)`s given, and, if asked, raw readings every five
+/// Ten days at 5 °C outside, the thermostat reporting 19 °C every hour, an offset setting
+/// `offset` taking the `(hour, value)`s given, and, if asked, raw readings every five
 /// minutes that move the way a thermostat applying its offset with `sign` would.
-fn thermostat_database(path: &Path, offsets: &[(i64, &str)], raw_sign: Option<f64>) {
+fn thermostat_database(path: &Path, offset: &str, values: &[(i64, &str)], raw_sign: Option<f64>) {
     let conn = Connection::open(path).unwrap();
     testdb::create_schema(&conn, Flavour::Modern);
     let start = ts("2024-01-01 00:00:00");
@@ -373,14 +373,14 @@ fn thermostat_database(path: &Path, offsets: &[(i64, &str)], raw_sign: Option<f6
             );
         }
     }
-    let offset_id = testdb::insert_states_meta(&conn, THERMOSTAT_OFFSET);
-    for (hour, value) in offsets {
+    let offset_id = testdb::insert_states_meta(&conn, offset);
+    for (hour, value) in values {
         let at = start + hour * 3_600;
         testdb::insert_state(&conn, Flavour::Modern, "", offset_id, at, value);
     }
     if let Some(sign) = raw_sign {
         let sensor_id = testdb::insert_states_meta(&conn, THERMOSTAT);
-        let steps: Vec<(i64, f64)> = offsets
+        let steps: Vec<(i64, f64)> = values
             .iter()
             .filter_map(|(hour, value)| Some((start + hour * 3_600, value.parse().ok()?)))
             .collect();
@@ -397,15 +397,12 @@ fn thermostat_database(path: &Path, offsets: &[(i64, &str)], raw_sign: Option<f6
     }
 }
 
-/// Run the binary on `db` with one room on one floor, `extra` written into its entry.
-fn bathroom(scratch: &Scratch, db: &Path, extra: &str) -> (String, String, String) {
+/// Run the binary on `db` with the thermostat as the only room.
+fn bathroom(scratch: &Scratch, db: &Path) -> (String, String) {
     let rooms = scratch.path("rooms.toml");
     std::fs::write(
         &rooms,
-        format!(
-            "[[floor]]\nname = \"Upstairs\"\nrooms = [{{ name = \"Bath\", sensor = \
-             \"{THERMOSTAT}\"{extra} }}]\n"
-        ),
+        format!("[[floor]]\nname = \"Upstairs\"\nrooms = [{{ name = \"Bath\", sensor = \"{THERMOSTAT}\" }}]\n"),
     )
     .unwrap();
     let out = scratch.path("report.html");
@@ -422,99 +419,105 @@ fn bathroom(scratch: &Scratch, db: &Path, extra: &str) -> (String, String, Strin
         out.as_os_str(),
     ]);
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    assert!(output.status.success(), "{stdout}{stderr}");
-    (stdout, stderr, std::fs::read_to_string(out).unwrap())
+    assert!(
+        output.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (stdout, std::fs::read_to_string(out).unwrap())
 }
 
 #[test]
-fn a_thermostats_offset_is_taken_back_out() {
+fn a_thermostats_offset_is_found_and_taken_back_out_and_said_so() {
     let scratch = Scratch::new("offset");
     let db = scratch.path("ha.db");
-    thermostat_database(&db, &[(48, "-2"), (100, "unavailable"), (101, "-2")], None);
-
-    let (stdout, _, html) = bathroom(
-        &scratch,
+    thermostat_database(
         &db,
-        &format!(", offset = \"{THERMOSTAT_OFFSET}\""),
+        THERMOSTAT_OFFSET,
+        &[(48, "-2"), (100, "unavailable"), (101, "-2")],
+        None,
     );
+
+    let (stdout, html) = bathroom(&scratch, &db);
     assert!(stdout.contains("indoors: Upstairs 21 °C"), "{stdout}");
     assert!(
         stdout.contains(
-            "offset: Upstairs / Bath: -2 °C taken back out, from \
-             number.bad_heizkorper_temperature_offset (on record since 2024-01-03; the first \
-             value is assumed before that)"
+            "offset: Upstairs / Bath: readings raised by 2 °C to take out its thermostat's \
+             offset number.bad_og_heizkorper_temperature_offset (-2 °C)"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "the offset is on record since 2024-01-03, and taken to have been the same before"
         ),
         "{stdout}"
     );
     assert!(stdout.contains("not checked"), "{stdout}");
     assert!(
-        html.contains("<strong>Upstairs / Bath</strong> is shown with its thermostat's offset taken back out, as it measured rather than as it reported: -2 °C from number.bad_heizkorper_temperature_offset"),
+        html.contains(
+            "<strong>Upstairs / Bath</strong> is shown as its thermostat measured rather than as \
+             it reported: readings raised by 2 °C"
+        ),
         "the report says so too"
     );
-
-    // A fixed value needs nothing from the database.
-    let (stdout, _, _) = bathroom(
-        &scratch,
-        &db,
-        ", offset = 1.5, offset_applied = \"subtracted\"",
-    );
-    assert!(stdout.contains("indoors: Upstairs 20.5 °C"), "{stdout}");
 }
 
 #[test]
-fn a_room_that_names_no_offset_is_pointed_to_the_one_that_looks_like_it() {
-    let scratch = Scratch::new("offset-suggested");
+fn another_devices_offset_is_left_alone() {
+    let scratch = Scratch::new("offset-other-device");
     let db = scratch.path("ha.db");
-    thermostat_database(&db, &[(0, "-2")], None);
-
-    let (stdout, _, html) = bathroom(&scratch, &db, "");
-    assert!(
-        stdout.contains("indoors: Upstairs 19 °C"),
-        "nothing changes on a guess"
+    thermostat_database(
+        &db,
+        "number.bad_heizkorper_temperature_offset",
+        &[(0, "-2")],
+        None,
     );
-    assert!(
-        stdout.contains(
-            "note: Upstairs / Bath: number.bad_heizkorper_temperature_offset looks like its \
-             thermostat's offset"
-        ),
-        "{stdout}"
-    );
-    assert!(!html.contains("offset taken back out"));
 
-    let (stdout, _, _) = bathroom(&scratch, &db, ", offset = false");
+    let (stdout, html) = bathroom(&scratch, &db);
+    assert!(stdout.contains("indoors: Upstairs 19 °C"), "{stdout}");
+    assert!(!stdout.contains("offset:"), "{stdout}");
     assert!(!stdout.contains("note:"), "{stdout}");
+    assert!(!html.contains("as its thermostat measured"));
 }
 
 #[test]
-fn a_thermostat_applying_its_offset_the_other_way_round_is_caught() {
+fn a_thermostat_subtracting_its_offset_is_read_from_its_readings() {
     let scratch = Scratch::new("offset-direction");
     let db = scratch.path("ha.db");
-    // Changed from -1 to -2 at hour 100; the readings rise by one degree when it does.
-    thermostat_database(&db, &[(0, "-1"), (100, "-2")], Some(-1.0));
+    // Changed from -1 to -2 at hour 100, and the readings rose by one degree when it was:
+    // this thermostat reports what it measures minus its offset.
+    thermostat_database(
+        &db,
+        THERMOSTAT_OFFSET,
+        &[(0, "-1"), (100, "-2")],
+        Some(-1.0),
+    );
 
-    let entry = format!(", offset = \"{THERMOSTAT_OFFSET}\"");
-    let (stdout, _, _) = bathroom(&scratch, &db, &entry);
+    let (stdout, _) = bathroom(&scratch, &db);
     assert!(
         stdout.contains(
-            "warning: Upstairs / Bath: when its offset went from -1 °C to -2 °C at 2024-01-05 \
-             04:00, the reading moved by +1 °C"
+            "checked: when the offset went from -1 °C to -2 °C at 2024-01-05 04:00, the reading \
+             moved by +1 °C - the other way (once), so this thermostat subtracts it"
         ),
         "{stdout}"
     );
     assert!(
-        stdout.contains("set offset_applied = \"subtracted\""),
+        stdout.contains("readings lowered by 1 °C, then lowered by 2 °C"),
         "{stdout}"
     );
-
-    let (stdout, _, _) = bathroom(
-        &scratch,
-        &db,
-        &format!("{entry}, offset_applied = \"subtracted\""),
-    );
     assert!(!stdout.contains("warning:"), "{stdout}");
+
+    // One that adds it moves with it, and is said to.
+    let db = scratch.path("adds.db");
+    thermostat_database(&db, THERMOSTAT_OFFSET, &[(0, "-1"), (100, "-2")], Some(1.0));
+    let (stdout, _) = bathroom(&scratch, &db);
     assert!(
-        stdout.contains("checked: the reading moved with the offset at 1 recorded change"),
+        stdout.contains("checked: the reading moved with the offset when it changed (once)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("readings raised by 1 °C, then raised by 2 °C"),
         "{stdout}"
     );
 }

@@ -452,8 +452,8 @@ fn rooms_section(analysis: &Analysis, house: &House, notes: &[(String, String)])
     for (room, note) in notes {
         let _ = write!(
             html,
-            "<p class=\"note\"><strong>{}</strong> is shown with its thermostat's offset taken \
-             back out, as it measured rather than as it reported: {}.</p>",
+            "<p class=\"note\"><strong>{}</strong> is shown as its thermostat measured rather \
+             than as it reported: {}.</p>",
             escape(room),
             escape(note)
         );

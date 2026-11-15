@@ -9,9 +9,9 @@
 //! 4. [`report`] writes it all out as a self-contained HTML page, in the shell every
 //!    report shares.
 //!
-//! [`rooms`] reads the house - its floors, rooms and thermometers - from a TOML file,
-//! and [`offset`] takes a thermostat's own offset back out of its readings where a room
-//! asks for that.
+//! [`rooms`] reads the house - its floors, rooms and thermometers - from a TOML file.
+//! Where a room's thermometer is a thermostat with an offset setting beside it,
+//! [`offset`] takes that offset back out of its readings.
 
 pub mod cli;
 pub mod daily;
