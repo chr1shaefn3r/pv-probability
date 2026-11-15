@@ -136,8 +136,8 @@ nothing to configure:
 
 Give it the heating's energy as a running total - a meter in kWh, read on the last day of
 every month, and as often between as you like - and it takes what the total grew by over
-every month, plots it against the month's heating degree days, and fits a straight line
-through them:
+every month, takes off what heating water took, plots the rest against the month's heating
+degree days, and fits a straight line through them:
 
 ```sh
 heating-energy --db ha.db --outside-entity sensor.outdoor_temperature \
@@ -145,22 +145,21 @@ heating-energy --db ha.db --outside-entity sensor.outdoor_temperature \
 ```
 
 ```
-efficiency: 2.47 kWh per heating degree day (± 0.06), and 376 kWh a month without heating - a line through 22 months of number.heizol_energy
-  2022/23: 2.38 kWh per degree day (± 0.05) over 5 months
-  2023/24: 2.57 kWh per degree day (± 0.04) over 12 months, 8% more than 2022/23
-  2024/25: 2.08 kWh per degree day (± 0.02) over 5 months, 19% less than 2023/24
+efficiency: 2.50 kWh per heating degree day (± 0.06), once water heating of 389 kWh a month on average is taken off - a line through 22 months of number.heizol_energy
+  2022/23: 2.43 kWh per degree day (± 0.01) over 5 months; water heating 379 kWh a month, 2023/24's
+  2023/24: 2.57 kWh per degree day (± 0.03) over 12 months, 6% more than 2022/23; water heating 379 kWh a month, from July 2023, August 2023 and June 2024
+  2024/25: 2.10 kWh per degree day (± 0.03) over 5 months, 18% less than 2023/24; water heating 399 kWh a month, from July 2024, August 2024 and September 2024
 ```
 
-![Monthly heating energy against monthly degree days, and kWh per degree day per season](docs/energy-light.png)
+![Monthly heating energy, water heating taken off, against monthly degree days, and kWh per degree day per season](docs/energy-light.png)
 
 The **slope** is the house's efficiency figure: the energy one more heating degree day
 costs. The weather only moves a month along the line, so insulation, new windows or a
 boiler tune-up show as a lower slope however cold the winter was. (The example is the demo
-database with a made-up meter added, for a house insulated in the summer of 2024.) Where
-the line meets zero degree days is what the house uses a month **without heating**: hot
-water, standby losses. The report shows the months and the line, the slope of every
-heating season (July to June, so a winter is never split) as a bar with its standard
-error, and a table of both.
+database with a made-up meter added, for a house insulated in the summer of 2024.) The
+report shows the months and the line, the slope of every heating season (July to June, so
+a winter is never split) as a bar with its standard error, and a table of both with every
+season's water heating.
 
 * **A month's energy is the total at its end less the total at its start**, both taken at
   local midnight as the month turns. Readings in between change nothing, so reading the
@@ -169,6 +168,14 @@ error, and a table of both.
 * **A reading on the 1st still closes the month before** when the meter was not read on
   its last day, and a value brought down on the 1st puts right the one before it. So a
   month counts once the 1st after it is over.
+* **Water heating is taken off first.** It does not follow the weather, so it would only
+  blur the line: what a season's three warmest months from May to September - by the
+  outside thermometer - used a day, with the heating off, is taken off every day of that
+  season, and the line goes through the heating energy left. A meter for heating alone
+  shows next to nothing in summer, so next to nothing is taken off. A season with fewer than three such months on record - the
+  first, starting in January, or the current one before September is over - takes the
+  nearest season's. With none anywhere, water heating stays in, and the run says so and
+  gives what the line's base holds: what the house uses a month without heating.
 * **A month needs its weather.** One the outside thermometer missed a day or two of has
   its degree days scaled up to the whole month, since the energy covers all of it; one
   missing more than a tenth is left out.

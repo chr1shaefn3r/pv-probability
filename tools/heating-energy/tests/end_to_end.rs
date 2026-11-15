@@ -657,9 +657,10 @@ fn days_only_some_thermometers_covered_rest_on_those_and_are_counted() {
 /// The heating's energy as a running total, as Home Assistant names it.
 const HEATING_ENERGY: &str = "number.heizol_energy";
 
-/// Outside in 2024, every month at its own steady temperature below the heating base.
+/// Outside in 2024, every month at its own steady temperature: June to September at or
+/// above the heating base.
 const MONTHLY_TEMPERATURES: [f64; 12] = [
-    0.0, 2.0, 5.0, 9.0, 13.0, 14.5, 14.0, 13.5, 12.0, 10.0, 5.0, 1.0,
+    0.0, 2.0, 5.0, 9.0, 13.0, 17.0, 19.0, 18.0, 15.5, 10.0, 5.0, 1.0,
 ];
 
 /// 2024 hour by hour outside, at [`MONTHLY_TEMPERATURES`], and the 1st of January 2025,
@@ -689,15 +690,15 @@ fn temperature_at(ts: i64) -> f64 {
     MONTHLY_TEMPERATURES[month]
 }
 
-/// The running total at `at`, for a house using two kWh per heating degree day and
-/// nothing more since the start of 2024, from 10,000 kWh: every month's energy lies
-/// exactly on the line.
+/// The running total at `at`, for a house heating at two kWh per heating degree day and
+/// heating ten kWh of water a day since the start of 2024, from 10,000 kWh: once the water
+/// heating is taken off, every month lies exactly on the line.
 fn total_at(at: i64) -> f64 {
     let mut total = 10_000.0;
     let mut day = ts("2024-01-01 00:00:00");
     while day < at {
         let share = (at - day).min(86_400) as f64 / 86_400.0;
-        total += share * 2.0 * (15.0f64 - temperature_at(day)).max(0.0);
+        total += share * (2.0 * (15.0f64 - temperature_at(day)).max(0.0) + 10.0);
         day += 86_400;
     }
     total
@@ -767,14 +768,27 @@ fn a_monthly_meter_gives_the_houses_kwh_per_degree_day() {
     raw_states(&conn, &month_starts());
 
     let (stdout, stderr, html) = with_energy(&scratch, &conn, HEATING_ENERGY);
+    let lines = efficiency_lines(&stdout);
+    assert_eq!(lines.len(), 3, "{stdout}");
     assert_eq!(
-        efficiency_lines(&stdout),
-        [
-            "efficiency: 2.00 kWh per heating degree day (± 0.00), and 0 kWh a month without \
-             heating - a line through 12 months of number.heizol_energy",
-            "  2023/24: 2.00 kWh per degree day (± 0.00) over 6 months",
-            "  2024/25: 2.00 kWh per degree day (± 0.00) over 6 months, 0% more than 2023/24",
-        ],
+        lines[0],
+        "efficiency: 2.00 kWh per heating degree day (± 0.00), once water heating of 307 kWh a \
+         month on average is taken off - a line through 12 months of number.heizol_energy"
+    );
+    // January to June has no summer of its own on record.
+    assert_eq!(
+        lines[1],
+        "  2023/24: 2.00 kWh per degree day (± 0.00) over 6 months; water heating 307 kWh a \
+         month, 2024/25's"
+    );
+    assert!(
+        lines[2].starts_with("  2024/25: 2.00 kWh per degree day (± 0.00) over 6 months, 0% "),
+        "{stdout}"
+    );
+    assert!(
+        lines[2].ends_with(
+            "; water heating 307 kWh a month, from July 2024, August 2024 and September 2024"
+        ),
         "{stdout}"
     );
     assert!(
@@ -784,11 +798,16 @@ fn a_monthly_meter_gives_the_houses_kwh_per_degree_day() {
     assert!(html.contains("<h2>Heating energy</h2>"));
     assert!(html.contains("<strong>2.00 kWh</strong> per heating degree day"));
     assert_eq!(html.matches("class=\"dot\"").count(), 12);
-    // 31 days of 15 degree days each, at two kWh apiece.
+    assert!(html.contains("once water heating of <strong>307 kWh a month</strong> is taken off"));
+    // 31 days of 15 degree days each at two kWh apiece, and of ten kWh of water heating.
     assert!(
-        html.contains("<th scope=\"row\">January 2024</th><td>930 kWh</td><td>465</td>"),
+        html.contains(
+            "<th scope=\"row\">January 2024</th><td>1,240 kWh</td><td>310 kWh</td>\
+             <td>930 kWh</td><td>465</td>"
+        ),
         "{html}"
     );
+    assert!(html.contains("<td>310 kWh, one of the warmest</td>"));
 }
 
 #[test]
@@ -822,11 +841,15 @@ fn a_month_not_read_is_named_and_left_out_with_the_one_after() {
     raw_states(&conn, &times);
 
     let (stdout, _, html) = with_energy(&scratch, &conn, HEATING_ENERGY);
+    assert!(stdout.contains("a line through 10 months"), "{stdout}");
+    // With July and August out, 2024/25 has one warm month left, and 2023/24 two.
     assert!(
-        stdout.contains("2.00 kWh per heating degree day (± 0.00)"),
+        stdout.contains(
+            "note: water heating is left in number.heizol_energy: no season has three months \
+             from May to September on record to tell it by"
+        ),
         "{stdout}"
     );
-    assert!(stdout.contains("a line through 10 months"), "{stdout}");
     assert!(
         stdout.contains(
             "note: July 2024 of number.heizol_energy left out of the fit: the total did not \

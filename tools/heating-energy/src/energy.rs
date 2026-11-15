@@ -2,14 +2,15 @@
 //!
 //! The heating's energy comes as a running total in kWh - a meter, read at the end of every
 //! month or more often - and what it grew by from one month's end to the next is that
-//! month's heating energy. Plot every month's energy against its heating degree days and
-//! the months fall along a straight line. Its slope, in kWh per degree day, is the house's
+//! month's energy. Part of it heats water, which the weather does not move: what a season's
+//! warmest months used, with the heating off, is taken off every month of it first. Plot
+//! every month's heating energy against its heating degree days and the months fall along
+//! a straight line. Its slope, in kWh per degree day, is the house's
 //! efficiency figure: the weather only moves a month along the line, so insulation, new
-//! windows or a boiler tune-up show as a lower slope however cold the winter was. Where the
-//! line meets zero degree days is what the house uses a month without heating - hot water,
-//! standby losses.
+//! windows or a boiler tune-up show as a lower slope however cold the winter was.
 
 use std::collections::BTreeMap;
+use std::ops::RangeInclusive;
 
 use chrono::{Datelike, NaiveDate, NaiveTime, TimeZone};
 use chrono_tz::Tz;
@@ -31,6 +32,14 @@ pub const MIN_FIT_MONTHS: usize = 3;
 /// line can be fitted along: months that all asked for the same heat say nothing about
 /// what it costs.
 const MIN_SPREAD: f64 = 15.0;
+
+/// How many of a season's warmest months tell what its water heating takes: three, as
+/// the report and the run spell it out.
+pub const WATER_MONTHS: usize = 3;
+
+/// The months a season's warmest are taken from, May to September: a season with no summer
+/// on record has no month the heating is surely off in.
+const SUMMER: RangeInclusive<u32> = 5..=9;
 
 /// A calendar month.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -156,9 +165,13 @@ pub struct MonthPoint {
     pub counted_days: u32,
     /// Heating degree days over the counted days.
     pub hdd: f64,
+    /// Mean outside temperature over the counted days, in °C.
+    pub outside_mean: Option<f64>,
     /// Whether the total did not change over the month before: a reading missed there
     /// leaves both months' energy in this one.
     pub follows_unchanged: bool,
+    /// The water heating taken off its energy, in kWh: its season's a day, every day.
+    pub water_kwh: f64,
 }
 
 /// Why a month is not in the fit.
@@ -194,6 +207,20 @@ impl MonthPoint {
         self.left_out().is_none()
     }
 
+    /// Whether its energy is sound, fitted or not: the total grew over it, and not by
+    /// another month's energy too.
+    pub fn has_energy(&self) -> bool {
+        !matches!(
+            self.left_out(),
+            Some(LeftOut::WentDown | LeftOut::Unchanged | LeftOut::AfterUnchanged)
+        )
+    }
+
+    /// Its energy with the water heating taken off.
+    pub fn heating_kwh(&self) -> f64 {
+        self.kwh - self.water_kwh
+    }
+
     /// The month's heating degree days over all its days: the counted ones, scaled up by
     /// the days that went uncounted.
     pub fn whole_month_hdd(&self) -> f64 {
@@ -204,12 +231,13 @@ impl MonthPoint {
     }
 }
 
-/// A straight line through months: `kWh = slope × heating degree days + base`.
+/// A straight line through months: `heating kWh = slope × heating degree days + base`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Fit {
     /// kWh per heating degree day: the efficiency figure.
     pub slope: f64,
-    /// kWh a month with no heating degree days at all would use.
+    /// Heating kWh a month with no heating degree days at all would use: near nothing,
+    /// once the water heating is taken off.
     pub base: f64,
     /// Share of the months' spread in energy the line accounts for, 0 to 1.
     pub r_squared: f64,
@@ -260,6 +288,20 @@ pub fn fit(points: &[(f64, f64)]) -> Option<Fit> {
     })
 }
 
+/// What heating water takes, as a season's warmest months tell it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Water {
+    /// kWh a day, taken off every day of the season.
+    pub per_day: f64,
+    /// What the warmest months used on average, in kWh a month.
+    pub per_month: f64,
+    /// The warmest months it was taken from, in order.
+    pub months: Vec<Month>,
+    /// The season those months belong to: the season's own, or the nearest one's when it
+    /// has no summer of its own on record.
+    pub from_season: i32,
+}
+
 /// One heating season, July to June.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Season {
@@ -268,19 +310,23 @@ pub struct Season {
     pub months: usize,
     /// Of those, the months fitted.
     pub fitted: usize,
+    /// Heating energy, the water heating taken off, over the months whose energy is sound.
     pub kwh: f64,
+    /// What heating water takes in it, if any season tells.
+    pub water: Option<Water>,
     pub fit: Option<Fit>,
 }
 
 impl Season {
     /// `2023/24`.
     pub fn label(&self) -> String {
-        format!(
-            "{}/{:02}",
-            self.start_year,
-            (self.start_year + 1).rem_euclid(100)
-        )
+        season_label(self.start_year)
     }
+}
+
+/// `2023/24` for the season starting in July 2023.
+pub fn season_label(start_year: i32) -> String {
+    format!("{}/{:02}", start_year, (start_year + 1).rem_euclid(100))
 }
 
 /// Everything the report and the terminal say about heating energy.
@@ -298,6 +344,9 @@ pub struct Energy {
     /// Whole months the total was read over that the outside thermometer's record does not
     /// reach.
     pub beyond_record: usize,
+    /// What water heating took in a month, on average over every season that tells it from
+    /// its own warmest months.
+    pub water_per_month: Option<f64>,
 }
 
 impl Energy {
@@ -307,12 +356,44 @@ impl Energy {
     }
 }
 
-/// Take every whole month's energy from the total at its start and its end, put it beside
-/// the month's heating degree days, and fit the lines.
+/// A season's water heating from its own warmest months: the [`WATER_MONTHS`] warmest from
+/// May to September with a sound energy figure, if it has that many.
+fn own_water(months: &[MonthPoint], start_year: i32) -> Option<Water> {
+    let mut warm: Vec<&MonthPoint> = months
+        .iter()
+        .filter(|point| {
+            point.month.season() == start_year
+                && SUMMER.contains(&point.month.month)
+                && point.is_fitted()
+                && point.outside_mean.is_some()
+        })
+        .collect();
+    if warm.len() < WATER_MONTHS {
+        return None;
+    }
+    let mean = |point: &MonthPoint| point.outside_mean.unwrap_or(f64::NEG_INFINITY);
+    warm.sort_by(|a, b| mean(b).total_cmp(&mean(a)));
+    warm.truncate(WATER_MONTHS);
+    warm.sort_by_key(|point| point.month);
+    let kwh: f64 = warm.iter().map(|point| point.kwh).sum();
+    let days: u32 = warm.iter().map(|point| point.month.days()).sum();
+    Some(Water {
+        per_day: kwh / f64::from(days),
+        per_month: kwh / WATER_MONTHS as f64,
+        months: warm.iter().map(|point| point.month).collect(),
+        from_season: start_year,
+    })
+}
+
+/// Take every whole month's energy from the total at its start and its end, take off its
+/// season's water heating, put it beside the month's heating degree days, and fit the
+/// lines.
 ///
 /// A month counts once the 1st after it is over too, since a reading made then still
-/// closes it. Degree days come from the outside thermometer's days that covered
-/// `min_coverage` of the day, as everywhere else in the report.
+/// closes it. A season's water heating is what its warmest months used a day, with the
+/// heating off; a season with no summer on record takes the nearest season's. Degree days
+/// come from the outside thermometer's days that covered `min_coverage` of the day, as
+/// everywhere else in the report.
 pub fn analyse(
     readings: &[Reading],
     outside: &[DayMean],
@@ -320,12 +401,13 @@ pub fn analyse(
     min_coverage: f64,
     tz: Tz,
 ) -> Energy {
-    let mut weather: BTreeMap<Month, (u32, f64)> = BTreeMap::new();
+    let mut weather: BTreeMap<Month, (u32, f64, f64)> = BTreeMap::new();
     for day in outside.iter().filter(|day| day.coverage() >= min_coverage) {
         if let Some(date) = day.date() {
-            let (count, hdd) = weather.entry(Month::of(date)).or_default();
+            let (count, hdd, temperature) = weather.entry(Month::of(date)).or_default();
             *count += 1;
             *hdd += bases.hdd(day.mean);
+            *temperature += day.mean;
         }
     }
     let record = outside
@@ -364,7 +446,8 @@ pub fn analyse(
                 {
                     beyond_record += 1;
                 } else {
-                    let (counted_days, hdd) = weather.get(&this).copied().unwrap_or_default();
+                    let (counted_days, hdd, temperature) =
+                        weather.get(&this).copied().unwrap_or_default();
                     let follows_unchanged = months.last().is_some_and(|before: &MonthPoint| {
                         before.month.next() == this && before.kwh == 0.0
                     });
@@ -373,7 +456,10 @@ pub fn analyse(
                         kwh: closing - opening,
                         counted_days,
                         hdd,
+                        outside_mean: (counted_days > 0)
+                            .then(|| temperature / f64::from(counted_days)),
                         follows_unchanged,
+                        water_kwh: 0.0,
                     });
                 }
             }
@@ -382,36 +468,61 @@ pub fn analyse(
         }
     }
 
+    // Water heating, season by season, taken off every day of it.
+    let mut start_years: Vec<i32> = months.iter().map(|month| month.month.season()).collect();
+    start_years.dedup();
+    let own: Vec<Water> = start_years
+        .iter()
+        .filter_map(|start_year| own_water(&months, *start_year))
+        .collect();
+    let waters: Vec<(i32, Option<Water>)> = start_years
+        .iter()
+        .map(|start_year| {
+            let nearest = own
+                .iter()
+                .min_by_key(|water| ((water.from_season - start_year).abs(), water.from_season));
+            (*start_year, nearest.cloned())
+        })
+        .collect();
+    for month in &mut months {
+        let season = month.month.season();
+        if let Some((_, Some(water))) = waters.iter().find(|(year, _)| *year == season) {
+            month.water_kwh = water.per_day * f64::from(month.month.days());
+        }
+    }
+    let water_per_month = (!own.is_empty())
+        .then(|| own.iter().map(|water| water.per_month).sum::<f64>() / own.len() as f64);
+
     let points = |months: &mut dyn Iterator<Item = &MonthPoint>| -> Vec<(f64, f64)> {
         months
             .filter(|month| month.is_fitted())
-            .map(|month| (month.whole_month_hdd(), month.kwh))
+            .map(|month| (month.whole_month_hdd(), month.heating_kwh()))
             .collect()
     };
     let overall = fit(&points(&mut months.iter()));
 
-    let mut seasons: Vec<Season> = Vec::new();
-    for start_year in months.iter().map(|month| month.month.season()) {
-        if seasons
-            .last()
-            .is_some_and(|season| season.start_year == start_year)
-        {
-            continue;
-        }
-        let of_season = || {
-            months
-                .iter()
-                .filter(move |month| month.month.season() == start_year)
-        };
-        let fitted = points(&mut of_season());
-        seasons.push(Season {
-            start_year,
-            months: of_season().count(),
-            fitted: fitted.len(),
-            kwh: of_season().map(|month| month.kwh).sum(),
-            fit: fit(&fitted),
-        });
-    }
+    let seasons = waters
+        .into_iter()
+        .map(|(start_year, water)| {
+            let of_season = || {
+                months
+                    .iter()
+                    .filter(move |month| month.month.season() == start_year)
+            };
+            let fitted = points(&mut of_season());
+            Season {
+                start_year,
+                months: of_season().count(),
+                fitted: fitted.len(),
+                kwh: of_season()
+                    .filter(|month| month.has_energy())
+                    .map(MonthPoint::heating_kwh)
+                    .sum(),
+                water,
+                fit: fit(&fitted),
+            }
+        })
+        .collect();
 
     Energy {
         readings: readings.len(),
@@ -419,6 +530,17 @@ pub fn analyse(
         overall,
         seasons,
         beyond_record,
+        water_per_month,
+    }
+}
+
+/// Months as they are listed: `July 2023, August 2023 and June 2024`.
+pub fn month_list(months: &[Month]) -> String {
+    let labels: Vec<String> = months.iter().map(|month| month.label()).collect();
+    match labels.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        Some((last, _)) => last.clone(),
+        None => String::new(),
     }
 }
 
@@ -480,6 +602,7 @@ mod tests {
             months: 0,
             fitted: 0,
             kwh: 0.0,
+            water: None,
             fit: None,
         };
         assert_eq!(season.label(), "2099/00");
@@ -755,7 +878,13 @@ mod tests {
         let overall = energy.overall.unwrap();
         assert!((overall.slope - 2.0).abs() < 1e-9, "{overall:?}");
         assert!((overall.base - 300.0).abs() < 1e-6);
+        assert_eq!(
+            energy.water_per_month, None,
+            "no summer, so water heating is left in"
+        );
+        assert_eq!(energy.months[0].water_kwh, 0.0);
         assert_eq!(energy.seasons.len(), 1);
+        assert_eq!(energy.seasons[0].water, None);
         assert_eq!(energy.seasons[0].label(), "2023/24");
         assert_eq!(energy.seasons[0].fitted, 4);
     }
@@ -813,11 +942,94 @@ mod tests {
     }
 
     #[test]
+    fn water_heating_is_what_the_warmest_months_used_and_is_taken_off_first() {
+        // Every month at its own temperature, June to September warm enough for no heat.
+        let temperatures = [
+            0.0, 2.0, 5.0, 9.0, 13.0, 17.0, 19.0, 18.0, 15.5, 10.0, 5.0, 1.0,
+        ];
+        let mut outside = days("2023-01-01", "2025-01-01", 0.0);
+        for day in &mut outside {
+            day.mean = temperatures[day.date().unwrap().month0() as usize];
+        }
+        // Read as each month turns, for a house heating at two kWh per degree day and
+        // heating ten kWh of water a day.
+        let mut readings = Vec::new();
+        let mut total = 5_000.0;
+        let mut start = month(2023, 1);
+        for day in &outside {
+            let date = day.date().unwrap();
+            if Month::of(date) != start || readings.is_empty() {
+                start = Month::of(date);
+                readings.push(Reading {
+                    at: midnight(date, UTC).unwrap(),
+                    total,
+                });
+            }
+            total += 2.0 * Bases::default().hdd(day.mean) + 10.0;
+        }
+        let energy = analyse(&readings, &outside, Bases::default(), 0.9, UTC);
+        assert_eq!(energy.months.len(), 24);
+
+        let water: Vec<(String, Vec<Month>, i32)> = energy
+            .seasons
+            .iter()
+            .map(|season| {
+                let water = season.water.as_ref().unwrap();
+                assert!((water.per_day - 10.0).abs() < 1e-9, "{water:?}");
+                (season.label(), water.months.clone(), water.from_season)
+            })
+            .collect();
+        assert_eq!(
+            water,
+            [
+                // January to June has no summer of its own: the next season's.
+                (
+                    "2022/23".to_string(),
+                    vec![month(2023, 7), month(2023, 8), month(2024, 6)],
+                    2023
+                ),
+                (
+                    "2023/24".to_string(),
+                    vec![month(2023, 7), month(2023, 8), month(2024, 6)],
+                    2023
+                ),
+                (
+                    "2024/25".to_string(),
+                    vec![month(2024, 7), month(2024, 8), month(2024, 9)],
+                    2024
+                ),
+            ]
+        );
+        let per_month = energy.seasons[1].water.as_ref().unwrap().per_month;
+        assert!((per_month - 920.0 / 3.0).abs() < 1e-9);
+        assert!((energy.water_per_month.unwrap() - 920.0 / 3.0).abs() < 1e-9);
+
+        // Taken off every day, the rest is heating alone: on the line, through nothing.
+        let january = energy
+            .months
+            .iter()
+            .find(|point| point.month == month(2024, 1))
+            .unwrap();
+        assert!((january.water_kwh - 310.0).abs() < 1e-9);
+        assert!((january.heating_kwh() - 2.0 * 465.0).abs() < 1e-9);
+        let overall = energy.overall.unwrap();
+        assert!((overall.slope - 2.0).abs() < 1e-9, "{overall:?}");
+        assert!(overall.base.abs() < 1e-6, "{overall:?}");
+        let season = &energy.seasons[1];
+        assert!((season.kwh - 2.0 * 2_283.0).abs() < 1e-6, "{season:?}");
+    }
+
+    #[test]
     fn amounts_and_slopes_are_written_plainly() {
         assert_eq!(format_energy(1_850.4), "1,850 kWh");
         assert_eq!(format_energy(-12.0), "-12 kWh");
         assert_eq!(format_energy(0.2), "0 kWh");
         assert_eq!(format_monthly(372.2), "372 kWh a month");
+        assert_eq!(
+            month_list(&[month(2023, 7), month(2023, 8), month(2024, 6)]),
+            "July 2023, August 2023 and June 2024"
+        );
+        assert_eq!(month_list(&[month(2023, 7)]), "July 2023");
         assert_eq!(format_slope(2.314), "2.31");
         assert_eq!(format_slope(12.44), "12.4");
         assert_eq!(format_slope(140.2), "140");

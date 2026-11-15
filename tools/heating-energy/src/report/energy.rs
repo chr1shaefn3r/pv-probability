@@ -1,6 +1,6 @@
-//! The Heating energy section: every month's energy - what the running total grew by over
-//! it - against its heating degree days, the line through them, and its slope season by
-//! season.
+//! The Heating energy section: every month's heating energy - what the running total grew
+//! by over it, less the water heating its season's warmest months tell - against its
+//! heating degree days, the line through them, and its slope season by season.
 
 use std::fmt::Write as _;
 
@@ -9,8 +9,8 @@ use ha_report::escape;
 
 use super::{column, format_degree_days};
 use crate::energy::{
-    Energy, Fit, LeftOut, MIN_FIT_MONTHS, MonthPoint, Season, format_energy, format_monthly,
-    format_slope,
+    Energy, Fit, LeftOut, MIN_FIT_MONTHS, Month, MonthPoint, Season, format_energy, format_monthly,
+    format_slope, month_list, season_label,
 };
 
 /// What the report needs to say about heating energy.
@@ -49,11 +49,12 @@ pub fn section(section: &EnergySection) -> String {
     let _ = write!(
         html,
         "<p>Each month's heating energy - what the running total {} grew by from the month's \
-         start to its end - against its heating degree days. The slope of the line through the \
-         months is what one more heating degree day costs this house: the weather only moves a \
-         month along the line, so insulation, new windows or a boiler tune-up show as a lower \
-         slope however cold the winter was. Where the line meets zero degree days is what the \
-         house uses a month without heating - hot water, standby.</p>",
+         start to its end, less what heating water took - against its heating degree days. \
+         Water heating does not follow the weather: what each season's warmest months used a \
+         day, with the heating off, is taken off every day of the season. The slope of the line \
+         through the months is what one more heating degree day costs this house: the weather \
+         only moves a month along the line, so insulation, new windows or a boiler tune-up show \
+         as a lower slope however cold the winter was.</p>",
         escape(&section.entity)
     );
 
@@ -74,14 +75,40 @@ pub fn section(section: &EnergySection) -> String {
         return html;
     };
 
+    let water = match energy.water_per_month {
+        Some(per_month) => {
+            let own = energy
+                .seasons
+                .iter()
+                .filter(|season| {
+                    season
+                        .water
+                        .as_ref()
+                        .is_some_and(|water| water.from_season == season.start_year)
+                })
+                .count();
+            format!(
+                ", once water heating of <strong>{}</strong>{} is taken off",
+                escape(&format_monthly(per_month)),
+                if own > 1 {
+                    " on average over the seasons"
+                } else {
+                    ""
+                }
+            )
+        }
+        // No summer to tell water heating by: it stays in, and the line's base holds it.
+        None => format!(
+            ", and <strong>{}</strong> without heating",
+            escape(&format_monthly(overall.base))
+        ),
+    };
     let _ = write!(
         html,
-        "<p class=\"headline\"><strong>{} kWh</strong> per heating degree day (± {}), and \
-         <strong>{}</strong> without heating - the line accounts for {} of the months' spread \
-         over {} months.</p>",
+        "<p class=\"headline\"><strong>{} kWh</strong> per heating degree day (± {}){water} - \
+         the line accounts for {} of the months' spread over {} months.</p>",
         escape(&format_slope(overall.slope)),
         escape(&format_slope(overall.slope_error)),
-        escape(&format_monthly(overall.base)),
         escape(&percent(overall.r_squared)),
         overall.months
     );
@@ -103,8 +130,9 @@ pub fn section(section: &EnergySection) -> String {
         "Seasons run from July to June, so a winter is never split. The ± is the slope's \
          standard error: two seasons further apart than their errors put together differ by \
          more than chance. A month the outside thermometer missed a day or two of has its \
-         degree days scaled up to all of them, since the energy covers the whole month.",
+         degree days scaled up to all of them, since the energy covers the whole month. ",
     );
+    note.push_str(&water_note(energy));
     for (reason, why) in [
         (
             LeftOut::FewDays,
@@ -135,6 +163,36 @@ pub fn section(section: &EnergySection) -> String {
     }
     let _ = write!(html, "<p class=\"note\">{}</p></section>", escape(&note));
     html
+}
+
+/// Where every season's water heating came from.
+fn water_note(energy: &Energy) -> String {
+    if energy.water_per_month.is_none() {
+        return "Water heating is left in: no season has three months from May to September \
+                on record to tell it by, so the line's base holds it."
+            .to_string();
+    }
+    let sources: Vec<String> = energy
+        .seasons
+        .iter()
+        .filter_map(|season| {
+            let water = season.water.as_ref()?;
+            Some(if water.from_season == season.start_year {
+                format!("{}'s from {}", season.label(), month_list(&water.months))
+            } else {
+                format!(
+                    "{} takes {}'s, having fewer of its own on record",
+                    season.label(),
+                    season_label(water.from_season)
+                )
+            })
+        })
+        .collect();
+    format!(
+        "Water heating is what a season's three warmest months from May to September used a \
+         day, with the heating off, taken off every day of the season: {}.",
+        sources.join("; ")
+    )
 }
 
 /// `the total covers 3 whole months where the outside was recorded (January to March
@@ -199,24 +257,32 @@ fn scatter(energy: &Energy, overall: &Fit) -> String {
     let line_end = overall.base + overall.slope * max_hdd;
     let low_kwh = months
         .iter()
-        .map(|month| month.kwh)
+        .map(|month| month.heating_kwh())
         .fold(overall.base.min(line_end), f64::min);
     let high_kwh = months
         .iter()
-        .map(|month| month.kwh)
+        .map(|month| month.heating_kwh())
         .fold(overall.base.max(line_end), f64::max);
     // A quarter more room to the right than the coldest month needs, where the line's
     // label goes: no month can be there.
     let (x_ticks, _, x_top) = axis(0.0, max_hdd * 1.25);
-    let (y_ticks, y_bottom, y_top) = axis(low_kwh, high_kwh);
+    // A summer month's heating comes out a little either side of nothing once its water
+    // heating is taken off: a few kWh below it sit on the baseline rather than open up a
+    // whole step of axis.
+    let axis_low = if low_kwh > -0.05 * high_kwh {
+        low_kwh.max(0.0)
+    } else {
+        low_kwh
+    };
+    let (y_ticks, y_bottom, y_top) = axis(axis_low, high_kwh);
     let x = |hdd: f64| LEFT + hdd / x_top * (WIDTH - LEFT - RIGHT);
     let y = |kwh: f64| TOP + (y_top - kwh) / (y_top - y_bottom) * SCATTER_HEIGHT;
     let height = TOP + SCATTER_HEIGHT + BOTTOM;
 
     let mut svg = format!(
         "<svg class=\"energy-chart\" viewBox=\"0 0 {WIDTH:.0} {height:.0}\" role=\"img\" \
-         aria-label=\"Monthly heating energy against heating degree days, with the line \
-         through them\" preserveAspectRatio=\"xMidYMid meet\"><g class=\"grid\">"
+         aria-label=\"Monthly heating energy, water heating taken off, against heating degree \
+         days, with the line through them\" preserveAspectRatio=\"xMidYMid meet\"><g class=\"grid\">"
     );
     for tick in &y_ticks {
         let _ = write!(
@@ -241,7 +307,7 @@ fn scatter(energy: &Energy, overall: &Fit) -> String {
     }
     let _ = write!(
         svg,
-        "<text class=\"axis-title\" x=\"{LEFT:.1}\" y=\"{:.1}\">kWh a month</text>\
+        "<text class=\"axis-title\" x=\"{LEFT:.1}\" y=\"{:.1}\">heating kWh a month</text>\
          <text class=\"axis-title\" x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"end\">heating degree \
          days a month</text></g>",
         TOP - 4.0,
@@ -277,7 +343,7 @@ fn scatter(energy: &Energy, overall: &Fit) -> String {
 
     svg.push_str("<g class=\"series\">");
     for month in &months {
-        let (cx, cy) = (x(month.whole_month_hdd()), y(month.kwh));
+        let (cx, cy) = (x(month.whole_month_hdd()), y(month.heating_kwh()));
         let expected = overall.base + overall.slope * month.whole_month_hdd();
         let _ = write!(
             svg,
@@ -286,12 +352,12 @@ fn scatter(energy: &Energy, overall: &Fit) -> String {
              r=\"{DOT_RADIUS:.1}\"/><text class=\"readout\" x=\"{LEFT:.1}\" \
              y=\"{READOUT_BASELINE:.1}\">{}</text></g>",
             escape(&format!(
-                "{}: {} at {} heating degree days - {} {} the line",
+                "{}: {} for heating at {} heating degree days - {} {} the line",
                 month.month.label(),
-                format_energy(month.kwh),
+                format_energy(month.heating_kwh()),
                 format_degree_days(month.whole_month_hdd()),
-                format_energy((month.kwh - expected).abs()),
-                if month.kwh >= expected {
+                format_energy((month.heating_kwh() - expected).abs()),
+                if month.heating_kwh() >= expected {
                     "above"
                 } else {
                     "below"
@@ -379,12 +445,15 @@ fn season_bars(seasons: &[&Season]) -> String {
             "<g class=\"slot\">{marks}<text class=\"readout\" x=\"{LEFT:.1}\" \
              y=\"{READOUT_BASELINE:.1}\">{}</text></g>",
             escape(&format!(
-                "{}: {} kWh per degree day ± {}, {} without heating, over {} months",
+                "{}: {} kWh per degree day ± {}, over {} months{}",
                 season.label(),
                 format_slope(fit.slope),
                 format_slope(fit.slope_error),
-                format_monthly(fit.base),
-                fit.months
+                fit.months,
+                season.water.as_ref().map_or(String::new(), |water| format!(
+                    ", after {} of water heating",
+                    format_monthly(water.per_month)
+                ))
             ))
         );
     }
@@ -413,9 +482,10 @@ fn season_table(energy: &Energy, overall: &Fit) -> String {
         "<div class=\"table-scroll\"><table><caption>Per heating season, July to June. A \
          season needs three fitted months, milder and colder ones, for a line of its own.\
          </caption><thead><tr><th scope=\"col\">Season</th><th scope=\"col\">Months</th>\
-         <th scope=\"col\">Heating energy</th><th scope=\"col\">kWh per degree day</th>\
-         <th scope=\"col\">±</th><th scope=\"col\">Without heating</th><th scope=\"col\">Fit\
-         </th><th scope=\"col\">Against the season before</th></tr></thead><tbody>",
+         <th scope=\"col\">Heating energy</th><th scope=\"col\">Water heating</th>\
+         <th scope=\"col\">kWh per degree day</th><th scope=\"col\">±</th>\
+         <th scope=\"col\">Fit</th><th scope=\"col\">Against the season before</th></tr>\
+         </thead><tbody>",
     );
     let mut previous: Option<f64> = None;
     for season in &energy.seasons {
@@ -437,10 +507,24 @@ fn season_table(energy: &Energy, overall: &Fit) -> String {
         };
         let _ = write!(
             html,
-            "<tr><th scope=\"row\">{}</th><td>{}</td><td>{}</td>{}<td>{}</td></tr>",
+            "<tr><th scope=\"row\">{}</th><td>{}</td><td>{}</td><td>{}</td>{}<td>{}</td></tr>",
             escape(&season.label()),
             escape(&months),
             escape(&format_energy(season.kwh)),
+            escape(&season.water.as_ref().map_or_else(
+                || "-".to_string(),
+                |water| {
+                    if water.from_season == season.start_year {
+                        format_monthly(water.per_month)
+                    } else {
+                        format!(
+                            "{}, {}'s",
+                            format_monthly(water.per_month),
+                            season_label(water.from_season)
+                        )
+                    }
+                }
+            )),
             fit_cells(season.fit.as_ref()),
             escape(&change)
         );
@@ -450,11 +534,15 @@ fn season_table(energy: &Energy, overall: &Fit) -> String {
     }
     let _ = write!(
         html,
-        "</tbody><tfoot><tr><th scope=\"row\">All</th><td>{}</td><td>{}</td>{}<td></td></tr>\
-         </tfoot></table></div>",
+        "</tbody><tfoot><tr><th scope=\"row\">All</th><td>{}</td><td>{}</td><td>{}</td>{}\
+         <td></td></tr></tfoot></table></div>",
         overall.months,
         escape(&format_energy(
-            energy.fitted().map(|month| month.kwh).sum::<f64>()
+            energy.fitted().map(MonthPoint::heating_kwh).sum::<f64>()
+        )),
+        escape(&energy.water_per_month.map_or_else(
+            || "-".to_string(),
+            |per_month| format!("{} on average", format_monthly(per_month))
         )),
         fit_cells(Some(overall))
     );
@@ -464,13 +552,12 @@ fn season_table(energy: &Energy, overall: &Fit) -> String {
 fn fit_cells(fit: Option<&Fit>) -> String {
     match fit {
         Some(fit) => format!(
-            "<td>{}</td><td>{}</td><td>{}</td><td>{}</td>",
+            "<td>{}</td><td>{}</td><td>{}</td>",
             escape(&format_slope(fit.slope)),
             escape(&format_slope(fit.slope_error)),
-            escape(&format_monthly(fit.base)),
             escape(&percent(fit.r_squared))
         ),
-        None => "<td>-</td><td>-</td><td>-</td><td>-</td>".to_string(),
+        None => "<td>-</td><td>-</td><td>-</td>".to_string(),
     }
 }
 
@@ -478,20 +565,37 @@ fn fit_cells(fit: Option<&Fit>) -> String {
 fn month_table(energy: &Energy) -> String {
     let mut html = String::from(
         "<details class=\"floor\"><summary>Every month</summary><div class=\"table-scroll\">\
-         <table><caption>What the total grew by over each month, and the month's heating \
-         degree days, scaled up to the whole month where a few days went uncounted.</caption>\
-         <thead><tr><th scope=\"col\">Month\
-         </th><th scope=\"col\">Heating energy</th><th scope=\"col\">Heating degree days</th>\
+         <table><caption>What the total grew by over each month, the water heating taken \
+         off it, the heating energy left, and the month's heating degree days, scaled up to the \
+         whole month where a few days went uncounted.</caption><thead><tr><th scope=\"col\">\
+         Month</th><th scope=\"col\">Energy</th><th scope=\"col\">Water heating</th>\
+         <th scope=\"col\">Heating energy</th><th scope=\"col\">Heating degree days</th>\
          <th scope=\"col\">Days counted</th><th scope=\"col\">In the fit</th></tr></thead>\
          <tbody>",
     );
+    // The months each season's water heating was told by.
+    let warmest: Vec<Month> = energy
+        .seasons
+        .iter()
+        .filter_map(|season| season.water.as_ref())
+        .flat_map(|water| water.months.iter().copied())
+        .collect();
     for month in &energy.months {
+        let water = if month.water_kwh == 0.0 {
+            "-".to_string()
+        } else if warmest.contains(&month.month) {
+            format!("{}, one of the warmest", format_energy(month.water_kwh))
+        } else {
+            format_energy(month.water_kwh)
+        };
         let _ = write!(
             html,
-            "<tr><th scope=\"row\">{}</th><td>{}</td><td>{}</td><td>{} of {}</td><td>{}</td>\
-             </tr>",
+            "<tr><th scope=\"row\">{}</th><td>{}</td><td>{}</td><td>{}</td><td>{}</td>\
+             <td>{} of {}</td><td>{}</td></tr>",
             escape(&month.month.label()),
             escape(&format_energy(month.kwh)),
+            escape(&water),
+            escape(&format_energy(month.heating_kwh())),
             escape(&format_degree_days(month.whole_month_hdd())),
             month.counted_days,
             month.month.days(),
@@ -538,7 +642,7 @@ pub const CSS: &str = "
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::energy::{Month, Season};
+    use crate::energy::{Month, Season, Water};
 
     fn point(year: i32, month: u32, hdd: f64, kwh: f64) -> MonthPoint {
         let month = Month { year, month };
@@ -547,16 +651,43 @@ mod tests {
             kwh,
             counted_days: month.days(),
             hdd,
+            outside_mean: Some(15.0 - hdd / f64::from(month.days())),
             follows_unchanged: false,
+            water_kwh: 0.0,
         }
     }
 
-    fn energy(months: Vec<MonthPoint>) -> Energy {
+    /// The section's figures for `months`, with `water_per_day` kWh of water heating a day
+    /// taken off every one: 2023/24's own, from its warmest months, which 2022/23 takes.
+    fn energy(mut months: Vec<MonthPoint>, water_per_day: Option<f64>) -> Energy {
+        let water = water_per_day.map(|per_day| Water {
+            per_day,
+            per_month: per_day * 30.0,
+            months: vec![
+                Month {
+                    year: 2023,
+                    month: 7,
+                },
+                Month {
+                    year: 2023,
+                    month: 8,
+                },
+                Month {
+                    year: 2024,
+                    month: 6,
+                },
+            ],
+            from_season: 2023,
+        });
+        for month in &mut months {
+            month.water_kwh =
+                water_per_day.map_or(0.0, |per_day| per_day * f64::from(month.month.days()));
+        }
         let fit = |months: &[MonthPoint]| {
             crate::energy::fit(
                 &months
                     .iter()
-                    .map(|month| (month.whole_month_hdd(), month.kwh))
+                    .map(|month| (month.whole_month_hdd(), month.heating_kwh()))
                     .collect::<Vec<_>>(),
             )
         };
@@ -571,7 +702,8 @@ mod tests {
                 start_year,
                 months: own.len(),
                 fitted: own.len(),
-                kwh: own.iter().map(|month| month.kwh).sum(),
+                kwh: own.iter().map(MonthPoint::heating_kwh).sum(),
+                water: water.clone(),
                 fit: fit(&own),
             });
         }
@@ -581,6 +713,7 @@ mod tests {
             seasons,
             months,
             beyond_record: 0,
+            water_per_month: water.map(|water| water.per_month),
         }
     }
 
@@ -601,7 +734,7 @@ mod tests {
         for (year, month, hdd) in [(2023, 11, 310.0), (2023, 12, 440.0), (2024, 1, 500.0)] {
             months.push(point(year, month, hdd, 2.4 * hdd + 400.0));
         }
-        let html = section_of(energy(months));
+        let html = section_of(energy(months, None));
         assert!(html.contains("<h2>Heating energy</h2>"));
         assert!(html.contains("number.heizol_energy"));
         assert!(html.contains(" kWh a month</strong> without heating"));
@@ -610,7 +743,8 @@ mod tests {
         assert_eq!(html.matches("class=\"bar\"").count(), 2, "a bar a season");
         assert!(html.contains("<th scope=\"row\">2023/24</th>"));
         assert!(html.contains("<td>-20%</td>"), "2.4 against 3.0");
-        assert!(html.contains("January 2024: 1,600 kWh at 500 heating degree days"));
+        assert!(html.contains("January 2024: 1,600 kWh for heating at 500 heating degree days"));
+        assert!(html.contains("Water heating is left in: no season has three months"));
         assert!(html.contains("heating degree days a month</text>"));
     }
 
@@ -624,7 +758,7 @@ mod tests {
             point(2024, 3, 250.0, -40.0),
         ];
         months[2].counted_days = 20;
-        let html = section_of(energy(months));
+        let html = section_of(energy(months, None));
         assert!(html.contains(
             "Left out, the outside thermometer counted less than nine in ten of its days: \
              January 2024."
@@ -639,7 +773,7 @@ mod tests {
 
     #[test]
     fn without_enough_months_it_says_what_there_is_and_why() {
-        let html = section_of(energy(vec![point(2024, 1, 450.0, 1_800.0)]));
+        let html = section_of(energy(vec![point(2024, 1, 450.0, 1_800.0)], None));
         assert!(html.contains("no line to draw yet"), "{html}");
         assert!(html.contains(
             "the total covers 1 whole month where the outside was recorded (January 2024), 1 \
@@ -647,6 +781,50 @@ mod tests {
         ));
         assert!(html.contains("ten days by default"));
         assert!(!html.contains("<svg"));
+    }
+
+    #[test]
+    fn water_heating_is_taken_off_and_said_where_it_came_from() {
+        // Three kWh per degree day for heating, and ten a day heating water.
+        let months: Vec<MonthPoint> = [
+            (2023, 1, 480.0),
+            (2023, 3, 310.0),
+            (2023, 7, 0.0),
+            (2023, 11, 300.0),
+            (2024, 1, 500.0),
+        ]
+        .iter()
+        .map(|(year, number, hdd)| {
+            let days = f64::from(
+                Month {
+                    year: *year,
+                    month: *number,
+                }
+                .days(),
+            );
+            point(*year, *number, *hdd, 3.0 * hdd + 10.0 * days)
+        })
+        .collect();
+        let html = section_of(energy(months, Some(10.0)));
+        assert!(
+            html.contains(
+                "<strong>3.00 kWh</strong> per heating degree day (± 0.00), once water heating \
+                 of <strong>300 kWh a month</strong> is taken off - the line"
+            ),
+            "{html}"
+        );
+        assert!(html.contains("<td>300 kWh a month, 2023/24&#39;s</td>"));
+        assert!(html.contains("<td>300 kWh a month on average</td>"));
+        assert!(html.contains(
+            "2022/23 takes 2023/24&#39;s, having fewer of its own on record; 2023/24&#39;s from \
+             July 2023, August 2023 and June 2024."
+        ));
+        assert!(html.contains(
+            "<th scope=\"row\">January 2024</th><td>1,810 kWh</td><td>310 kWh</td>\
+             <td>1,500 kWh</td>"
+        ));
+        assert!(html.contains("<td>310 kWh, one of the warmest</td>"));
+        assert!(html.contains("January 2024: 1,500 kWh for heating"));
     }
 
     #[test]

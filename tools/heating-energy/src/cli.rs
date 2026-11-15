@@ -39,9 +39,10 @@ pub struct Args {
     /// The heating's energy as a running total in kWh, e.g. sensor.heating_oil_energy: a
     /// meter read on the last day of every month, and as often between as you like.
     ///
-    /// What it grew by over every month, fitted against the months' heating degree days,
-    /// gives the house's efficiency figure - kWh per degree day - tracked season by season.
-    /// A sensor with a state class keeps its readings for good; the README has more.
+    /// What it grew by over every month, less the water heating each season's warmest
+    /// months tell, fitted against the months' heating degree days, gives the house's
+    /// efficiency figure - kWh per degree day - tracked season by season. A sensor with a
+    /// state class keeps its readings for good; the README has more.
     #[arg(long, value_name = "ENTITY_ID")]
     pub energy_entity: Option<String>,
 

@@ -19,7 +19,9 @@ use ha_report::{format_duration, open_command};
 use heating_energy::cli::{Args, Config};
 use heating_energy::daily::{DayMean, daily_means, room_days};
 use heating_energy::degree::{Analysis, analyse};
-use heating_energy::energy::{self, LeftOut, Reading, format_energy, format_monthly, format_slope};
+use heating_energy::energy::{
+    self, LeftOut, Reading, format_energy, format_monthly, format_slope, month_list, season_label,
+};
 use heating_energy::offset::{self, Check, Correction, Finding, format_offset, local_stamp};
 use heating_energy::report::{
     EnergySection, ReportOptions, format_celsius, format_degree_days, page,
@@ -458,11 +460,17 @@ fn energy_lines(section: &EnergySection) -> Vec<String> {
     let mut lines = Vec::new();
     match &energy.overall {
         Some(fit) => lines.push(format!(
-            "efficiency: {} kWh per heating degree day (± {}), and {} without heating - a line \
-             through {} months of {entity}",
+            "efficiency: {} kWh per heating degree day (± {}){} - a line through {} months of \
+             {entity}",
             format_slope(fit.slope),
             format_slope(fit.slope_error),
-            format_monthly(fit.base),
+            match energy.water_per_month {
+                Some(per_month) => format!(
+                    ", once water heating of {} on average is taken off",
+                    format_monthly(per_month)
+                ),
+                None => format!(", and {} without heating", format_monthly(fit.base)),
+            },
             fit.months
         )),
         None => {
@@ -487,8 +495,27 @@ fn energy_lines(section: &EnergySection) -> Vec<String> {
             lines.push(line);
         }
     }
+    if energy.water_per_month.is_none() && !energy.months.is_empty() {
+        lines.push(format!(
+            "note: water heating is left in {entity}: no season has three months from May to \
+             September on record to tell it by"
+        ));
+    }
     let mut previous: Option<(String, f64)> = None;
     for season in &energy.seasons {
+        let water = match &season.water {
+            Some(water) if water.from_season == season.start_year => format!(
+                "; water heating {}, from {}",
+                format_monthly(water.per_month),
+                month_list(&water.months)
+            ),
+            Some(water) => format!(
+                "; water heating {}, {}'s",
+                format_monthly(water.per_month),
+                season_label(water.from_season)
+            ),
+            None => String::new(),
+        };
         match season.fit {
             Some(fit) => {
                 let change = match &previous {
@@ -503,7 +530,7 @@ fn energy_lines(section: &EnergySection) -> Vec<String> {
                     _ => String::new(),
                 };
                 lines.push(format!(
-                    "  {}: {} kWh per degree day (± {}) over {} months{change}",
+                    "  {}: {} kWh per degree day (± {}) over {} months{change}{water}",
                     season.label(),
                     format_slope(fit.slope),
                     format_slope(fit.slope_error),
@@ -512,7 +539,7 @@ fn energy_lines(section: &EnergySection) -> Vec<String> {
                 previous = Some((season.label(), fit.slope));
             }
             None if energy.overall.is_some() => lines.push(format!(
-                "  {}: too few months for a line of its own ({} fitted)",
+                "  {}: too few months for a line of its own ({} fitted){water}",
                 season.label(),
                 season.fitted
             )),
