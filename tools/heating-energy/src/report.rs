@@ -59,7 +59,7 @@ pub fn page(analysis: &Analysis, options: &ReportOptions) -> String {
     body.push_str(&metadata_list(&metadata_entries(analysis, options)));
     body.push_str(&degree_day_section(analysis, options));
     if let Some(section) = &options.energy {
-        body.push_str(&energy::section(section));
+        body.push_str(&energy::section(section, options.tz));
     }
     if let Some(house) = &options.house {
         body.push_str(&rooms_section(analysis, house, &options.room_notes));

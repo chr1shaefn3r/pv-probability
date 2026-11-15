@@ -654,55 +654,61 @@ fn days_only_some_thermometers_covered_rest_on_those_and_are_counted() {
     );
 }
 
-/// The heating energy helper, as Home Assistant names it.
+/// The heating's energy as a running total, as Home Assistant names it.
 const HEATING_ENERGY: &str = "number.heizol_energy";
 
-/// 2024 month by month: outside, every month at its own steady temperature below the
-/// heating base, and the heating energy each month used - two kWh per heating degree day
-/// over a base of 300 - as `(month, kWh)`. No two months use the same.
-fn heating_year() -> (Connection, Vec<(u32, f64)>) {
+/// Outside in 2024, every month at its own steady temperature below the heating base.
+const MONTHLY_TEMPERATURES: [f64; 12] = [
+    0.0, 2.0, 5.0, 9.0, 13.0, 14.5, 14.0, 13.5, 12.0, 10.0, 5.0, 1.0,
+];
+
+/// 2024 hour by hour outside, at [`MONTHLY_TEMPERATURES`].
+fn heating_year() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
     testdb::create_schema(&conn, Flavour::Modern);
     let outside = testdb::insert_statistic_meta(&conn, OUTSIDE_ENTITY, Some("°C"));
-    let temperatures = [
-        0.0, 2.0, 5.0, 9.0, 13.0, 14.5, 14.0, 13.5, 12.0, 10.0, 5.0, 1.0,
-    ];
-    let mut energy = Vec::new();
-    for (index, temperature) in temperatures.iter().enumerate() {
-        let month = index as u32 + 1;
-        let first = ts(&format!("2024-{month:02}-01 00:00:00"));
-        let next = if month == 12 {
-            ts("2025-01-01 00:00:00")
-        } else {
-            ts(&format!("2024-{:02}-01 00:00:00", month + 1))
-        };
-        let mut hour = first;
-        while hour < next {
-            testdb::insert_statistics_row(
-                &conn,
-                Flavour::Modern,
-                "statistics",
-                outside,
-                hour,
-                Some(*temperature),
-            );
-            hour += 3_600;
-        }
-        let days = ((next - first) / 86_400) as f64;
-        let hdd = days * (15.0f64 - temperature).max(0.0);
-        energy.push((month, 2.0 * hdd + 300.0));
+    let mut hour = ts("2024-01-01 00:00:00");
+    while hour < ts("2025-01-01 00:00:00") {
+        testdb::insert_statistics_row(
+            &conn,
+            Flavour::Modern,
+            "statistics",
+            outside,
+            hour,
+            Some(temperature_at(hour)),
+        );
+        hour += 3_600;
     }
-    (conn, energy)
+    conn
 }
 
-/// The last day of `month` in 2024, at 20:00 UTC.
-fn month_end(month: u32) -> i64 {
-    let next = if month == 12 {
-        ts("2025-01-01 20:00:00")
-    } else {
-        ts(&format!("2024-{:02}-01 20:00:00", month + 1))
-    };
-    next - 86_400
+fn temperature_at(ts: i64) -> f64 {
+    use chrono::Datelike;
+    let month = chrono::DateTime::from_timestamp(ts, 0).unwrap().month0() as usize;
+    MONTHLY_TEMPERATURES[month]
+}
+
+/// The running total at `at`, for a house using two kWh per heating degree day over ten
+/// kWh a day since the start of 2024, from 10,000 kWh.
+fn total_at(at: i64) -> f64 {
+    let mut total = 10_000.0;
+    let mut day = ts("2024-01-01 00:00:00");
+    while day < at {
+        let share = (at - day).min(86_400) as f64 / 86_400.0;
+        total += share * (2.0 * (15.0f64 - temperature_at(day)).max(0.0) + 10.0);
+        day += 86_400;
+    }
+    total
+}
+
+/// Midnight UTC on the first of every month from January 2024 to January 2025: readings
+/// that each close the month before.
+fn month_starts() -> Vec<i64> {
+    let mut starts: Vec<i64> = (1..=12)
+        .map(|month| ts(&format!("2024-{month:02}-01 00:00:00")))
+        .collect();
+    starts.push(ts("2025-01-01 00:00:00"));
+    starts
 }
 
 /// Run the binary on `conn`, written to a file, with the heating energy from `entity`.
@@ -731,96 +737,144 @@ fn with_energy(scratch: &Scratch, conn: &Connection, entity: &str) -> (String, S
     (stdout, stderr, std::fs::read_to_string(out).unwrap())
 }
 
-#[test]
-fn monthly_heating_energy_gives_the_houses_kwh_per_degree_day() {
-    let scratch = Scratch::new("energy-states");
-    let (conn, energy) = heating_year();
-    let id = testdb::insert_states_meta(&conn, HEATING_ENERGY);
-    for (month, kwh) in &energy {
-        let value = format!("{kwh}");
-        testdb::insert_state(&conn, Flavour::Modern, "", id, month_end(*month), &value);
-        // Written again at a restart a week later: still the same month's.
-        testdb::insert_state(
-            &conn,
-            Flavour::Modern,
-            "",
-            id,
-            month_end(*month) + 7 * 86_400,
-            &value,
-        );
+/// Write the running total as raw states at `times`, each again at a restart a week on.
+fn raw_states(conn: &Connection, times: &[i64]) {
+    let id = testdb::insert_states_meta(conn, HEATING_ENERGY);
+    for at in times {
+        let value = format!("{:.3}", total_at(*at));
+        testdb::insert_state(conn, Flavour::Modern, "", id, *at, &value);
     }
+    for at in times {
+        let value = format!("{:.3}", total_at(*at));
+        testdb::insert_state(conn, Flavour::Modern, "", id, at + 7 * 86_400 - 1, &value);
+    }
+}
+
+#[test]
+fn a_monthly_meter_gives_the_houses_kwh_per_degree_day() {
+    let scratch = Scratch::new("energy-monthly");
+    let conn = heating_year();
+    raw_states(&conn, &month_starts());
 
     let (stdout, stderr, html) = with_energy(&scratch, &conn, HEATING_ENERGY);
     assert!(
         stdout.contains(
-            "efficiency: 2.00 kWh per heating degree day (± 0.00), and 300 kWh a month without \
-             heating - a line through 12 months of number.heizol_energy"
+            "efficiency: 2.00 kWh per heating degree day (± 0.00), and 10.0 kWh a day without \
+             heating - a line through 12 periods between readings of number.heizol_energy"
         ),
         "{stdout}"
     );
     assert!(
-        stdout.contains("  2023/24: 2.00 kWh per degree day (± 0.00) over 6 months"),
+        stdout.contains("  2023/24: 2.00 kWh per degree day (± 0.00) over 6 periods"),
         "{stdout}"
     );
     assert!(
-        stdout.contains("  2024/25: 2.00 kWh per degree day (± 0.00) over 6 months, 0% "),
+        stdout.contains("  2024/25: 2.00 kWh per degree day (± 0.00) over 6 periods, 0% "),
         "{stdout}"
     );
     assert!(
-        stderr.contains("read 12 monthly values of number.heizol_energy from its raw states"),
+        stderr.contains("read 13 readings of number.heizol_energy from its raw states"),
         "{stderr}"
     );
     assert!(html.contains("<h2>Heating energy</h2>"));
     assert!(html.contains("<strong>2.00 kWh</strong> per heating degree day"));
     assert_eq!(html.matches("class=\"dot\"").count(), 12);
+    assert!(html.contains("<th scope=\"row\">January 2024</th><td>31</td>"));
 }
 
 #[test]
-fn heating_energy_kept_as_long_term_statistics_is_read_from_them() {
+fn a_fortnightly_meter_tells_the_same_story() {
+    let scratch = Scratch::new("energy-fortnightly");
+    let conn = heating_year();
+    let fortnights: Vec<i64> = (0..26)
+        .map(|index| ts("2024-01-03 12:00:00") + index * 14 * 86_400)
+        .collect();
+    raw_states(&conn, &fortnights);
+
+    let (stdout, _, html) = with_energy(&scratch, &conn, HEATING_ENERGY);
+    assert!(
+        stdout.contains(
+            "efficiency: 2.00 kWh per heating degree day (± 0.00), and 10.0 kWh a day without \
+             heating - a line through 25 periods"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        html.contains("3 Jan - 17 Jan 2024"),
+        "fortnights go by their dates"
+    );
+}
+
+#[test]
+fn a_reading_skipped_makes_one_longer_period() {
+    let scratch = Scratch::new("energy-skipped");
+    let conn = heating_year();
+    // Nobody read the meter at the end of July.
+    let times: Vec<i64> = month_starts()
+        .into_iter()
+        .filter(|at| *at != ts("2024-08-01 00:00:00"))
+        .collect();
+    raw_states(&conn, &times);
+
+    let (stdout, _, html) = with_energy(&scratch, &conn, HEATING_ENERGY);
+    assert!(
+        stdout.contains("2.00 kWh per heating degree day (± 0.00)"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("a line through 11 periods"), "{stdout}");
+    assert!(
+        html.contains("1 Jul - 1 Sep 2024"),
+        "July and August as one"
+    );
+}
+
+#[test]
+fn a_meter_kept_as_long_term_statistics_is_read_from_them() {
     let scratch = Scratch::new("energy-statistics");
-    let (conn, energy) = heating_year();
-    // A template sensor with a state class of total, which Home Assistant keeps for good.
-    let id = testdb::insert_statistic_meta(&conn, "sensor.heizol_energy_month", Some("MWh"));
-    for (month, kwh) in &energy {
+    let conn = heating_year();
+    // A sensor with a state class of total_increasing, which Home Assistant keeps for good,
+    // here in MWh. Its hourly state carries the total from each reading on.
+    let id = testdb::insert_statistic_meta(&conn, "sensor.heizol_energy_total", Some("MWh"));
+    let readings = month_starts();
+    let mut hour = readings[0] - 3_600;
+    while hour < *readings.last().unwrap() {
+        let read = readings
+            .iter()
+            .rev()
+            .find(|at| **at <= hour + 3_600)
+            .unwrap();
         testdb::insert_statistics_sum_row(
             &conn,
             Flavour::Modern,
             "statistics",
             id,
-            month_end(*month),
-            kwh / 1_000.0,
+            hour,
+            total_at(*read) / 1_000.0,
         );
+        hour += 3_600;
     }
 
-    let (stdout, stderr, _) = with_energy(&scratch, &conn, "sensor.heizol_energy_month");
+    let (stdout, stderr, _) = with_energy(&scratch, &conn, "sensor.heizol_energy_total");
     assert!(
         stdout.contains("efficiency: 2.00 kWh per heating degree day"),
         "MWh are read as kWh: {stdout}"
     );
+    assert!(stdout.contains("a line through 12 periods"), "{stdout}");
     assert!(stderr.contains("from its long-term statistics"), "{stderr}");
 }
 
 #[test]
 fn a_short_history_says_what_it_has_and_how_to_keep_more() {
     let scratch = Scratch::new("energy-short");
-    let (conn, energy) = heating_year();
-    let id = testdb::insert_states_meta(&conn, HEATING_ENERGY);
-    // Ten days of raw states hold last month's value, and nothing before.
-    let (month, kwh) = energy[11];
-    testdb::insert_state(
-        &conn,
-        Flavour::Modern,
-        "",
-        id,
-        month_end(month),
-        &format!("{kwh}"),
-    );
+    let conn = heating_year();
+    // Ten days of raw states hold the last reading, and nothing before.
+    raw_states(&conn, &month_starts()[12..]);
 
     let (stdout, _, html) = with_energy(&scratch, &conn, HEATING_ENERGY);
     assert!(
         stdout.contains(
-            "efficiency: no line yet - 1 month of number.heizol_energy falls where the outside \
-             was recorded, 1 fully enough, and a line needs 3"
+            "efficiency: no line yet - 1 reading of number.heizol_energy makes 0 periods of at \
+             least a week where the outside was recorded, 0 fully enough, and a line needs 3"
         ),
         "{stdout}"
     );
@@ -829,29 +883,4 @@ fn a_short_history_says_what_it_has_and_how_to_keep_more() {
         "{stdout}"
     );
     assert!(html.contains("There is no line to draw yet"));
-}
-
-#[test]
-fn a_month_that_left_no_value_is_named() {
-    let scratch = Scratch::new("energy-unrecorded");
-    let (conn, energy) = heating_year();
-    let id = testdb::insert_states_meta(&conn, HEATING_ENERGY);
-    // The helper was set every month but July, which left no row.
-    for (month, kwh) in energy.iter().filter(|(month, _)| *month != 7) {
-        testdb::insert_state(
-            &conn,
-            Flavour::Modern,
-            "",
-            id,
-            month_end(*month),
-            &format!("{kwh}"),
-        );
-    }
-
-    let (stdout, _, _) = with_energy(&scratch, &conn, HEATING_ENERGY);
-    assert!(stdout.contains("a line through 11 months"), "{stdout}");
-    assert!(
-        stdout.contains("note: no value of number.heizol_energy is on record for July 2024"),
-        "{stdout}"
-    );
 }

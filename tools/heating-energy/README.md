@@ -16,7 +16,7 @@ heating degree days was no less efficient than the other.
 
 `heating-energy` counts them from an outdoor thermometer in a Home Assistant recorder
 database, per month or per ISO week and per year, and shows beside them how warm every
-room and floor was kept over the same days. Given the energy the heating used each month,
+room and floor was kept over the same days. Given the heating's energy as a running total,
 it also works out [what one degree day costs the house](#heating-energy-and-efficiency),
 season by season.
 
@@ -134,8 +134,9 @@ nothing to configure:
 
 ## Heating energy and efficiency
 
-Give it the energy the heating used each month and it plots every month's kWh against its
-heating degree days, and fits a straight line through them:
+Give it the heating's energy as a running total - a meter in kWh, read monthly, every two
+weeks or whenever - and it plots every period between two readings against its heating
+degree days, and fits a straight line through them:
 
 ```sh
 heating-energy --db ha.db --outside-entity sensor.outdoor_temperature \
@@ -143,68 +144,69 @@ heating-energy --db ha.db --outside-entity sensor.outdoor_temperature \
 ```
 
 ```
-efficiency: 2.56 kWh per heating degree day (± 0.10), and 334 kWh a month without heating - a line through 24 months of number.heizol_energy
-  2022/23: 2.66 kWh per degree day (± 0.14) over 6 months
-  2023/24: 2.62 kWh per degree day (± 0.11) over 12 months, 2% less than 2022/23
-  2024/25: 2.17 kWh per degree day (± 0.14) over 6 months, 17% less than 2023/24
+efficiency: 2.49 kWh per heating degree day (± 0.06), and 12.3 kWh a day without heating - a line through 22 periods between readings of number.heizol_energy
+  2022/23: 2.43 kWh per degree day (± 0.01) over 5 periods
+  2023/24: 2.57 kWh per degree day (± 0.03) over 12 periods, 6% more than 2022/23
+  2024/25: 2.10 kWh per degree day (± 0.03) over 5 periods, 18% less than 2023/24
 ```
 
-![Monthly heating energy against degree days, and kWh per degree day per season](docs/energy-light.png)
+![Heating energy a day against degree days a day, and kWh per degree day per season](docs/energy-light.png)
 
 The **slope** is the house's efficiency figure: the energy one more heating degree day
-costs. The weather only moves a month along the line, so insulation, new windows or a
+costs. The weather only moves a period along the line, so insulation, new windows or a
 boiler tune-up show as a lower slope however cold the winter was. (The example is the demo
-database with a made-up monthly helper added, for a house insulated in the summer of
-2024.) Where the line meets zero
-degree days is what the house uses **without heating**: hot water, standby losses. The
-report shows the months and the line, the slope of every heating season (July to June, so
-a winter is never split) as a bar with its standard error, and a table of both.
+database with a made-up meter added, for a house insulated in the summer of 2024.) Where
+the line meets zero degree days is what the house uses a day **without heating**: hot
+water, standby losses. The report shows the periods and the line, the slope of every
+heating season (July to June, so a winter is never split) as a bar with its standard
+error, and a table of both.
 
-* **The entity holds each month's energy, in kWh.** It is set on the last day of the
-  month to what the heating used that month - not a running total. A value counts for the
-  month the day before it was set falls in, so one set just after midnight on the 1st
-  still counts for the month that ended; a month given two values keeps the later.
-* **Months are matched to whole months of weather.** The energy covers the whole month,
-  so a month whose degree days miss a day or two has them scaled up to all its days; one
-  missing more than a tenth is left out of the fit, and the run names it.
-* **A line needs three months**, milder and colder ones: summer months alone say nothing
-  about what heating costs. A season gets a line of its own on the same terms.
+* **Every period between two readings is a point.** Its energy is what the total grew
+  by; its heating degree days are those of exactly the same stretch of time, a day read
+  in the evening split where the reading fell. Read monthly, the periods are the months;
+  read every two weeks, they are fortnights, and the line is the same.
+* **Both are per day**, so periods of different lengths compare alike, and each counts
+  for as many days as it lasted: two fortnights weigh what one month does. A reading
+  skipped just makes one longer period.
+* **Readings are changes of the total.** One written again unchanged - at a restart - is
+  no new reading, and one changed again within two days is one reading, the later value
+  standing, so a typo put right does not count twice. Readings less than a week after the
+  last are folded into the next period, so a total that changes every hour still gives
+  periods with a week of weather in them.
+* **A period needs its weather.** One the outside thermometer missed a day or two of has
+  its degree days scaled up to all of it, since the energy covers the whole; one missing
+  more than a tenth is left out, and so is one over which the total went down. The run
+  names them.
+* **A line needs three periods**, milder and colder ones: summer alone says nothing about
+  what heating costs. A season gets a line of its own on the same terms, and a period
+  belongs to the season its middle falls in.
 * **The ±** is the slope's standard error. Two seasons whose slopes are further apart
   than their errors put together differ by more than the weather's noise.
 
-### Keeping the monthly values
+### Keeping the readings
 
-Home Assistant keeps a `number` or `input_number` entity's values only in its raw
-states, which it purges after ten days by default - so a helper set once a month has
-about one month on record at any time. Two ways to keep them for good:
+A sensor with a state class - `total_increasing` for a meter - is kept by Home Assistant
+as long-term statistics for as long as the database lives, and the tool reads them. A
+plain `number` or `input_number` helper has no statistics: its values live only in the
+raw states, purged after ten days by default. Copy such a helper into a template sensor
+and pass that instead:
 
-* Copy the helper into a template sensor with a state class, which Home Assistant keeps
-  as long-term statistics for as long as the database lives, and pass that sensor
-  instead. Its history starts the day it is created.
+```yaml
+template:
+  - sensor:
+      - name: "Heizöl Energie"
+        unique_id: heizol_energy_total
+        unit_of_measurement: kWh
+        device_class: energy
+        state_class: total_increasing
+        availability: "{{ has_value('input_number.heizol_energy') }}"
+        state: "{{ states('input_number.heizol_energy') | float }}"
+```
 
-  ```yaml
-  template:
-    - sensor:
-        - name: "Heizöl Energie Monat"
-          unique_id: heizol_energy_month
-          unit_of_measurement: kWh
-          device_class: energy
-          state_class: total
-          availability: "{{ has_value('number.heizol_energy') }}"
-          state: "{{ states('number.heizol_energy') | float }}"
-  ```
-
-  The availability line matters: without it, a restart that briefly leaves the helper
-  unavailable would record a 0 just after a month ended, and the month would read as
-  using nothing.
-
-* Or keep raw states longer, with `purge_keep_days` under `recorder:` - for every entity,
-  so the database grows with it.
-
-The tool reads long-term statistics where the entity has them and raw states otherwise,
-and with `-v` says which. One thing neither keeps: setting a helper to the value it
-already has records nothing, so a month that used exactly what the month before did
-leaves no trace. Such a month is named in the run and the report, not guessed at.
+The availability line matters: without it, a restart that briefly leaves the helper
+unavailable would record a 0, and a total that drops to nothing and back reads as a meter
+replaced. With `-v` the run says whether it read statistics or raw states, and how many
+readings it found. Its units may be kWh, Wh or MWh.
 
 ## How it is counted
 
@@ -240,7 +242,7 @@ leaves no trace. Such a month is named in the run and the report, not guessed at
 |---|---|---|
 | `--outside-entity <ID>` | required | The outdoor thermometer, e.g. `sensor.outdoor_temperature` |
 | `--rooms <FILE>` | none | The [rooms file](#the-rooms-file): floors, rooms and their thermometers |
-| `--energy-entity <ID>` | none | [Monthly heating energy](#heating-energy-and-efficiency) in kWh, set on the last day of each month |
+| `--energy-entity <ID>` | none | The [heating's energy as a running total](#heating-energy-and-efficiency) in kWh, read monthly or whenever |
 | `--heating-base <°C>` | `15` | Outside temperature above which a day needs no heating |
 | `--cooling-base <°C>` | `21` | Outside temperature above which a day needs cooling; not below the heating base |
 | `--group <month\|week>` | `month` | Sum per calendar month or per ISO week |
