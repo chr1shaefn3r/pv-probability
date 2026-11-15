@@ -653,3 +653,205 @@ fn days_only_some_thermometers_covered_rest_on_those_and_are_counted() {
         "{stderr}"
     );
 }
+
+/// The heating energy helper, as Home Assistant names it.
+const HEATING_ENERGY: &str = "number.heizol_energy";
+
+/// 2024 month by month: outside, every month at its own steady temperature below the
+/// heating base, and the heating energy each month used - two kWh per heating degree day
+/// over a base of 300 - as `(month, kWh)`. No two months use the same.
+fn heating_year() -> (Connection, Vec<(u32, f64)>) {
+    let conn = Connection::open_in_memory().unwrap();
+    testdb::create_schema(&conn, Flavour::Modern);
+    let outside = testdb::insert_statistic_meta(&conn, OUTSIDE_ENTITY, Some("°C"));
+    let temperatures = [
+        0.0, 2.0, 5.0, 9.0, 13.0, 14.5, 14.0, 13.5, 12.0, 10.0, 5.0, 1.0,
+    ];
+    let mut energy = Vec::new();
+    for (index, temperature) in temperatures.iter().enumerate() {
+        let month = index as u32 + 1;
+        let first = ts(&format!("2024-{month:02}-01 00:00:00"));
+        let next = if month == 12 {
+            ts("2025-01-01 00:00:00")
+        } else {
+            ts(&format!("2024-{:02}-01 00:00:00", month + 1))
+        };
+        let mut hour = first;
+        while hour < next {
+            testdb::insert_statistics_row(
+                &conn,
+                Flavour::Modern,
+                "statistics",
+                outside,
+                hour,
+                Some(*temperature),
+            );
+            hour += 3_600;
+        }
+        let days = ((next - first) / 86_400) as f64;
+        let hdd = days * (15.0f64 - temperature).max(0.0);
+        energy.push((month, 2.0 * hdd + 300.0));
+    }
+    (conn, energy)
+}
+
+/// The last day of `month` in 2024, at 20:00 UTC.
+fn month_end(month: u32) -> i64 {
+    let next = if month == 12 {
+        ts("2025-01-01 20:00:00")
+    } else {
+        ts(&format!("2024-{:02}-01 20:00:00", month + 1))
+    };
+    next - 86_400
+}
+
+/// Run the binary on `conn`, written to a file, with the heating energy from `entity`.
+fn with_energy(scratch: &Scratch, conn: &Connection, entity: &str) -> (String, String, String) {
+    let db = scratch.path("ha.db");
+    let _ = std::fs::remove_file(&db);
+    conn.execute("VACUUM INTO ?1", [db.to_str().unwrap()])
+        .unwrap();
+    let out = scratch.path("report.html");
+    let output = heating_energy(&[
+        "--db".as_ref(),
+        db.as_os_str(),
+        "--outside-entity".as_ref(),
+        OUTSIDE_ENTITY.as_ref(),
+        "--energy-entity".as_ref(),
+        entity.as_ref(),
+        "--tz".as_ref(),
+        "UTC".as_ref(),
+        "-v".as_ref(),
+        "-o".as_ref(),
+        out.as_os_str(),
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(output.status.success(), "{stdout}{stderr}");
+    (stdout, stderr, std::fs::read_to_string(out).unwrap())
+}
+
+#[test]
+fn monthly_heating_energy_gives_the_houses_kwh_per_degree_day() {
+    let scratch = Scratch::new("energy-states");
+    let (conn, energy) = heating_year();
+    let id = testdb::insert_states_meta(&conn, HEATING_ENERGY);
+    for (month, kwh) in &energy {
+        let value = format!("{kwh}");
+        testdb::insert_state(&conn, Flavour::Modern, "", id, month_end(*month), &value);
+        // Written again at a restart a week later: still the same month's.
+        testdb::insert_state(
+            &conn,
+            Flavour::Modern,
+            "",
+            id,
+            month_end(*month) + 7 * 86_400,
+            &value,
+        );
+    }
+
+    let (stdout, stderr, html) = with_energy(&scratch, &conn, HEATING_ENERGY);
+    assert!(
+        stdout.contains(
+            "efficiency: 2.00 kWh per heating degree day (± 0.00), and 300 kWh a month without \
+             heating - a line through 12 months of number.heizol_energy"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("  2023/24: 2.00 kWh per degree day (± 0.00) over 6 months"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("  2024/25: 2.00 kWh per degree day (± 0.00) over 6 months, 0% "),
+        "{stdout}"
+    );
+    assert!(
+        stderr.contains("read 12 monthly values of number.heizol_energy from its raw states"),
+        "{stderr}"
+    );
+    assert!(html.contains("<h2>Heating energy</h2>"));
+    assert!(html.contains("<strong>2.00 kWh</strong> per heating degree day"));
+    assert_eq!(html.matches("class=\"dot\"").count(), 12);
+}
+
+#[test]
+fn heating_energy_kept_as_long_term_statistics_is_read_from_them() {
+    let scratch = Scratch::new("energy-statistics");
+    let (conn, energy) = heating_year();
+    // A template sensor with a state class of total, which Home Assistant keeps for good.
+    let id = testdb::insert_statistic_meta(&conn, "sensor.heizol_energy_month", Some("MWh"));
+    for (month, kwh) in &energy {
+        testdb::insert_statistics_sum_row(
+            &conn,
+            Flavour::Modern,
+            "statistics",
+            id,
+            month_end(*month),
+            kwh / 1_000.0,
+        );
+    }
+
+    let (stdout, stderr, _) = with_energy(&scratch, &conn, "sensor.heizol_energy_month");
+    assert!(
+        stdout.contains("efficiency: 2.00 kWh per heating degree day"),
+        "MWh are read as kWh: {stdout}"
+    );
+    assert!(stderr.contains("from its long-term statistics"), "{stderr}");
+}
+
+#[test]
+fn a_short_history_says_what_it_has_and_how_to_keep_more() {
+    let scratch = Scratch::new("energy-short");
+    let (conn, energy) = heating_year();
+    let id = testdb::insert_states_meta(&conn, HEATING_ENERGY);
+    // Ten days of raw states hold last month's value, and nothing before.
+    let (month, kwh) = energy[11];
+    testdb::insert_state(
+        &conn,
+        Flavour::Modern,
+        "",
+        id,
+        month_end(month),
+        &format!("{kwh}"),
+    );
+
+    let (stdout, _, html) = with_energy(&scratch, &conn, HEATING_ENERGY);
+    assert!(
+        stdout.contains(
+            "efficiency: no line yet - 1 month of number.heizol_energy falls where the outside \
+             was recorded, 1 fully enough, and a line needs 3"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("see the README for keeping them"),
+        "{stdout}"
+    );
+    assert!(html.contains("There is no line to draw yet"));
+}
+
+#[test]
+fn a_month_that_left_no_value_is_named() {
+    let scratch = Scratch::new("energy-unrecorded");
+    let (conn, energy) = heating_year();
+    let id = testdb::insert_states_meta(&conn, HEATING_ENERGY);
+    // The helper was set every month but July, which left no row.
+    for (month, kwh) in energy.iter().filter(|(month, _)| *month != 7) {
+        testdb::insert_state(
+            &conn,
+            Flavour::Modern,
+            "",
+            id,
+            month_end(*month),
+            &format!("{kwh}"),
+        );
+    }
+
+    let (stdout, _, _) = with_energy(&scratch, &conn, HEATING_ENERGY);
+    assert!(stdout.contains("a line through 11 months"), "{stdout}");
+    assert!(
+        stdout.contains("note: no value of number.heizol_energy is on record for July 2024"),
+        "{stdout}"
+    );
+}

@@ -16,6 +16,7 @@
 pub mod cli;
 pub mod daily;
 pub mod degree;
+pub mod energy;
 pub mod offset;
 pub mod report;
 pub mod rooms;

@@ -11,7 +11,7 @@ use rusqlite::types::Value;
 use crate::model::Sample;
 use crate::quantity::{Conversion, Quantity};
 use crate::source::schema::{
-    self, StatisticsTable, TimeColumn, ValueColumn, find_statistic, not_found_error,
+    self, StatisticsTable, TimeColumn, ValueColumn, column_names, find_statistic, not_found_error,
     statistics_layout, value_to_f64, value_to_timestamp,
 };
 use crate::source::slices::{self, Slice};
@@ -178,6 +178,60 @@ pub fn load(conn: &Connection, request: &Request<'_>) -> Result<Loaded> {
         conversion,
         rows,
     })
+}
+
+/// What a statistic read at the end of every hour of its long-term history, with its
+/// unit; `None` when the database has no such statistic.
+///
+/// That is the `state` column, which Home Assistant keeps for a sensor with a state class
+/// of `total` or `total_increasing`: what it read as the hour ended. A measurement has no
+/// state and gives its hourly mean instead. Every value is stamped with the end of its
+/// hour, when it is known to have held. Unlike raw states, these are kept for as long as
+/// the database lives.
+pub fn hourly_values(conn: &Connection, statistic_id: &str) -> Result<Option<HourlyValues>> {
+    let Some(meta) = find_statistic(conn, statistic_id)? else {
+        return Ok(None);
+    };
+    let table = StatisticsTable::LongTerm;
+    let time = statistics_layout(conn, table, ValueColumn::Mean)?.name();
+    let has_state = column_names(conn, table.table_name())?
+        .iter()
+        .any(|column| column == "state");
+    let value = if has_state {
+        "COALESCE(state, mean)"
+    } else {
+        "mean"
+    };
+    let sql = format!(
+        "SELECT \"{time}\", {value} FROM \"{}\" WHERE metadata_id = ?1 ORDER BY \"{time}\"",
+        table.table_name()
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([meta.metadata_id], |row| {
+        Ok((row.get::<_, Value>(0)?, row.get::<_, Value>(1)?))
+    })?;
+    let mut values = Vec::new();
+    for row in rows {
+        let (raw_time, raw_value) = row?;
+        if let (Some(start), Some(value)) =
+            (value_to_timestamp(&raw_time), value_to_f64(&raw_value))
+        {
+            values.push((start + table.interval_seconds(), value));
+        }
+    }
+    values.sort_by_key(|(ts, _)| *ts);
+    Ok(Some(HourlyValues {
+        values,
+        unit: meta.unit,
+    }))
+}
+
+/// What a statistic read at the end of each hour, in time order, and the unit it is in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HourlyValues {
+    /// `(end of the hour, value)`.
+    pub values: Vec<(i64, f64)>,
+    pub unit: Option<String>,
 }
 
 /// How readings recorded in `unit` become `quantity`'s working unit.
@@ -396,6 +450,50 @@ mod tests {
         assert!(error.contains("sensor.solar_powr"), "{error}");
         assert!(error.contains("did you mean"), "{error}");
         assert!(error.contains(ENTITY), "{error}");
+    }
+
+    #[test]
+    fn a_totals_hourly_values_are_its_state_at_the_end_of_each_hour() {
+        for flavour in [Flavour::Modern, Flavour::Legacy] {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            testdb::create_schema(&conn, flavour);
+            let total = testdb::insert_statistic_meta(&conn, "sensor.heating_month", Some("kWh"));
+            let hour = ts("2024-01-31 20:00:00");
+            for (offset, value) in [(0, 1_200.0), (1, 1_850.5), (2, 1_850.5)] {
+                testdb::insert_statistics_sum_row(
+                    &conn,
+                    flavour,
+                    "statistics",
+                    total,
+                    hour + offset * 3_600,
+                    value,
+                );
+            }
+            let HourlyValues { values, unit } = hourly_values(&conn, "sensor.heating_month")
+                .unwrap()
+                .unwrap();
+            assert_eq!(unit.as_deref(), Some("kWh"));
+            assert_eq!(
+                values,
+                [
+                    (hour + 3_600, 1_200.0),
+                    (hour + 7_200, 1_850.5),
+                    (hour + 10_800, 1_850.5)
+                ],
+                "{flavour:?}"
+            );
+
+            // A measurement has no state, so its mean stands in.
+            let measured = testdb::insert_statistic_meta(&conn, "sensor.heating_level", None);
+            testdb::insert_statistics_row(&conn, flavour, "statistics", measured, hour, Some(4.0));
+            let HourlyValues { values, unit } = hourly_values(&conn, "sensor.heating_level")
+                .unwrap()
+                .unwrap();
+            assert_eq!(values, [(hour + 3_600, 4.0)]);
+            assert_eq!(unit, None);
+
+            assert_eq!(hourly_values(&conn, "number.heating").unwrap(), None);
+        }
     }
 
     #[test]

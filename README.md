@@ -9,7 +9,7 @@ answer one question about your home's energy as a self-contained HTML report:
 |---|---|
 | **[`pv-probability`](tools/pv-probability/README.md)** | How much solar power can I count on, hour by hour and month by month? |
 | **[`energy-storage-payback-period`](tools/energy-storage-payback-period/README.md)** | How long would a home battery take to pay for itself? |
-| **[`heating-energy`](tools/heating-energy/README.md)** | How much heating did the weather ask for, and how warm was every room kept? |
+| **[`heating-energy`](tools/heating-energy/README.md)** | How much heating did the weather ask for, how warm was every room kept, and what does a degree day cost the house? |
 
 ![Monthly likelihood heatmaps from pv-probability](tools/pv-probability/docs/example-light.png)
 

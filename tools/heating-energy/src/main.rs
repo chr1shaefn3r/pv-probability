@@ -4,7 +4,7 @@
 use std::fs;
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::Datelike;
 use chrono_tz::Tz;
 use clap::Parser;
@@ -12,16 +12,19 @@ use rayon::prelude::*;
 
 use ha_recorder::coverage::Coverage;
 use ha_recorder::model::Grouping;
-use ha_recorder::source::{self, LoadedSamples, SourceKind};
+use ha_recorder::source::{self, LoadedSamples, SourceKind, states, statistics};
 use ha_recorder::{Quantity, Sample};
 use ha_report::{format_duration, open_command};
 
 use heating_energy::cli::{Args, Config};
 use heating_energy::daily::{DayMean, daily_means, room_days};
 use heating_energy::degree::{Analysis, analyse};
+use heating_energy::energy::{self, Reading, format_energy, format_slope, monthly_values};
 use heating_energy::offset::{self, Check, Correction, Finding, format_offset, local_stamp};
-use heating_energy::report::{ReportOptions, format_celsius, format_degree_days, page};
-use heating_energy::rooms::House;
+use heating_energy::report::{
+    EnergySection, ReportOptions, format_celsius, format_degree_days, page,
+};
+use heating_energy::rooms::{Floor, House, Room};
 
 fn main() {
     if let Err(error) = run() {
@@ -68,33 +71,19 @@ fn run() -> Result<()> {
         );
     }
     // A thermostat's offset is looked for and taken back out in its own task, before its
-    // days are counted.
-    let read_all: Vec<Result<Thermometer>> = thermometers
-        .par_iter()
-        .map(|(entity, room)| {
-            let (loaded, finding) = match room {
-                Some((floor, room)) => read_room(&args, &config, entity).with_context(|| {
-                    if room.sensors.len() == 1 {
-                        format!("reading the thermometer of {} / {}", floor.name, room.name)
-                    } else {
-                        format!(
-                            "reading the thermometer {entity} of {} / {}",
-                            floor.name, room.name
-                        )
-                    }
-                })?,
-                None => (read(&args, &config, entity)?, None),
-            };
-            let days = daily_means(&loaded.samples, tz);
-            Ok(Thermometer {
-                loaded,
-                days,
-                finding,
-            })
-        })
-        .collect();
+    // days are counted, and the monthly heating energy, if asked for, is read beside them.
+    let (read_all, energy_read): (Vec<Result<Thermometer>>, _) = rayon::join(
+        || read_thermometers(&args, &config, &thermometers),
+        || {
+            args.energy_entity
+                .as_deref()
+                .map(|entity| read_energy(&args, entity, tz))
+                .transpose()
+        },
+    );
     // The first thermometer that failed, in the file's order, is the one reported.
     let mut read_all = read_all.into_iter().collect::<Result<Vec<_>>>()?;
+    let energy_read = energy_read?;
     let outside = read_all.remove(0);
     let (outside, outside_days) = (outside.loaded, outside.days);
     // Each room's thermometers, read in the file's order, become the room's days.
@@ -193,6 +182,34 @@ fn run() -> Result<()> {
             )
         },
     );
+    // Every month's heating energy beside its degree days, and the line through them.
+    let energy = match (&args.energy_entity, energy_read) {
+        (Some(entity), Some(read)) => {
+            if args.verbose > 0 {
+                eprintln!(
+                    "read {} monthly value{} of {entity} from its {}",
+                    read.readings.len(),
+                    if read.readings.len() == 1 { "" } else { "s" },
+                    if read.from_raw_states {
+                        "raw states"
+                    } else {
+                        "long-term statistics"
+                    }
+                );
+            }
+            Some(EnergySection {
+                entity: entity.clone(),
+                energy: energy::analyse(
+                    &read.readings,
+                    &outside_days,
+                    config.bases,
+                    config.min_day_coverage,
+                ),
+                from_raw_states: read.from_raw_states,
+            })
+        }
+        _ => None,
+    };
     if args.verbose > 0 {
         eprintln!(
             "counted {} of {} days into {} periods in {:.2?}",
@@ -212,12 +229,18 @@ fn run() -> Result<()> {
             coverage: coverage.clone(),
             tz,
             room_notes,
+            energy: energy.clone(),
         },
     );
     fs::write(&args.out, &html)
         .with_context(|| format!("failed to write {}", args.out.display()))?;
 
     report(&args, &analysis, house.as_ref(), html.len(), started);
+    if let Some(section) = &energy {
+        for line in energy_lines(section) {
+            println!("{line}");
+        }
+    }
     for line in finding_lines(&findings, tz) {
         println!("{line}");
     }
@@ -236,6 +259,82 @@ fn run() -> Result<()> {
     // The last line is the one worth copying.
     println!("\n{}", open_command(&args.out));
     Ok(())
+}
+
+/// Read every thermometer on a connection of its own, in parallel, with its daily means,
+/// in the order given.
+fn read_thermometers(
+    args: &Args,
+    config: &Config,
+    thermometers: &[(&str, Option<(&Floor, &Room)>)],
+) -> Vec<Result<Thermometer>> {
+    let tz = config.recorder.tz;
+    thermometers
+        .par_iter()
+        .map(|(entity, room)| {
+            let (loaded, finding) = match room {
+                Some((floor, room)) => read_room(args, config, entity).with_context(|| {
+                    if room.sensors.len() == 1 {
+                        format!("reading the thermometer of {} / {}", floor.name, room.name)
+                    } else {
+                        format!(
+                            "reading the thermometer {entity} of {} / {}",
+                            floor.name, room.name
+                        )
+                    }
+                })?,
+                None => (read(args, config, entity)?, None),
+            };
+            let days = daily_means(&loaded.samples, tz);
+            Ok(Thermometer {
+                loaded,
+                days,
+                finding,
+            })
+        })
+        .collect()
+}
+
+/// The monthly heating energy, and where it was read from.
+struct EnergyRead {
+    readings: Vec<Reading>,
+    from_raw_states: bool,
+}
+
+/// Read the monthly heating energy on its own connection: from its long-term statistics
+/// where it has them, which Home Assistant keeps for good, otherwise from its raw states.
+fn read_energy(args: &Args, entity: &str, tz: Tz) -> Result<EnergyRead> {
+    let conn = source::open_database(&args.recorder.db)?;
+    let (history, scale, from_raw_states) = match statistics::hourly_values(&conn, entity)? {
+        Some(hourly) if !hourly.values.is_empty() => (
+            hourly.values,
+            energy_scale(entity, hourly.unit.as_deref())?,
+            false,
+        ),
+        _ => (
+            states::history(&conn, entity)
+                .with_context(|| format!("reading the heating energy, {entity}"))?,
+            1.0,
+            true,
+        ),
+    };
+    Ok(EnergyRead {
+        readings: monthly_values(&history, scale, tz),
+        from_raw_states,
+    })
+}
+
+/// What turns the energy entity's unit into kWh. Raw states carry no unit, and are taken
+/// to be in kWh.
+fn energy_scale(entity: &str, unit: Option<&str>) -> Result<f64> {
+    match unit.map(str::trim) {
+        None | Some("") | Some("kWh") => Ok(1.0),
+        Some("Wh") => Ok(0.001),
+        Some("MWh") => Ok(1_000.0),
+        Some(other) => {
+            bail!("{entity} is recorded in {other}; the heating energy has to be in kWh, Wh or MWh")
+        }
+    }
 }
 
 /// One thermometer read, its days counted, and what became of its offset.
@@ -347,6 +446,122 @@ fn report(args: &Args, analysis: &Analysis, house: Option<&House>, bytes: usize,
             args.min_day_coverage * 100.0
         );
     }
+}
+
+/// The efficiency figure and how it moved season by season, as lines for the terminal.
+fn energy_lines(section: &EnergySection) -> Vec<String> {
+    let energy = &section.energy;
+    let entity = &section.entity;
+    let mut lines = Vec::new();
+    match &energy.overall {
+        Some(fit) => lines.push(format!(
+            "efficiency: {} kWh per heating degree day (± {}), and {} a month without heating - \
+             a line through {} months of {entity}",
+            format_slope(fit.slope),
+            format_slope(fit.slope_error),
+            format_energy(fit.base),
+            fit.months
+        )),
+        None => {
+            let mut line = format!(
+                "efficiency: no line yet - {} month{} of {entity} {} where the outside was \
+                 recorded, {} fully enough, and a line needs {} spread over milder and colder \
+                 ones",
+                energy.months.len(),
+                if energy.months.len() == 1 { "" } else { "s" },
+                if energy.months.len() == 1 {
+                    "falls"
+                } else {
+                    "fall"
+                },
+                energy.fitted().count(),
+                energy::MIN_FIT_MONTHS
+            );
+            if section.from_raw_states {
+                line.push_str(
+                    ". Home Assistant keeps this entity's values only in its raw states, ten \
+                     days by default: see the README for keeping them",
+                );
+            }
+            lines.push(line);
+        }
+    }
+    let mut previous: Option<(String, f64)> = None;
+    for season in &energy.seasons {
+        match season.fit {
+            Some(fit) => {
+                let change = match &previous {
+                    Some((label, before)) if *before > 0.0 => {
+                        let change = fit.slope / before - 1.0;
+                        format!(
+                            ", {:.0}% {} than {label}",
+                            change.abs() * 100.0,
+                            if change < 0.0 { "less" } else { "more" }
+                        )
+                    }
+                    _ => String::new(),
+                };
+                lines.push(format!(
+                    "  {}: {} kWh per degree day (± {}) over {} months{change}",
+                    season.label(),
+                    format_slope(fit.slope),
+                    format_slope(fit.slope_error),
+                    fit.months
+                ));
+                previous = Some((season.label(), fit.slope));
+            }
+            None if energy.overall.is_some() => lines.push(format!(
+                "  {}: too few months for a line of its own ({} fitted)",
+                season.label(),
+                season.fitted
+            )),
+            None => {}
+        }
+    }
+    let left_out: Vec<String> = energy
+        .months
+        .iter()
+        .filter(|month| !month.is_fitted())
+        .map(|month| {
+            format!(
+                "{} ({} of {} days)",
+                month.month.label(),
+                month.counted_days,
+                month.month.days()
+            )
+        })
+        .collect();
+    if !left_out.is_empty() {
+        lines.push(format!(
+            "note: {} month{} of {entity} left out of the fit, the outside thermometer having \
+             counted too few of {} days: {}",
+            left_out.len(),
+            if left_out.len() == 1 { "" } else { "s" },
+            if left_out.len() == 1 { "its" } else { "their" },
+            left_out.join(", ")
+        ));
+    }
+    if !energy.unrecorded.is_empty() {
+        let names: Vec<String> = energy
+            .unrecorded
+            .iter()
+            .map(|month| month.label())
+            .collect();
+        lines.push(format!(
+            "note: no value of {entity} is on record for {} - setting it to the value it \
+             already had leaves no new row in the database",
+            names.join(", ")
+        ));
+    }
+    if energy.beyond_record > 0 {
+        lines.push(format!(
+            "note: {} month{} of {entity} fall{} outside the outside thermometer's record",
+            energy.beyond_record,
+            if energy.beyond_record == 1 { "" } else { "s" },
+            if energy.beyond_record == 1 { "s" } else { "" }
+        ));
+    }
+    lines
 }
 
 /// What became of every room's thermostat offset, as lines for the terminal: what was

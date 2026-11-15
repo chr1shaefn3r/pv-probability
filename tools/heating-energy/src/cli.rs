@@ -36,6 +36,15 @@ pub struct Args {
     #[arg(long, value_name = "FILE")]
     pub rooms: Option<PathBuf>,
 
+    /// Monthly heating energy in kWh, e.g. number.heating_oil_energy: an entity set on the
+    /// last day of every month to the energy the heating used that month.
+    ///
+    /// Fitted against the months' heating degree days, its slope - kWh per degree day - is
+    /// the house's efficiency figure, tracked season by season. Home Assistant keeps a
+    /// number entity's values only ten days by default; the README says how to keep them.
+    #[arg(long, value_name = "ENTITY_ID")]
+    pub energy_entity: Option<String>,
+
     /// Outside temperature above which a day needs no heating, in °C.
     #[arg(long, value_name = "CELSIUS", default_value_t = DEFAULT_HEATING_BASE)]
     pub heating_base: f64,

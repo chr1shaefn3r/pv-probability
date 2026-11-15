@@ -16,6 +16,10 @@ use ha_report::{escape, format_percent};
 use crate::degree::{Analysis, Summary};
 use crate::rooms::House;
 
+mod energy;
+
+pub use energy::EnergySection;
+
 /// Everything the page needs beyond the analysis itself.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReportOptions {
@@ -29,6 +33,8 @@ pub struct ReportOptions {
     /// whose thermostat offset was taken back out of its readings. The sentence follows
     /// the room's name.
     pub room_notes: Vec<(String, String)>,
+    /// Monthly heating energy against degree days, when an energy entity was given.
+    pub energy: Option<EnergySection>,
 }
 
 impl Default for ReportOptions {
@@ -40,6 +46,7 @@ impl Default for ReportOptions {
             coverage: None,
             tz: Tz::UTC,
             room_notes: Vec::new(),
+            energy: None,
         }
     }
 }
@@ -51,6 +58,9 @@ pub fn page(analysis: &Analysis, options: &ReportOptions) -> String {
 
     body.push_str(&metadata_list(&metadata_entries(analysis, options)));
     body.push_str(&degree_day_section(analysis, options));
+    if let Some(section) = &options.energy {
+        body.push_str(&energy::section(section));
+    }
     if let Some(house) = &options.house {
         body.push_str(&rooms_section(analysis, house, &options.room_notes));
     }
@@ -69,7 +79,7 @@ pub fn page(analysis: &Analysis, options: &ReportOptions) -> String {
         &Shell {
             title: &title,
             lede: &lede(analysis),
-            stylesheet: &stylesheet(),
+            stylesheet: &stylesheet(options.energy.is_some()),
             defs: "",
             footer: "Degree days measure the weather, not the house: a month with twice the \
                      heating degree days asked for about twice the heat to keep it at the same \
@@ -642,7 +652,7 @@ pub fn format_degree_days(value: f64) -> String {
     }
 }
 
-fn stylesheet() -> String {
+fn stylesheet(with_energy: bool) -> String {
     // The diverging pair: heating demand cold blue, cooling demand warm red, each stepped
     // for its own surface and validated together for colour vision deficiency.
     let mut css = theme_stylesheet(
@@ -651,6 +661,9 @@ fn stylesheet() -> String {
     );
     css.push_str(CHROME_CSS);
     css.push_str(DEGREE_CSS);
+    if with_energy {
+        css.push_str(energy::CSS);
+    }
     css
 }
 
