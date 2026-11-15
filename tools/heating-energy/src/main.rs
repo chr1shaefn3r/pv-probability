@@ -19,7 +19,7 @@ use ha_report::{format_duration, open_command};
 use heating_energy::cli::{Args, Config};
 use heating_energy::daily::{DayMean, daily_means, room_days};
 use heating_energy::degree::{Analysis, analyse};
-use heating_energy::energy::{self, LeftOut, Reading, format_daily, format_slope};
+use heating_energy::energy::{self, LeftOut, Reading, format_energy, format_monthly, format_slope};
 use heating_energy::offset::{self, Check, Correction, Finding, format_offset, local_stamp};
 use heating_energy::report::{
     EnergySection, ReportOptions, format_celsius, format_degree_days, page,
@@ -182,8 +182,8 @@ fn run() -> Result<()> {
             )
         },
     );
-    // Every period between two readings of the heating energy beside its degree days,
-    // and the line through them.
+    // Every month's heating energy, from the total at its start and its end, beside its
+    // degree days, and the line through them.
     let energy = match (&args.energy_entity, energy_read) {
         (Some(entity), Some(read)) => {
             if args.verbose > 0 {
@@ -239,7 +239,7 @@ fn run() -> Result<()> {
 
     report(&args, &analysis, house.as_ref(), html.len(), started);
     if let Some(section) = &energy {
-        for line in energy_lines(section, tz) {
+        for line in energy_lines(section) {
             println!("{line}");
         }
     }
@@ -452,35 +452,35 @@ fn report(args: &Args, analysis: &Analysis, house: Option<&House>, bytes: usize,
 }
 
 /// The efficiency figure and how it moved season by season, as lines for the terminal.
-fn energy_lines(section: &EnergySection, tz: Tz) -> Vec<String> {
+fn energy_lines(section: &EnergySection) -> Vec<String> {
     let energy = &section.energy;
     let entity = &section.entity;
     let mut lines = Vec::new();
     match &energy.overall {
         Some(fit) => lines.push(format!(
             "efficiency: {} kWh per heating degree day (± {}), and {} without heating - a line \
-             through {} periods between readings of {entity}",
+             through {} months of {entity}",
             format_slope(fit.slope),
             format_slope(fit.slope_error),
-            format_daily(fit.base),
-            fit.periods
+            format_monthly(fit.base),
+            fit.months
         )),
         None => {
             let mut line = format!(
-                "efficiency: no line yet - {} reading{} of {entity} make{} {} period{} of at \
-                 least a week where the outside was recorded, {} fully enough, and a line needs \
-                 {} spread over milder and colder ones",
+                "efficiency: no line yet - {} reading{} of {entity} cover{} {} whole month{} \
+                 where the outside was recorded, {} fit to use, and a line needs {} spread over \
+                 milder and colder ones",
                 energy.readings,
                 if energy.readings == 1 { "" } else { "s" },
                 if energy.readings == 1 { "s" } else { "" },
-                energy.periods.len(),
-                if energy.periods.len() == 1 { "" } else { "s" },
+                energy.months.len(),
+                if energy.months.len() == 1 { "" } else { "s" },
                 energy.fitted().count(),
-                energy::MIN_FIT_PERIODS
+                energy::MIN_FIT_MONTHS
             );
             if section.from_raw_states {
                 line.push_str(
-                    ". Home Assistant keeps this entity's values only in its raw states, ten \
+                    ". Home Assistant keeps this entity's readings only in its raw states, ten \
                      days by default: see the README for keeping them",
                 );
             }
@@ -503,42 +503,50 @@ fn energy_lines(section: &EnergySection, tz: Tz) -> Vec<String> {
                     _ => String::new(),
                 };
                 lines.push(format!(
-                    "  {}: {} kWh per degree day (± {}) over {} periods{change}",
+                    "  {}: {} kWh per degree day (± {}) over {} months{change}",
                     season.label(),
                     format_slope(fit.slope),
                     format_slope(fit.slope_error),
-                    fit.periods
+                    fit.months
                 ));
                 previous = Some((season.label(), fit.slope));
             }
             None if energy.overall.is_some() => lines.push(format!(
-                "  {}: too few periods for a line of its own ({} fitted)",
+                "  {}: too few months for a line of its own ({} fitted)",
                 season.label(),
                 season.fitted
             )),
             None => {}
         }
     }
-    for period in &energy.periods {
-        match period.left_out() {
-            None => {}
-            Some(LeftOut::FewDays(share)) => lines.push(format!(
-                "note: {} of {entity} left out of the fit: the outside thermometer covered \
-                 {:.0}% of it",
-                period.label(tz),
-                share * 100.0
-            )),
-            Some(LeftOut::WentDown) => lines.push(format!(
-                "note: {} of {entity} left out of the fit: the total went down over it, by {}",
-                period.label(tz),
-                format_daily(-period.kwh).replace(" a day", "")
-            )),
-        }
+    for month in &energy.months {
+        let why = match month.left_out() {
+            None => continue,
+            Some(LeftOut::FewDays) => format!(
+                "the outside thermometer counted {} of its {} days",
+                month.counted_days,
+                month.month.days()
+            ),
+            Some(LeftOut::Unchanged) => {
+                "the total did not change over it - not read, or nothing used".to_string()
+            }
+            Some(LeftOut::AfterUnchanged) => {
+                "the total did not change over the month before, so it may hold both".to_string()
+            }
+            Some(LeftOut::WentDown) => format!(
+                "the total went down over it, by {} - a meter replaced, or a reading put right \
+                 late",
+                format_energy(-month.kwh)
+            ),
+        };
+        lines.push(format!(
+            "note: {} of {entity} left out of the fit: {why}",
+            month.month.label()
+        ));
     }
     if energy.beyond_record > 0 {
         lines.push(format!(
-            "note: {} period{} between readings of {entity} lie{} outside the outside \
-             thermometer's record",
+            "note: {} month{} of {entity} lie{} outside the outside thermometer's record",
             energy.beyond_record,
             if energy.beyond_record == 1 { "" } else { "s" },
             if energy.beyond_record == 1 { "s" } else { "" }

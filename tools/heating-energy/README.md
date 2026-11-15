@@ -134,9 +134,10 @@ nothing to configure:
 
 ## Heating energy and efficiency
 
-Give it the heating's energy as a running total - a meter in kWh, read monthly, every two
-weeks or whenever - and it plots every period between two readings against its heating
-degree days, and fits a straight line through them:
+Give it the heating's energy as a running total - a meter in kWh, read on the last day of
+every month, and as often between as you like - and it takes what the total grew by over
+every month, plots it against the month's heating degree days, and fits a straight line
+through them:
 
 ```sh
 heating-energy --db ha.db --outside-entity sensor.outdoor_temperature \
@@ -144,42 +145,39 @@ heating-energy --db ha.db --outside-entity sensor.outdoor_temperature \
 ```
 
 ```
-efficiency: 2.49 kWh per heating degree day (± 0.06), and 12.3 kWh a day without heating - a line through 22 periods between readings of number.heizol_energy
-  2022/23: 2.43 kWh per degree day (± 0.01) over 5 periods
-  2023/24: 2.57 kWh per degree day (± 0.03) over 12 periods, 6% more than 2022/23
-  2024/25: 2.10 kWh per degree day (± 0.03) over 5 periods, 18% less than 2023/24
+efficiency: 2.47 kWh per heating degree day (± 0.06), and 376 kWh a month without heating - a line through 22 months of number.heizol_energy
+  2022/23: 2.38 kWh per degree day (± 0.05) over 5 months
+  2023/24: 2.57 kWh per degree day (± 0.04) over 12 months, 8% more than 2022/23
+  2024/25: 2.08 kWh per degree day (± 0.02) over 5 months, 19% less than 2023/24
 ```
 
-![Heating energy a day against degree days a day, and kWh per degree day per season](docs/energy-light.png)
+![Monthly heating energy against monthly degree days, and kWh per degree day per season](docs/energy-light.png)
 
 The **slope** is the house's efficiency figure: the energy one more heating degree day
-costs. The weather only moves a period along the line, so insulation, new windows or a
+costs. The weather only moves a month along the line, so insulation, new windows or a
 boiler tune-up show as a lower slope however cold the winter was. (The example is the demo
 database with a made-up meter added, for a house insulated in the summer of 2024.) Where
-the line meets zero degree days is what the house uses a day **without heating**: hot
-water, standby losses. The report shows the periods and the line, the slope of every
+the line meets zero degree days is what the house uses a month **without heating**: hot
+water, standby losses. The report shows the months and the line, the slope of every
 heating season (July to June, so a winter is never split) as a bar with its standard
 error, and a table of both.
 
-* **Every period between two readings is a point.** Its energy is what the total grew
-  by; its heating degree days are those of exactly the same stretch of time, a day read
-  in the evening split where the reading fell. Read monthly, the periods are the months;
-  read every two weeks, they are fortnights, and the line is the same.
-* **Both are per day**, so periods of different lengths compare alike, and each counts
-  for as many days as it lasted: two fortnights weigh what one month does. A reading
-  skipped just makes one longer period.
-* **Readings are changes of the total.** One written again unchanged - at a restart - is
-  no new reading, and one changed again within two days is one reading, the later value
-  standing, so a typo put right does not count twice. Readings less than a week after the
-  last are folded into the next period, so a total that changes every hour still gives
-  periods with a week of weather in them.
-* **A period needs its weather.** One the outside thermometer missed a day or two of has
-  its degree days scaled up to all of it, since the energy covers the whole; one missing
-  more than a tenth is left out, and so is one over which the total went down. The run
-  names them.
-* **A line needs three periods**, milder and colder ones: summer alone says nothing about
-  what heating costs. A season gets a line of its own on the same terms, and a period
-  belongs to the season its middle falls in.
+* **A month's energy is the total at its end less the total at its start**, both taken at
+  local midnight as the month turns. Readings in between change nothing, so reading the
+  meter every two weeks gives the same months as reading it monthly. A value repeated
+  unchanged - at a restart - is no new reading.
+* **A reading on the 1st still closes the month before** when the meter was not read on
+  its last day, and a value brought down on the 1st puts right the one before it. So a
+  month counts once the 1st after it is over.
+* **A month needs its weather.** One the outside thermometer missed a day or two of has
+  its degree days scaled up to the whole month, since the energy covers all of it; one
+  missing more than a tenth is left out.
+* **A month the total did not change over is left out, and so is the month after it**: a
+  reading missed at the end of July leaves July at nothing and August holding both. One
+  over which the total went down - a meter replaced, a reading put right late - is left
+  out too. The run names them all.
+* **A line needs three months**, milder and colder ones: summer alone says nothing about
+  what heating costs. A season gets a line of its own on the same terms.
 * **The ±** is the slope's standard error. Two seasons whose slopes are further apart
   than their errors put together differ by more than the weather's noise.
 
@@ -204,8 +202,7 @@ template:
 ```
 
 The availability line matters: without it, a restart that briefly leaves the helper
-unavailable would record a 0, and a total that drops to nothing and back reads as a meter
-replaced. With `-v` the run says whether it read statistics or raw states, and how many
+unavailable records a 0, and a month that happens to end on it reads as gone down. With `-v` the run says whether it read statistics or raw states, and how many
 readings it found. Its units may be kWh, Wh or MWh.
 
 ## How it is counted
@@ -242,7 +239,7 @@ readings it found. Its units may be kWh, Wh or MWh.
 |---|---|---|
 | `--outside-entity <ID>` | required | The outdoor thermometer, e.g. `sensor.outdoor_temperature` |
 | `--rooms <FILE>` | none | The [rooms file](#the-rooms-file): floors, rooms and their thermometers |
-| `--energy-entity <ID>` | none | The [heating's energy as a running total](#heating-energy-and-efficiency) in kWh, read monthly or whenever |
+| `--energy-entity <ID>` | none | The [heating's energy as a running total](#heating-energy-and-efficiency) in kWh, read on the last day of every month |
 | `--heating-base <°C>` | `15` | Outside temperature above which a day needs no heating |
 | `--cooling-base <°C>` | `21` | Outside temperature above which a day needs cooling; not below the heating base |
 | `--group <month\|week>` | `month` | Sum per calendar month or per ISO week |
