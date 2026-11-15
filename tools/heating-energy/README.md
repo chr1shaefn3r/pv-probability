@@ -214,10 +214,10 @@ With the demo's rooms, as [`rooms.example.toml`](rooms.example.toml) gives their
 the made-up meter, whose house was insulated in the summer of 2024:
 
 ```
-heat loss: 61 W/K over 16 heating months, the house kept at 20.5 °C - its 5 rooms weighted by 84 m² of floor
-  2022/23: 62 W/K at 20.5 °C over 4 months
-  2023/24: 65 W/K at 20.5 °C over 9 months; against 2022/23: kWh per degree day +6%, heat loss +6%, the house 0.1 K cooler - mostly the building
-  2024/25: 45 W/K at 20.7 °C over 3 months; against 2023/24: kWh per degree day -18%, heat loss -31%, the house 0.2 K warmer - mostly the building
+heat loss: 108 W/K over 16 heating months, the house kept at 20.5 °C - its 5 rooms weighted by 84 m² of floor; the sun and the household gave about 635 W for free
+  2022/23: 107 W/K at 20.5 °C over 4 months
+  2023/24: 111 W/K at 20.5 °C over 9 months; against 2022/23: kWh per degree day +6%, heat loss +3%, the house 0.1 K cooler - the building and how warm the house was kept alike
+  2024/25: 89 W/K at 20.7 °C over 3 months; against 2023/24: kWh per degree day -18%, heat loss -19%, the house 0.2 K warmer - mostly the building
 ```
 
 * **The house's temperature** is the rooms', weighted by their floor area: Σ(area ×
@@ -227,19 +227,26 @@ heat loss: 61 W/K over 16 heating months, the house kept at 20.5 °C - its 5 roo
 * **Degree-hours** add up the house's temperature less the outside's, hour by hour, over
   a month - scaled up to the whole month where a few hours are missing, as degree days
   are; a month missing more than a tenth is left out.
-* **The heat loss coefficient** is the heating energy - water heating taken off - over the
-  degree-hours, times a thousand: watts for every kelvin the house is kept above the
-  outside. It is taken over the heating months only, those colder on average than the
-  heating base: in milder ones the sun and the household cover much of what the building
-  loses, so it would read low. A season needs three of them for a figure of its own.
+* **The heat loss coefficient** is the slope of a straight line through the heating
+  months' heating energy - water heating taken off - against their degree-hours, times a
+  thousand: watts for every kelvin the house is kept above the outside. The sun and the
+  household give heat for free as well, about the same every month; it only moves the
+  line down, and where the line meets no degree-hours, below nothing, it says how much
+  that was. Heating energy over degree-hours alone would count the free heat as heat the
+  building did not lose, and read lower the milder the months - on the demo, 79 W/K in
+  January and 49 W/K in April for the same house. Only the heating months count, those
+  colder on average than the heating base: in milder ones the heating is off or nearly
+  so, and the line would bend there. A season needs three of them, milder and colder
+  ones, for a line of its own.
 * **What changed** sets each season against the one before. kWh per degree day moves with
   both the building and how warm the house is kept; the heat loss coefficient with the
   building alone. When two thirds or more of the change in kWh per degree day is the heat
   loss coefficient's, it was mostly the building; a third or less, mostly how warm the
   house was kept. A change in kWh per degree day under 3% is none.
 
-The report shows the same under Heating energy, with the house's temperature, degree-hours
-and heat loss of every month in the month table.
+The report shows the same under Heating energy, with the house's temperature and
+degree-hours of every month in the month table, and whether it is one of the heating
+months the line runs through.
 
 ### A degree warmer
 
@@ -255,16 +262,13 @@ a degree warmer: 713 kWh more heating energy in a season like 2023/24, with its 
 ```
 
 * **A degree warmer adds a degree-hour to every hour** of the heating months, and the
-  heating has to make up all of it: the sun and the household give no more for it. So
-  what counts is what one more degree-hour costs - the slope of a line through the heating
-  months' heating energy against their degree-hours - not the heat loss coefficient above,
-  which is heating energy over all the degree-hours. Part of those the free heat covers,
-  so that average reads lower, and would make a degree look cheaper than it is: on the
-  demo, 61 W/K on average, 108 W/K at the margin.
-* **A season's cost** is that slope times the hours of its heating months, and its share
-  is of the season's heating energy. The headline takes the line through every heating
-  month on record, applied to the season with the most heating months; the table gives
-  every season's own line, which needs three heating months, milder and colder ones.
+  heating has to make up all of it: the sun and the household give no more for it. What
+  one more degree-hour costs is the heat loss coefficient above - 108 W/K on the demo is
+  108 Wh every hour for every degree.
+* **A season's cost** is that times the hours of its heating months, and its share is of
+  the season's heating energy. The headline takes the coefficient from every heating month
+  on record, applied to the season with the most heating months; the table gives every
+  season's own.
 * **It is if anything a little more**: a warmer house would also want heating on a few
   more days at either end of the season, which the heating months leave out.
 

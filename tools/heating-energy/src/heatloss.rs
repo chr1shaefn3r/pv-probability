@@ -4,11 +4,14 @@
 //! Degree days take the inside to be one fixed temperature; the rooms' thermometers say
 //! what it was. The house's temperature is the rooms', weighted by their floor area, and
 //! every hour's difference between it and the outside adds up, month by month, to
-//! degree-hours. A month's heating energy over its degree-hours is the heat the building
-//! lost for every kelvin it was kept above the outside - in watts per kelvin, the heat loss
-//! coefficient - which neither the weather nor how warm the house is kept moves: only the
-//! building does. Set beside the kWh per degree day, which both move, it tells which of the
-//! two changed.
+//! degree-hours. Through the heating months' heating energy against their degree-hours
+//! runs a straight line: its slope is what the building loses for every kelvin it is kept
+//! above the outside, every hour - in watts per kelvin, the heat loss coefficient - and
+//! where it meets no degree-hours, below nothing, the heat the sun and the household give
+//! for free, which the heating need not make up. Neither the weather nor how warm the house
+//! is kept moves the slope: only the building does. Set beside the kWh per degree day,
+//! which both move, it tells which of the two changed; and times a season's hours, it is
+//! what keeping the house a degree warmer costs.
 
 use std::collections::BTreeMap;
 
@@ -17,7 +20,7 @@ use chrono_tz::Tz;
 use ha_recorder::Sample;
 use ha_recorder::timeutil::{day_to_date, local_day};
 
-use crate::energy::{Energy, Fit, MIN_FIT_MONTHS, Month, MonthPoint, fit_spread, format_whole};
+use crate::energy::{Energy, Fit, Month, MonthPoint, fit_spread, format_whole};
 
 /// Share of a month's hours the house's temperature and the outside's must both be known
 /// for: the degree-hours of a month missing a few are scaled up to all of them, as its
@@ -204,22 +207,42 @@ pub struct MonthLoss {
     pub not_counted: Option<NotCounted>,
 }
 
-impl MonthLoss {
-    /// Its heating energy over its degree-hours, in W/K, if it has degree-hours.
-    pub fn coefficient(&self) -> Option<f64> {
-        let degree_hours = self.hours?.whole_degree_hours();
-        (degree_hours > 0.0).then(|| self.heating_kwh * 1_000.0 / degree_hours)
-    }
-}
-
-/// The heat loss coefficient over some months.
+/// The heat loss coefficient over some months: the line through their heating energy
+/// against their degree-hours.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Loss {
-    /// Their heating energy over their degree-hours, in W/K.
-    pub coefficient: f64,
-    /// The house's mean temperature over their counted hours, in °C.
+    /// Heating kWh against degree-hours: its slope, in kWh per K·h, is what the building
+    /// loses for every kelvin, every hour, and where it meets no degree-hours, below
+    /// nothing, the heat the sun and the household give for free.
+    pub fit: Fit,
+    /// The house's mean temperature over the months' counted hours, in °C.
     pub house: f64,
-    pub months: usize,
+    /// The months' hours.
+    pub hours: u32,
+}
+
+impl Loss {
+    /// The heat loss coefficient, in W/K.
+    pub fn coefficient(&self) -> f64 {
+        self.fit.slope * 1_000.0
+    }
+
+    pub fn months(&self) -> usize {
+        self.fit.months
+    }
+
+    /// What the sun and the household gave on average over the months, in W, if the line
+    /// says they gave more than a few watts.
+    pub fn free_heat(&self) -> Option<f64> {
+        let hours_a_month = f64::from(self.hours) / self.fit.months as f64;
+        let watts = -self.fit.base * 1_000.0 / hours_a_month;
+        (watts >= 10.0).then_some(watts)
+    }
+
+    /// What keeping the house a degree warmer costs over `hours`, in kWh.
+    pub fn cost(&self, hours: u32) -> f64 {
+        self.fit.slope * f64::from(hours)
+    }
 }
 
 /// What changed from one season to the next, and what it came from.
@@ -260,70 +283,14 @@ impl Verdict {
     }
 }
 
-/// What a degree warmer costs, from the line through heating months' heating energy
-/// against their degree-hours.
-///
-/// A degree warmer adds a degree-hour to every hour, and the heating makes up all of it:
-/// the sun and the household give no more for it. So it is the line's slope that counts -
-/// what one more degree-hour costs - not the heating energy over all the degree-hours,
-/// part of which the free heat covers.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Warmer {
-    /// Heating kWh against degree-hours: its slope is what one more degree-hour costs, in
-    /// kWh.
-    pub fit: Fit,
-    /// Hours of the heating months it was fitted through.
-    pub hours: u32,
-    /// The heating energy - water heating taken off - the share is of: the season's, or
-    /// every season's.
-    pub heating_kwh: f64,
-}
-
-impl Warmer {
-    /// What a degree warmer costs every hour, in W: the heat loss coefficient at the
-    /// margin.
-    pub fn marginal(&self) -> f64 {
-        self.fit.slope * 1_000.0
-    }
-
-    /// What a degree warmer costs over the heating months' hours, in kWh.
-    pub fn kwh(&self) -> f64 {
-        self.fit.slope * f64::from(self.hours)
-    }
-
-    /// That, as a share of the heating energy.
-    pub fn share(&self) -> Option<f64> {
-        (self.heating_kwh > 0.0).then(|| self.kwh() / self.heating_kwh)
-    }
-}
-
-/// What a degree warmer costs over `months`, if a line runs through them.
-fn warmer(months: &[&MonthLoss], heating_kwh: f64) -> Option<Warmer> {
-    let points: Vec<(f64, f64)> = months
-        .iter()
-        .filter_map(|month| Some((month.hours?.whole_degree_hours(), month.heating_kwh)))
-        .collect();
-    let fit = fit_spread(&points, MIN_DEGREE_HOUR_SPREAD)?;
-    (fit.slope > 0.0).then(|| Warmer {
-        fit,
-        hours: months
-            .iter()
-            .filter_map(|month| month.hours)
-            .map(|hours| hours.hours)
-            .sum(),
-        heating_kwh,
-    })
-}
-
 /// One heating season's heat loss coefficient.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SeasonLoss {
     pub start_year: i32,
+    /// From its own heating months, if they carry a line.
     pub loss: Option<Loss>,
     /// Against the latest season before it with both a line and a heat loss coefficient.
     pub change: Option<Change>,
-    /// What a degree warmer cost over its heating months.
-    pub warmer: Option<Warmer>,
     /// Its heating months, and their hours.
     pub heating_months: usize,
     pub heating_hours: u32,
@@ -332,10 +299,10 @@ pub struct SeasonLoss {
 }
 
 impl SeasonLoss {
-    /// What a degree warmer costs over its heating months by `warmer`'s line, and that as
-    /// a share of its heating energy.
-    pub fn cost(&self, warmer: &Warmer) -> (f64, Option<f64>) {
-        let kwh = warmer.fit.slope * f64::from(self.heating_hours);
+    /// What a degree warmer costs over its heating months by `loss`, and that as a share of
+    /// its heating energy.
+    pub fn cost(&self, loss: &Loss) -> (f64, Option<f64>) {
+        let kwh = loss.cost(self.heating_hours);
         (
             kwh,
             (self.heating_kwh > 0.0).then(|| kwh / self.heating_kwh),
@@ -354,9 +321,10 @@ pub struct HeatLoss {
     pub without_area: Vec<String>,
     /// Every month of the heating energy, with its degree-hours where it has them.
     pub months: Vec<MonthLoss>,
+    /// From every heating month.
     pub overall: Option<Loss>,
-    /// What a degree warmer costs, from every heating month.
-    pub warmer: Option<Warmer>,
+    /// Every season's heating energy, water heating taken off, together.
+    pub heating_kwh: f64,
     /// Every heating season of the heating energy, in order.
     pub seasons: Vec<SeasonLoss>,
 }
@@ -367,6 +335,17 @@ impl HeatLoss {
         self.months
             .iter()
             .filter(|month| month.not_counted.is_none())
+    }
+
+    /// What a degree warmer costs over every heating month, and that as a share of every
+    /// season's heating energy.
+    pub fn cost(&self) -> Option<(f64, Option<f64>)> {
+        let overall = self.overall?;
+        let kwh = overall.cost(overall.hours);
+        Some((
+            kwh,
+            (self.heating_kwh > 0.0).then(|| kwh / self.heating_kwh),
+        ))
     }
 
     /// The season with the most heating months, the latest of those that tie: the one a
@@ -387,11 +366,10 @@ pub struct Floorspace {
     pub without_area: Vec<String>,
 }
 
-/// Put every month's heating energy beside its degree-hours, and work out the heat loss
-/// coefficient over the months the heating ran in: those whose energy and weather are
-/// sound, colder on average than `heating_base` and with the house's temperature known
-/// for most of their hours. A season needs three such months for a coefficient of its
-/// own, as it does for a line.
+/// Put every month's heating energy beside its degree-hours, and fit the line through the
+/// months the heating ran in: those whose energy and weather are sound, colder on average
+/// than `heating_base` and with the house's temperature known for most of their hours. A
+/// season needs three such months, milder and colder ones, for a line of its own.
 pub fn analyse(
     energy: &Energy,
     hours: &[MonthHours],
@@ -432,8 +410,6 @@ pub fn analyse(
             .collect()
     };
     let overall = loss(&counted(None));
-    let all_heating: f64 = energy.seasons.iter().map(|season| season.kwh).sum();
-    let warmer_overall = warmer(&counted(None), all_heating);
 
     let mut seasons: Vec<SeasonLoss> = Vec::with_capacity(energy.seasons.len());
     let mut before: Option<(i32, Fit, Loss)> = None;
@@ -456,7 +432,6 @@ pub fn analyse(
             start_year: season.start_year,
             loss,
             change,
-            warmer: warmer(&heating_months, season.kwh),
             heating_months: heating_months.len(),
             heating_hours: heating_months
                 .iter()
@@ -473,25 +448,26 @@ pub fn analyse(
         without_area: floorspace.without_area,
         months,
         overall,
-        warmer: warmer_overall,
+        heating_kwh: energy.seasons.iter().map(|season| season.kwh).sum(),
         seasons,
     }
 }
 
-/// The heat loss coefficient over `months`, if there are enough of them.
+/// The line through `months`' heating energy against their degree-hours, if there are
+/// enough of them, spread out enough, for one that rises.
 fn loss(months: &[&MonthLoss]) -> Option<Loss> {
-    if months.len() < MIN_FIT_MONTHS {
-        return None;
-    }
-    let kwh: f64 = months.iter().map(|month| month.heating_kwh).sum();
+    let points: Vec<(f64, f64)> = months
+        .iter()
+        .filter_map(|month| Some((month.hours?.whole_degree_hours(), month.heating_kwh)))
+        .collect();
+    let fit = fit_spread(&points, MIN_DEGREE_HOUR_SPREAD)?;
     let hours = months.iter().filter_map(|month| month.hours);
-    let degree_hours: f64 = hours.clone().map(|hours| hours.whole_degree_hours()).sum();
     let counted: u32 = hours.clone().map(|hours| hours.counted_hours).sum();
-    let house_sum: f64 = hours.map(|hours| hours.house_sum).sum();
-    (degree_hours > 0.0 && counted > 0).then(|| Loss {
-        coefficient: kwh * 1_000.0 / degree_hours,
+    let house_sum: f64 = hours.clone().map(|hours| hours.house_sum).sum();
+    (fit.slope > 0.0 && counted > 0).then(|| Loss {
+        fit,
         house: house_sum / f64::from(counted),
-        months: months.len(),
+        hours: hours.map(|hours| hours.hours).sum(),
     })
 }
 
@@ -506,8 +482,8 @@ pub fn change(before: (&Fit, &Loss), after: (&Fit, &Loss)) -> Option<Change> {
     let positive = [
         before.0.slope,
         after.0.slope,
-        before.1.coefficient,
-        after.1.coefficient,
+        before.1.coefficient(),
+        after.1.coefficient(),
     ]
     .iter()
     .all(|value| value.is_finite() && *value > 0.0);
@@ -515,7 +491,7 @@ pub fn change(before: (&Fit, &Loss), after: (&Fit, &Loss)) -> Option<Change> {
         return None;
     }
     let per_degree_day = after.0.slope / before.0.slope;
-    let heat_loss = after.1.coefficient / before.1.coefficient;
+    let heat_loss = after.1.coefficient() / before.1.coefficient();
     let verdict = if (per_degree_day - 1.0).abs() < HELD {
         Verdict::Held
     } else {
@@ -660,9 +636,9 @@ mod tests {
 
     fn loss_of(coefficient: f64, house: f64) -> Loss {
         Loss {
-            coefficient,
+            fit: fit(coefficient / 1_000.0),
             house,
-            months: 4,
+            hours: 4 * 744,
         }
     }
 
@@ -738,7 +714,7 @@ mod tests {
     }
 
     #[test]
-    fn the_coefficient_is_heating_energy_over_degree_hours_in_the_heating_months() {
+    fn the_coefficient_is_the_slope_through_the_heating_months() {
         // 2023/24 kept at 21 °C, 2024/25 a degree cooler; the building the same.
         let mut pairs = vec![
             month(2023, 9, 16.0, 21.0, 150.0),
@@ -790,11 +766,11 @@ mod tests {
         assert_eq!(not_counted[7], Some(NotCounted::FewHours));
         assert_eq!(heat_loss.counted().count(), 6);
         let overall = heat_loss.overall.unwrap();
-        assert!((overall.coefficient - 150.0).abs() < 1e-9, "{overall:?}");
-        assert!((heat_loss.months[2].coefficient().unwrap() - 150.0).abs() < 1e-9);
+        assert!((overall.coefficient() - 150.0).abs() < 1e-9, "{overall:?}");
+        assert_eq!(overall.free_heat(), None, "no free heat in this house");
 
         let first = heat_loss.seasons[0].loss.unwrap();
-        assert_eq!((first.months, first.house), (3, 21.0));
+        assert_eq!((first.months(), first.house), (3, 21.0));
         let second = heat_loss.seasons[1];
         assert_eq!(second.loss.unwrap().house, 20.0);
         let change = second.change.unwrap();
@@ -805,11 +781,11 @@ mod tests {
     }
 
     #[test]
-    fn a_degree_warmer_costs_the_lines_slope_not_the_average() {
+    fn free_heat_lowers_the_heating_but_not_the_coefficient() {
         // A house losing 150 W/K whose heating the sun and household spare 0.6 kW of every
-        // hour, kept at 20 °C: a degree warmer costs 150 W more every hour, though the
-        // heating made up for less than that per kelvin on average.
-        // Months of 31 days alike, so the free heat is the same in every one.
+        // hour, kept at 20 °C: its heating over its degree-hours is well under 150 W/K, but
+        // every degree-hour more still costs the whole 150 Wh. Months of 31 days alike, so
+        // the free heat is the same in every one.
         let pairs: Vec<(MonthPoint, MonthHours)> = [
             (2023, 10, 8.0),
             (2023, 12, 2.0),
@@ -824,6 +800,11 @@ mod tests {
         })
         .collect();
         let heating: f64 = pairs.iter().map(|(point, _)| point.kwh).sum();
+        let degree_hours: f64 = pairs.iter().map(|(_, hours)| hours.degree_hours).sum();
+        assert!(
+            heating * 1_000.0 / degree_hours < 125.0,
+            "the plain ratio reads low"
+        );
         let (points, hours): (Vec<MonthPoint>, Vec<MonthHours>) = pairs.into_iter().unzip();
         let energy = Energy {
             readings: 5,
@@ -850,18 +831,18 @@ mod tests {
                 without_area: Vec::new(),
             },
         );
-        let warmer = heat_loss.warmer.unwrap();
-        assert!((warmer.marginal() - 150.0).abs() < 1e-6, "{warmer:?}");
+        let overall = heat_loss.overall.unwrap();
+        assert!((overall.coefficient() - 150.0).abs() < 1e-6, "{overall:?}");
+        assert!((overall.free_heat().unwrap() - 600.0).abs() < 1e-6);
         let hours = 4 * 744;
-        assert_eq!(warmer.hours, hours);
-        assert!((warmer.kwh() - 0.15 * f64::from(hours)).abs() < 1e-6);
-        assert!((warmer.share().unwrap() - warmer.kwh() / heating).abs() < 1e-12);
-        let average = heat_loss.overall.unwrap().coefficient;
-        assert!(average < 125.0, "the free heat makes the average {average}");
+        assert_eq!(overall.hours, hours);
+        let (kwh, share) = heat_loss.cost().unwrap();
+        assert!((kwh - 0.15 * f64::from(hours)).abs() < 1e-6);
+        assert!((share.unwrap() - kwh / heating).abs() < 1e-12);
         let season = heat_loss.fullest_season().unwrap();
         assert_eq!((season.start_year, season.heating_months), (2023, 4));
-        assert_eq!(season.warmer, Some(warmer));
-        assert_eq!(season.cost(&warmer), (warmer.kwh(), warmer.share()));
+        assert_eq!(season.loss, Some(overall));
+        assert_eq!(season.cost(&overall), (kwh, share));
     }
 
     #[test]

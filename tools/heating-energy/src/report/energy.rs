@@ -13,8 +13,8 @@ use crate::energy::{
     format_slope, format_whole, month_list, season_label,
 };
 use crate::heatloss::{
-    HeatLoss, MIN_HOUR_COVERAGE, NotCounted, RULE_OF_THUMB, Warmer, format_coefficient,
-    format_share, format_warmer,
+    HeatLoss, Loss, MIN_HOUR_COVERAGE, NotCounted, RULE_OF_THUMB, format_coefficient, format_share,
+    format_warmer,
 };
 
 /// What the report needs to say about heating energy.
@@ -581,7 +581,8 @@ fn month_table(energy: &Energy, heat_loss: Option<&HeatLoss>) -> String {
     if heat_loss.is_some() {
         html.push_str(
             " Beside them, the house's mean temperature, the month's degree-hours, scaled up \
-             likewise, and its heating energy over them.",
+             likewise, and whether it is one of the heating months the heat loss coefficient's \
+             line runs through.",
         );
     }
     html.push_str(
@@ -593,7 +594,7 @@ fn month_table(energy: &Energy, heat_loss: Option<&HeatLoss>) -> String {
     if heat_loss.is_some() {
         html.push_str(
             "<th scope=\"col\">House at</th><th scope=\"col\">Degree-hours</th>\
-             <th scope=\"col\">Heat loss</th>",
+             <th scope=\"col\">In the heat loss</th>",
         );
     }
     html.push_str("</tr></thead><tbody>");
@@ -637,17 +638,11 @@ fn month_table(energy: &Energy, heat_loss: Option<&HeatLoss>) -> String {
                 .iter()
                 .find(|loss| loss.month == month.month);
             let hours = loss.and_then(|loss| loss.hours);
-            let coefficient = match loss {
-                Some(loss) if loss.not_counted.is_none() => loss
-                    .coefficient()
-                    .map_or_else(|| "-".to_string(), format_coefficient),
-                Some(loss) if loss.not_counted == Some(NotCounted::Mild) => {
-                    "- (a mild month)".to_string()
-                }
-                Some(loss) if loss.not_counted == Some(NotCounted::FewHours) => {
-                    "- (too few hours)".to_string()
-                }
-                _ => "-".to_string(),
+            let counted = match loss.map(|loss| loss.not_counted) {
+                Some(None) => "yes",
+                Some(Some(NotCounted::Mild)) => "no, a mild month",
+                Some(Some(NotCounted::FewHours)) => "no, too few hours",
+                _ => "no",
             };
             let _ = write!(
                 html,
@@ -661,7 +656,7 @@ fn month_table(energy: &Energy, heat_loss: Option<&HeatLoss>) -> String {
                     || "-".to_string(),
                     |hours| format_whole(hours.whole_degree_hours())
                 )),
-                escape(&coefficient)
+                counted
             );
         }
         html.push_str("</tr>");
@@ -678,12 +673,13 @@ fn building_or_behaviour(heat_loss: &HeatLoss) -> String {
         html,
         "<p>Degree days take the house to be kept at one temperature; its thermometers say \
          what it was. Hour by hour, the rooms' temperatures weighted by their floor area - {} \
-         room{}, {} m² - less the outside's add up to each month's degree-hours, and the \
-         heating energy over them is what the building loses for every degree it is kept above \
-         the outside: the heat loss coefficient, in watts per kelvin. The weather does not move \
-         it, nor does how warm the house is kept - only the building does. Where kWh per degree \
-         day moves and the heat loss coefficient holds, the change was in how warm the house \
-         was kept.</p>",
+         room{}, {} m² - less the outside's add up to each month's degree-hours. Through the \
+         heating months' heating energy against their degree-hours runs a straight line, whose \
+         slope is what the building loses for every degree it is kept above the outside: the \
+         heat loss coefficient, in watts per kelvin. The heat the sun and the household give \
+         for free only moves the line down, not its slope; neither does the weather, nor how \
+         warm the house is kept - only the building does. Where kWh per degree day moves and \
+         the heat loss coefficient holds, the change was in how warm the house was kept.</p>",
         heat_loss.rooms,
         if heat_loss.rooms == 1 { "" } else { "s" },
         escape(&format_area(heat_loss.area))
@@ -693,7 +689,8 @@ fn building_or_behaviour(heat_loss: &HeatLoss) -> String {
         let _ = write!(
             html,
             "<p class=\"empty\">There is no heat loss coefficient yet: {counted} heating \
-             month{} the house's temperature known for most of {} hours, and it needs {}.</p>",
+             month{} the house's temperature known for most of {} hours, and a line needs {}, \
+             milder and colder ones.</p>",
             if counted == 1 { " has" } else { "s have" },
             if counted == 1 { "its" } else { "their" },
             MIN_FIT_MONTHS
@@ -703,10 +700,16 @@ fn building_or_behaviour(heat_loss: &HeatLoss) -> String {
     let _ = write!(
         html,
         "<p class=\"headline\"><strong>{}</strong> heat loss, the house kept at <strong>{}\
-         </strong> over {} heating months.</p>",
-        escape(&format_coefficient(overall.coefficient)),
+         </strong> over {} heating months{}.</p>",
+        escape(&format_coefficient(overall.coefficient())),
         escape(&format_celsius(overall.house)),
-        overall.months
+        overall.months(),
+        overall
+            .free_heat()
+            .map_or_else(String::new, |watts| format!(
+                ", the sun and the household giving about {} of heat for free",
+                escape(&format_watts(watts))
+            ))
     );
 
     html.push_str(
@@ -727,7 +730,7 @@ fn building_or_behaviour(heat_loss: &HeatLoss) -> String {
             |loss| {
                 (
                     format_celsius(loss.house),
-                    format_coefficient(loss.coefficient),
+                    format_coefficient(loss.coefficient()),
                 )
             },
         );
@@ -760,17 +763,18 @@ fn building_or_behaviour(heat_loss: &HeatLoss) -> String {
         html,
         "</tbody><tfoot><tr><th scope=\"row\">All</th><td>{}</td><td>{}</td><td>{}</td>\
          <td></td><td></td></tr></tfoot></table></div>",
-        overall.months,
+        overall.months(),
         escape(&format_celsius(overall.house)),
-        escape(&format_coefficient(overall.coefficient))
+        escape(&format_coefficient(overall.coefficient()))
     );
 
     let mut note = format!(
         "Only the heating months count: colder on average than the heating base, with every \
          room that has an area and the outside thermometer known for at least {:.0}% of their \
-         hours, the rest scaled up to the whole month. In milder months the sun and the \
-         household cover much of what the building loses, so the coefficient would read low. \
-         What changed: when two thirds or more of the change in kWh per degree day is the heat \
+         hours, the rest scaled up to the whole month. In milder months the heating is off or \
+         nearly so, the free heat covering what the building loses, and the line would bend \
+         there. A season needs three heating months, milder and colder ones, for a line of its \
+         own. What changed: when two thirds or more of the change in kWh per degree day is the heat \
          loss coefficient's, it was mostly the building; a third or less, mostly how warm the \
          house was kept.",
         MIN_HOUR_COVERAGE * 100.0
@@ -799,21 +803,21 @@ pub fn warmer_section(section: &EnergySection) -> String {
         "<section class=\"panel energy\"><h2>A degree warmer</h2><p>Keeping the house a \
          degree warmer adds a degree to its difference with the outside in every hour of the \
          heating season, and the heating has to make up all of it: the sun and the household \
-         give no more for it. A line through the heating months' heating energy against their \
-         degree-hours says what one more degree-hour costs; times the hours of a season's \
-         heating months, that is what a degree warmer costs the season.</p>",
+         give no more for it. The heat loss coefficient is what one more degree-hour costs; \
+         times the hours of a season's heating months, it is what a degree warmer costs the \
+         season.</p>",
     );
-    let Some(warmer) = heat_loss.warmer else {
+    let Some(overall) = heat_loss.overall else {
         let _ = write!(
             html,
-            "<p class=\"empty\">There is no line through the heating months yet: {} of them, \
-             and it needs {MIN_FIT_MONTHS}, milder and colder ones.</p></section>",
+            "<p class=\"empty\">There is no heat loss coefficient yet: {} heating months, and \
+             a line needs {MIN_FIT_MONTHS}, milder and colder ones.</p></section>",
             heat_loss.counted().count()
         );
         return html;
     };
     if let Some(season) = heat_loss.fullest_season() {
-        let (kwh, share) = season.cost(&warmer);
+        let (kwh, share) = season.cost(&overall);
         let _ = write!(
             html,
             "<p class=\"headline\"><strong>{}</strong> more heating energy for every degree \
@@ -839,53 +843,52 @@ pub fn warmer_section(section: &EnergySection) -> String {
          degree-hour</th><th scope=\"col\">A degree warmer</th><th scope=\"col\">Of the \
          heating energy</th></tr></thead><tbody>",
     );
-    let cells = |warmer: Option<&Warmer>| match warmer {
-        Some(warmer) => format!(
+    let cells = |loss: Option<&Loss>, hours: u32, heating_kwh: f64| match loss {
+        Some(loss) => format!(
             "<td>{}</td><td>{}</td><td>{}</td>",
-            escape(&format_watt_hours(warmer.marginal())),
-            escape(&format_energy(warmer.kwh())),
-            escape(&warmer.share().map_or_else(|| "-".to_string(), percent_of))
+            escape(&format_watt_hours(loss.coefficient())),
+            escape(&format_energy(loss.cost(hours))),
+            escape(&if heating_kwh > 0.0 {
+                percent_of(loss.cost(hours) / heating_kwh)
+            } else {
+                "-".to_string()
+            })
         ),
         None => "<td>-</td><td>-</td><td>-</td>".to_string(),
     };
-    for (season, energy_season) in heat_loss.seasons.iter().zip(&section.energy.seasons) {
+    for season in &heat_loss.seasons {
         let _ = write!(
             html,
             "<tr><th scope=\"row\">{}</th><td>{}</td><td>{}</td>{}</tr>",
             escape(&season_label(season.start_year)),
             season.heating_months,
-            escape(&format_energy(energy_season.kwh)),
-            cells(season.warmer.as_ref())
+            escape(&format_energy(season.heating_kwh)),
+            cells(
+                season.loss.as_ref(),
+                season.heating_hours,
+                season.heating_kwh
+            )
         );
     }
     let _ = write!(
         html,
         "</tbody><tfoot><tr><th scope=\"row\">All</th><td>{}</td><td>{}</td>{}</tr></tfoot>\
          </table></div>",
-        warmer.fit.months,
-        escape(&format_energy(warmer.heating_kwh)),
-        cells(Some(&warmer))
+        overall.months(),
+        escape(&format_energy(heat_loss.heating_kwh)),
+        cells(Some(&overall), overall.hours, heat_loss.heating_kwh)
     );
 
-    let mut note = format!(
-        "Each degree-hour costs {} at the margin - {} for every kelvin the house is kept above \
-         the outside",
-        format_watt_hours(warmer.marginal()),
-        format_coefficient(warmer.marginal())
-    );
-    if let Some(overall) = heat_loss.overall {
-        let _ = write!(
-            note,
-            ", against the {} the heating made up for on average: the sun and the household \
-             cover part of what the building loses, and that part does not grow when the house \
-             is kept warmer, so the average would make a degree look cheaper than it is",
-            format_coefficient(overall.coefficient)
-        );
-    }
-    note.push_str(
-        ". Only the heating months count, as for the heat loss coefficient. A warmer house \
-         would also want heating on a few more days at either end of the season, which this \
-         leaves out, so a degree costs if anything a little more.",
+    let note = format!(
+        "Each degree-hour costs {} - the heat loss coefficient, {} for every kelvin the house \
+         is kept above the outside. It is the line's slope, not the heating energy over all the \
+         degree-hours: the sun and the household cover part of what the building loses, and \
+         that part does not grow when the house is kept warmer, so that average would make a \
+         degree look cheaper than it is. Only the heating months count. A warmer house would \
+         also want heating on a few more days at either end of the season, which this leaves \
+         out, so a degree costs if anything a little more.",
+        format_watt_hours(overall.coefficient()),
+        format_coefficient(overall.coefficient())
     );
     let _ = write!(html, "<p class=\"note\">{}</p></section>", escape(&note));
     html
@@ -894,6 +897,15 @@ pub fn warmer_section(section: &EnergySection) -> String {
 /// A share as a percentage to a tenth: `9.8%`, `17.0%`.
 fn percent_of(share: f64) -> String {
     format!("{:.1}%", share * 100.0)
+}
+
+/// Power, in whole W or kW to a tenth: `520 W`, `1.4 kW`.
+fn format_watts(watts: f64) -> String {
+    if watts.abs() < 1_000.0 {
+        format!("{} W", format_whole(watts))
+    } else {
+        format!("{:.1} kW", watts / 1_000.0)
+    }
 }
 
 /// Energy an hour, in whole Wh: `113 Wh`.

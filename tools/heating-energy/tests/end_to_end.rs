@@ -1024,6 +1024,10 @@ fn rooms_with_a_floor_area_give_the_houses_heat_loss_coefficient() {
         "{stdout}"
     );
     assert!(
+        !stdout.contains("for free"),
+        "no free heat in this house: {stdout}"
+    );
+    assert!(
         stdout.contains("  2023/24: 150 W/K at 20 °C over 5 months"),
         "{stdout}"
     );
@@ -1043,10 +1047,10 @@ fn rooms_with_a_floor_area_give_the_houses_heat_loss_coefficient() {
     assert!(html.contains("<strong>150 W/K</strong> heat loss, the house kept at <strong>20 °C"));
     // January: 20 kelvin for 744 hours.
     assert!(
-        html.contains("<td>20 °C</td><td>14,880</td><td>150 W/K</td>"),
+        html.contains("<td>20 °C</td><td>14,880</td><td>yes</td>"),
         "{html}"
     );
-    assert!(html.contains("<td>- (a mild month)</td>"));
+    assert!(html.contains("<td>no, a mild month</td>"));
 
     // No free heat in this house: every degree-hour costs the whole 150 W/K. January to May
     // are 3,648 hours, and their heating 7,754 kWh.

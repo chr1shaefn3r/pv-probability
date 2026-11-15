@@ -654,14 +654,17 @@ fn heat_loss_lines(heat_loss: &HeatLoss) -> Vec<String> {
     );
     match &heat_loss.overall {
         Some(loss) => lines.push(format!(
-            "heat loss: {} over {} heating months, the house kept at {} - its {floor}",
-            format_coefficient(loss.coefficient),
-            loss.months,
-            format_celsius(loss.house)
+            "heat loss: {} over {} heating months, the house kept at {} - its {floor}{}",
+            format_coefficient(loss.coefficient()),
+            loss.months(),
+            format_celsius(loss.house),
+            loss.free_heat().map_or_else(String::new, |watts| format!(
+                "; the sun and the household gave about {watts:.0} W for free"
+            ))
         )),
         None => lines.push(format!(
             "heat loss: not yet - {} heating month{} with the house's temperature known, its \
-             {floor}, and it needs {}",
+             {floor}, and a line needs {}, milder and colder ones",
             heat_loss.counted().count(),
             if heat_loss.counted().count() == 1 {
                 " has"
@@ -689,14 +692,14 @@ fn heat_loss_lines(heat_loss: &HeatLoss) -> Vec<String> {
             lines.push(format!(
                 "  {}: {} at {} over {} months{change}",
                 season_label(season.start_year),
-                format_coefficient(loss.coefficient),
+                format_coefficient(loss.coefficient()),
                 format_celsius(loss.house),
-                loss.months
+                loss.months()
             ));
         }
     }
-    if let (Some(warmer), Some(season)) = (heat_loss.warmer, heat_loss.fullest_season()) {
-        let (kwh, share) = season.cost(&warmer);
+    if let (Some(overall), Some(season)) = (heat_loss.overall, heat_loss.fullest_season()) {
+        let (kwh, share) = season.cost(&overall);
         lines.push(format!(
             "a degree warmer: {} more heating energy in a season like {}, with its {} heating \
              months{} - the rule of thumb says {:.0}%; each degree-hour costs {:.0} Wh",
@@ -708,18 +711,19 @@ fn heat_loss_lines(heat_loss: &HeatLoss) -> Vec<String> {
                 share * 100.0
             )),
             heatloss::RULE_OF_THUMB * 100.0,
-            warmer.marginal()
+            overall.coefficient()
         ));
         for season in &heat_loss.seasons {
-            let Some(warmer) = season.warmer else {
+            let Some(loss) = season.loss else {
                 continue;
             };
+            let (kwh, share) = season.cost(&loss);
             lines.push(format!(
                 "  {}: {} over {} heating months{}",
                 season_label(season.start_year),
-                format_energy(warmer.kwh()),
+                format_energy(kwh),
                 season.heating_months,
-                warmer.share().map_or_else(String::new, |share| format!(
+                share.map_or_else(String::new, |share| format!(
                     ", {:.1}% of its heating energy",
                     share * 100.0
                 ))
