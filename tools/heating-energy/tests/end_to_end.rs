@@ -923,3 +923,168 @@ fn a_short_history_says_what_it_has_and_how_to_keep_more() {
     );
     assert!(html.contains("There is no line to draw yet"));
 }
+
+/// Two rooms kept at their own steady temperature: the living room at 21 °C over 30 m²
+/// and the bedroom at 17 °C over 10 m², which makes the house 20 °C.
+const HOUSE_ROOMS: [(&str, &str, f64, f64); 2] = [
+    ("Living room", "sensor.living_room_temperature", 21.0, 30.0),
+    ("Bedroom", "sensor.bedroom_temperature", 17.0, 10.0),
+];
+
+/// The running total at `at` for a house losing 150 W for every kelvin it is kept above
+/// the outside, heated whenever the outside is colder than 15 °C, and heating ten kWh of
+/// water a day, from 10,000 kWh at the start of 2024.
+fn house_total_at(at: i64) -> f64 {
+    let mut total = 10_000.0;
+    let mut day = ts("2024-01-01 00:00:00");
+    while day < at {
+        let share = (at - day).min(86_400) as f64 / 86_400.0;
+        let outside = temperature_at(day);
+        let heating = if outside < 15.0 {
+            0.150 * 24.0 * (20.0 - outside)
+        } else {
+            0.0
+        };
+        total += share * (heating + 10.0);
+        day += 86_400;
+    }
+    total
+}
+
+#[test]
+fn rooms_with_a_floor_area_give_the_houses_heat_loss_coefficient() {
+    let scratch = Scratch::new("energy-heat-loss");
+    let conn = heating_year();
+    for (_, sensor, temperature, _) in HOUSE_ROOMS {
+        let id = testdb::insert_statistic_meta(&conn, sensor, Some("°C"));
+        let mut hour = ts("2024-01-01 00:00:00");
+        while hour < ts("2025-01-02 00:00:00") {
+            testdb::insert_statistics_row(
+                &conn,
+                Flavour::Modern,
+                "statistics",
+                id,
+                hour,
+                Some(temperature),
+            );
+            hour += 3_600;
+        }
+    }
+    let meter = testdb::insert_states_meta(&conn, HEATING_ENERGY);
+    for at in month_starts() {
+        let value = format!("{:.3}", house_total_at(at));
+        testdb::insert_state(&conn, Flavour::Modern, "", meter, at, &value);
+    }
+    let db = scratch.path("ha.db");
+    conn.execute("VACUUM INTO ?1", [db.to_str().unwrap()])
+        .unwrap();
+    let rooms = scratch.path("rooms.toml");
+    let entries: Vec<String> = HOUSE_ROOMS
+        .iter()
+        .map(|(name, sensor, _, area)| {
+            format!("{{ name = \"{name}\", sensor = \"{sensor}\", area = {area} }}")
+        })
+        .collect();
+    std::fs::write(
+        &rooms,
+        format!(
+            "[[floor]]\nname = \"Ground floor\"\nrooms = [{}, {{ name = \"Hall\", sensor = \
+             \"{OUTSIDE_ENTITY}\" }}]\n",
+            entries.join(", ")
+        ),
+    )
+    .unwrap();
+    let out = scratch.path("report.html");
+    let output = heating_energy(&[
+        "--db".as_ref(),
+        db.as_os_str(),
+        "--outside-entity".as_ref(),
+        OUTSIDE_ENTITY.as_ref(),
+        "--energy-entity".as_ref(),
+        HEATING_ENERGY.as_ref(),
+        "--rooms".as_ref(),
+        rooms.as_os_str(),
+        "--tz".as_ref(),
+        "UTC".as_ref(),
+        "-o".as_ref(),
+        out.as_os_str(),
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // January to May and October to December are colder than the heating base.
+    assert!(
+        stdout.contains(
+            "heat loss: 150 W/K over 8 heating months, the house kept at 20 °C - its 2 rooms \
+             weighted by 40 m² of floor"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("  2023/24: 150 W/K at 20 °C over 5 months"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("  2024/25: 150 W/K at 20 °C over 3 months; against 2023/24: "),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "note: Ground floor / Hall has no area in the rooms file, so the house's \
+             temperature leaves it out"
+        ),
+        "{stdout}"
+    );
+    let html = std::fs::read_to_string(out).unwrap();
+    assert!(html.contains("<h3>Building or behaviour</h3>"));
+    assert!(html.contains("<strong>150 W/K</strong> heat loss, the house kept at <strong>20 °C"));
+    // January: 20 kelvin for 744 hours.
+    assert!(
+        html.contains("<td>20 °C</td><td>14,880</td><td>150 W/K</td>"),
+        "{html}"
+    );
+    assert!(html.contains("<td>- (a mild month)</td>"));
+}
+
+#[test]
+fn rooms_without_a_floor_area_say_how_to_get_the_heat_loss() {
+    let scratch = Scratch::new("energy-no-area");
+    let conn = heating_year();
+    raw_states(&conn, &month_starts());
+    let db = scratch.path("ha.db");
+    conn.execute("VACUUM INTO ?1", [db.to_str().unwrap()])
+        .unwrap();
+    let rooms = scratch.path("rooms.toml");
+    std::fs::write(
+        &rooms,
+        format!(
+            "[[floor]]\nname = \"Ground floor\"\nrooms = [{{ name = \"Hall\", sensor = \
+             \"{OUTSIDE_ENTITY}\" }}]\n"
+        ),
+    )
+    .unwrap();
+    let output = heating_energy(&[
+        "--db".as_ref(),
+        db.as_os_str(),
+        "--outside-entity".as_ref(),
+        OUTSIDE_ENTITY.as_ref(),
+        "--energy-entity".as_ref(),
+        HEATING_ENERGY.as_ref(),
+        "--rooms".as_ref(),
+        rooms.as_os_str(),
+        "--tz".as_ref(),
+        "UTC".as_ref(),
+        "-o".as_ref(),
+        scratch.path("report.html").as_os_str(),
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("note: give the rooms their floor area in the rooms file"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("heat loss:"));
+}

@@ -22,6 +22,10 @@ use heating_energy::degree::{Analysis, analyse};
 use heating_energy::energy::{
     self, LeftOut, Reading, format_energy, format_monthly, format_slope, month_list, season_label,
 };
+use heating_energy::heatloss::{
+    self, Floorspace, HeatLoss, HourMean, format_coefficient, format_share, format_warmer,
+    hourly_means, house_hours, month_hours, room_hours,
+};
 use heating_energy::offset::{self, Check, Correction, Finding, format_offset, local_stamp};
 use heating_energy::report::{
     EnergySection, ReportOptions, format_celsius, format_degree_days, page,
@@ -72,10 +76,16 @@ fn run() -> Result<()> {
                 .map(|(floor, room, sensor)| (sensor, Some((floor, room)))),
         );
     }
+    // The heat loss coefficient needs the heating energy and rooms with a floor area, and
+    // every thermometer's hours as well as its days.
+    let with_hours = args.energy_entity.is_some()
+        && house
+            .as_ref()
+            .is_some_and(|house| house.rooms().any(|(_, room)| room.area.is_some()));
     // A thermostat's offset is looked for and taken back out in its own task, before its
     // days are counted, and the monthly heating energy, if asked for, is read beside them.
     let (read_all, energy_read): (Vec<Result<Thermometer>>, _) = rayon::join(
-        || read_thermometers(&args, &config, &thermometers),
+        || read_thermometers(&args, &config, &thermometers, with_hours),
         || {
             args.energy_entity
                 .as_deref()
@@ -87,7 +97,7 @@ fn run() -> Result<()> {
     let mut read_all = read_all.into_iter().collect::<Result<Vec<_>>>()?;
     let energy_read = energy_read?;
     let outside = read_all.remove(0);
-    let (outside, outside_days) = (outside.loaded, outside.days);
+    let (outside, outside_days, outside_hours) = (outside.loaded, outside.days, outside.hours);
     // Each room's thermometers, read in the file's order, become the room's days.
     let mut read_all = read_all.into_iter();
     let mut indoor_days = Vec::new();
@@ -95,14 +105,19 @@ fn run() -> Result<()> {
     let mut partial: Vec<(String, u32, usize)> = Vec::new();
     let mut room_notes: Vec<(String, String)> = Vec::new();
     let mut room_rows = 0;
+    // Every room with a floor area, by its hours, and those without one.
+    let mut rooms_hours: Vec<(f64, Vec<HourMean>)> = Vec::new();
+    let mut without_area: Vec<String> = Vec::new();
     for (floor, room) in house.iter().flat_map(House::rooms) {
         let label = format!("{} / {}", floor.name, room.name);
         let mut thermometers = Vec::with_capacity(room.sensors.len());
+        let mut thermometer_hours = Vec::with_capacity(room.sensors.len());
         let mut corrections = Vec::new();
         for sensor in &room.sensors {
             let thermometer = read_all.next().expect("one thermometer read per sensor");
             room_rows += thermometer.loaded.rows;
             thermometers.push(thermometer.days);
+            thermometer_hours.push(thermometer.hours);
             if let Some(finding) = thermometer.finding {
                 let label = if room.sensors.len() == 1 {
                     label.clone()
@@ -139,10 +154,15 @@ fn run() -> Result<()> {
             ));
         }
         if days.partial_days > 0 {
-            partial.push((label, days.partial_days, room.sensors.len()));
+            partial.push((label.clone(), days.partial_days, room.sensors.len()));
         }
         room_notes.extend(corrections);
         indoor_days.push(days.days);
+        match room.area {
+            Some(area) if with_hours => rooms_hours.push((area, room_hours(&thermometer_hours))),
+            None => without_area.push(label),
+            Some(_) => {}
+        }
     }
     if args.verbose > 0 {
         eprintln!(
@@ -185,7 +205,8 @@ fn run() -> Result<()> {
         },
     );
     // Every month's heating energy, from the total at its start and its end, beside its
-    // degree days, and the line through them.
+    // degree days, and the line through them; and beside it, worked out alongside, every
+    // month's degree-hours between the house and the outside.
     let energy = match (&args.energy_entity, energy_read) {
         (Some(entity), Some(read)) => {
             if args.verbose > 0 {
@@ -200,16 +221,35 @@ fn run() -> Result<()> {
                     }
                 );
             }
+            let (energy, degree_hours) = rayon::join(
+                || {
+                    energy::analyse(
+                        &read.readings,
+                        &outside_days,
+                        config.bases,
+                        config.min_day_coverage,
+                        tz,
+                    )
+                },
+                || with_hours.then(|| month_hours(&house_hours(&rooms_hours), &outside_hours, tz)),
+            );
+            let heat_loss = degree_hours.map(|degree_hours| {
+                heatloss::analyse(
+                    &energy,
+                    &degree_hours,
+                    config.bases.heating,
+                    Floorspace {
+                        area: rooms_hours.iter().map(|(area, _)| area).sum(),
+                        rooms: rooms_hours.len(),
+                        without_area: without_area.clone(),
+                    },
+                )
+            });
             Some(EnergySection {
                 entity: entity.clone(),
-                energy: energy::analyse(
-                    &read.readings,
-                    &outside_days,
-                    config.bases,
-                    config.min_day_coverage,
-                    tz,
-                ),
+                energy,
                 from_raw_states: read.from_raw_states,
+                heat_loss,
             })
         }
         _ => None,
@@ -244,6 +284,18 @@ fn run() -> Result<()> {
         for line in energy_lines(section) {
             println!("{line}");
         }
+        match &section.heat_loss {
+            Some(heat_loss) => {
+                for line in heat_loss_lines(heat_loss) {
+                    println!("{line}");
+                }
+            }
+            None if house.is_some() => println!(
+                "note: give the rooms their floor area in the rooms file - area = ..., in m² - \
+                 and the run works out the house's heat loss coefficient too"
+            ),
+            None => {}
+        }
     }
     for line in finding_lines(&findings, tz) {
         println!("{line}");
@@ -271,6 +323,7 @@ fn read_thermometers(
     args: &Args,
     config: &Config,
     thermometers: &[(&str, Option<(&Floor, &Room)>)],
+    with_hours: bool,
 ) -> Vec<Result<Thermometer>> {
     let tz = config.recorder.tz;
     thermometers
@@ -290,9 +343,15 @@ fn read_thermometers(
                 None => (read(args, config, entity)?, None),
             };
             let days = daily_means(&loaded.samples, tz);
+            let hours = if with_hours {
+                hourly_means(&loaded.samples, config.min_day_coverage)
+            } else {
+                Vec::new()
+            };
             Ok(Thermometer {
                 loaded,
                 days,
+                hours,
                 finding,
             })
         })
@@ -342,10 +401,12 @@ fn energy_scale(entity: &str, unit: Option<&str>) -> Result<f64> {
     }
 }
 
-/// One thermometer read, its days counted, and what became of its offset.
+/// One thermometer read, its days counted - and its hours, when they are wanted - and
+/// what became of its offset.
 struct Thermometer {
     loaded: LoadedSamples,
     days: Vec<DayMean>,
+    hours: Vec<HourMean>,
     finding: Option<Finding>,
 }
 
@@ -580,6 +641,83 @@ fn energy_lines(section: &EnergySection) -> Vec<String> {
         ));
     }
     lines
+}
+
+/// The heat loss coefficient and what changed season by season, as lines for the terminal.
+fn heat_loss_lines(heat_loss: &HeatLoss) -> Vec<String> {
+    let mut lines = Vec::new();
+    let floor = format!(
+        "{} room{} weighted by {} m² of floor",
+        heat_loss.rooms,
+        if heat_loss.rooms == 1 { "" } else { "s" },
+        format_area(heat_loss.area)
+    );
+    match &heat_loss.overall {
+        Some(loss) => lines.push(format!(
+            "heat loss: {} over {} heating months, the house kept at {} - its {floor}",
+            format_coefficient(loss.coefficient),
+            loss.months,
+            format_celsius(loss.house)
+        )),
+        None => lines.push(format!(
+            "heat loss: not yet - {} heating month{} with the house's temperature known, its \
+             {floor}, and it needs {}",
+            heat_loss.counted().count(),
+            if heat_loss.counted().count() == 1 {
+                " has"
+            } else {
+                "s have"
+            },
+            energy::MIN_FIT_MONTHS
+        )),
+    }
+    if heat_loss.overall.is_some() {
+        for season in &heat_loss.seasons {
+            let Some(loss) = season.loss else {
+                continue;
+            };
+            let change = season.change.map_or(String::new(), |change| {
+                format!(
+                    "; against {}: kWh per degree day {}, heat loss {}, the house {} - {}",
+                    season_label(change.before),
+                    format_share(change.per_degree_day),
+                    format_share(change.heat_loss),
+                    format_warmer(change.house),
+                    change.verdict.text()
+                )
+            });
+            lines.push(format!(
+                "  {}: {} at {} over {} months{change}",
+                season_label(season.start_year),
+                format_coefficient(loss.coefficient),
+                format_celsius(loss.house),
+                loss.months
+            ));
+        }
+    }
+    if !heat_loss.without_area.is_empty() {
+        lines.push(format!(
+            "note: {} {} no area in the rooms file, so the house's temperature leaves {} out",
+            joined(&heat_loss.without_area),
+            if heat_loss.without_area.len() == 1 {
+                "has"
+            } else {
+                "have"
+            },
+            if heat_loss.without_area.len() == 1 {
+                "it"
+            } else {
+                "them"
+            }
+        ));
+    }
+    lines
+}
+
+/// A floor area: `142`, `18.5`.
+fn format_area(square_metres: f64) -> String {
+    let text = format!("{square_metres:.1}");
+    text.strip_suffix(".0").unwrap_or(&text).to_string()
 }
 
 /// What became of every room's thermostat offset, as lines for the terminal: what was

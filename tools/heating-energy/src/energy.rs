@@ -61,6 +61,11 @@ impl Month {
         NaiveDate::from_ymd_opt(self.year, self.month, 1).expect("a month has a first day")
     }
 
+    /// The local midnight it starts at, as a UTC timestamp.
+    pub fn start(self, tz: Tz) -> Option<i64> {
+        midnight(self.first_day(), tz)
+    }
+
     /// How many days it has.
     pub fn days(self) -> u32 {
         let next = self.next();
@@ -558,7 +563,15 @@ pub fn format_energy(kwh: f64) -> String {
     if !kwh.is_finite() {
         return "-".to_string();
     }
-    let digits = format!("{:.0}", kwh.abs());
+    format!("{} kWh", format_whole(kwh))
+}
+
+/// A whole number, grouped from a thousand: `12,450`.
+pub fn format_whole(value: f64) -> String {
+    if !value.is_finite() {
+        return "-".to_string();
+    }
+    let digits = format!("{:.0}", value.abs());
     let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, digit) in digits.chars().enumerate() {
         if index > 0 && (digits.len() - index) % 3 == 0 {
@@ -566,8 +579,12 @@ pub fn format_energy(kwh: f64) -> String {
         }
         grouped.push(digit);
     }
-    let sign = if kwh < 0.0 && digits != "0" { "-" } else { "" };
-    format!("{sign}{grouped} kWh")
+    let sign = if value < 0.0 && digits != "0" {
+        "-"
+    } else {
+        ""
+    };
+    format!("{sign}{grouped}")
 }
 
 /// Energy a month: `372 kWh a month`.

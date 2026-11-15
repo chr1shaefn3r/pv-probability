@@ -25,6 +25,15 @@
 //! ]
 //! ```
 //!
+//! A room's floor area, in square metres, weighs it in the house's temperature, which the
+//! heat loss coefficient is worked out from:
+//!
+//! ```toml
+//! rooms = [
+//!   { name = "Living room", sensor = "sensor.living_room_temperature", area = 32.5 },
+//! ]
+//! ```
+//!
 //! Floors and rooms keep the order the file gives them, which is the order the report
 //! shows them in.
 
@@ -52,6 +61,8 @@ pub struct Room {
     /// The room's thermometers, as Home Assistant entity or statistic ids: one or more,
     /// in the file's order.
     pub sensors: Vec<String>,
+    /// Its floor area in square metres, if the file gives it.
+    pub area: Option<f64>,
 }
 
 /// The file as written, before it is checked.
@@ -78,6 +89,8 @@ struct RoomEntry {
     sensor: Option<String>,
     /// ... or every thermometer of a room that has several.
     sensors: Option<Vec<String>>,
+    /// Floor area in square metres.
+    area: Option<f64>,
 }
 
 impl House {
@@ -158,7 +171,18 @@ impl House {
                     owners.insert(sensor.clone(), label.clone());
                     own.push(sensor);
                 }
-                rooms.push(Room { name, sensors: own });
+                if let Some(area) = room.area {
+                    ensure!(
+                        area.is_finite() && area > 0.0,
+                        "the room {label:?} has an area of {area}; give its floor area in square \
+                         metres, above zero"
+                    );
+                }
+                rooms.push(Room {
+                    name,
+                    sensors: own,
+                    area: room.area,
+                });
             }
             floors.push(Floor {
                 name: floor_name,
@@ -177,6 +201,11 @@ impl House {
 
     pub fn room_count(&self) -> usize {
         self.floors.iter().map(|floor| floor.rooms.len()).sum()
+    }
+
+    /// The floor area of the rooms that give one, in m².
+    pub fn area(&self) -> f64 {
+        self.rooms().filter_map(|(_, room)| room.area).sum()
     }
 
     /// Every thermometer of every room, with its room, in the file's order.
@@ -245,6 +274,35 @@ mod tests {
             .map(|(_, _, sensor, _)| *sensor)
             .collect();
         assert_eq!(sensors, demo);
+    }
+
+    #[test]
+    fn a_room_may_give_its_floor_area() {
+        let house = House::parse(
+            r#"
+            [[floor]]
+            name = "Ground floor"
+            rooms = [
+              { name = "Living room", sensor = "sensor.a", area = 32.5 },
+              { name = "Hall", sensor = "sensor.b" },
+            ]
+            "#,
+        )
+        .unwrap();
+        let areas: Vec<Option<f64>> = house.rooms().map(|(_, room)| room.area).collect();
+        assert_eq!(areas, [Some(32.5), None]);
+        assert_eq!(house.area(), 32.5);
+        for area in ["0", "-4", "nan"] {
+            let error = House::parse(&format!(
+                "[[floor]]\nname = \"Ground floor\"\nrooms = [{{ name = \"Hall\", sensor = \
+                 \"sensor.b\", area = {area} }}]"
+            ))
+            .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("give its floor area in square metres"),
+                "{error:#}"
+            );
+        }
     }
 
     #[test]

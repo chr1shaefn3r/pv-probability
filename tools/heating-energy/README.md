@@ -92,13 +92,24 @@ it, every one counting alike. One that saw too little of a day is left out of th
 rather than counted on a few hours, so such a day stands on the others; the run says on
 how many days that happened, and the report says which thermometers make up the room.
 
+A room may give its floor area in square metres. Together with the
+[heating energy](#heating-energy-and-efficiency), the rooms' temperatures weighted by it
+make the house's temperature, which [the heat loss coefficient](#building-or-behaviour-the-heat-loss-coefficient)
+is worked out from; nothing else uses it:
+
+```toml
+rooms = [
+  { name = "Living room", sensor = "sensor.living_room_temperature", area = 32.5 },
+]
+```
+
 [`rooms.example.toml`](rooms.example.toml) is a complete one, matching the demo database.
 Floors and rooms appear in the report in the file's order. Room names only have to be
 unique on their floor - a bathroom upstairs and one downstairs are fine - but a
 thermometer belongs to one room. Mistakes are named rather than guessed around: an
 unknown key, a floor without rooms, a room with both `sensor` and `sensors` or neither, a
-sensor listed twice, and a sensor that is not a thermometer all stop the run with the
-room's name in the message.
+sensor listed twice, an area of nothing or less, and a sensor that is not a thermometer
+all stop the run with the room's name in the message.
 
 ### Thermostats with an offset
 
@@ -151,7 +162,7 @@ efficiency: 2.50 kWh per heating degree day (± 0.06), once water heating of 389
   2024/25: 2.10 kWh per degree day (± 0.03) over 5 months, 18% less than 2023/24; water heating 399 kWh a month, from July 2024, August 2024 and September 2024
 ```
 
-![Monthly heating energy, water heating taken off, against monthly degree days, and kWh per degree day per season](docs/energy-light.png)
+![Monthly heating energy, water heating taken off, against monthly degree days, kWh per degree day per season, and the heat loss coefficient beside it](docs/energy-light.png)
 
 The **slope** is the house's efficiency figure: the energy one more heating degree day
 costs. The weather only moves a month along the line, so insulation, new windows or a
@@ -187,6 +198,48 @@ season's water heating.
   what heating costs. A season gets a line of its own on the same terms.
 * **The ±** is the slope's standard error. Two seasons whose slopes are further apart
   than their errors put together differ by more than the weather's noise.
+
+### Building or behaviour: the heat loss coefficient
+
+Degree days take the house to be kept at one temperature, so kWh per degree day moves
+with how warm it is kept as well as with the building. Give the rooms in the rooms file
+their floor area, and the run also works out what the building alone loses:
+
+```sh
+heating-energy --db ha.db --outside-entity sensor.outdoor_temperature \
+  --energy-entity number.heizol_energy --rooms rooms.toml
+```
+
+With the demo's rooms, as [`rooms.example.toml`](rooms.example.toml) gives their areas, and
+the made-up meter, whose house was insulated in the summer of 2024:
+
+```
+heat loss: 61 W/K over 16 heating months, the house kept at 20.5 °C - its 5 rooms weighted by 84 m² of floor
+  2022/23: 62 W/K at 20.5 °C over 4 months
+  2023/24: 65 W/K at 20.5 °C over 9 months; against 2022/23: kWh per degree day +6%, heat loss +6%, the house 0.1 K cooler - mostly the building
+  2024/25: 45 W/K at 20.7 °C over 3 months; against 2023/24: kWh per degree day -18%, heat loss -31%, the house 0.2 K warmer - mostly the building
+```
+
+* **The house's temperature** is the rooms', weighted by their floor area: Σ(area ×
+  temperature) / total area, hour by hour. An hour any room with an area - or the outside
+  thermometer - is missing from is left out rather than read from the others alone; a
+  room without an area is left out of it altogether, and the run names it.
+* **Degree-hours** add up the house's temperature less the outside's, hour by hour, over
+  a month - scaled up to the whole month where a few hours are missing, as degree days
+  are; a month missing more than a tenth is left out.
+* **The heat loss coefficient** is the heating energy - water heating taken off - over the
+  degree-hours, times a thousand: watts for every kelvin the house is kept above the
+  outside. It is taken over the heating months only, those colder on average than the
+  heating base: in milder ones the sun and the household cover much of what the building
+  loses, so it would read low. A season needs three of them for a figure of its own.
+* **What changed** sets each season against the one before. kWh per degree day moves with
+  both the building and how warm the house is kept; the heat loss coefficient with the
+  building alone. When two thirds or more of the change in kWh per degree day is the heat
+  loss coefficient's, it was mostly the building; a third or less, mostly how warm the
+  house was kept. A change in kWh per degree day under 3% is none.
+
+The report shows the same under Heating energy, with the house's temperature, degree-hours
+and heat loss of every month in the month table.
 
 ### Keeping the readings
 
@@ -245,7 +298,7 @@ readings it found. Its units may be kWh, Wh or MWh.
 | Option | Default | What it does |
 |---|---|---|
 | `--outside-entity <ID>` | required | The outdoor thermometer, e.g. `sensor.outdoor_temperature` |
-| `--rooms <FILE>` | none | The [rooms file](#the-rooms-file): floors, rooms and their thermometers |
+| `--rooms <FILE>` | none | The [rooms file](#the-rooms-file): floors, rooms, their thermometers and floor areas |
 | `--energy-entity <ID>` | none | The [heating's energy as a running total](#heating-energy-and-efficiency) in kWh, read on the last day of every month |
 | `--heating-base <°C>` | `15` | Outside temperature above which a day needs no heating |
 | `--cooling-base <°C>` | `21` | Outside temperature above which a day needs cooling; not below the heating base |

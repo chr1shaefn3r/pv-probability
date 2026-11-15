@@ -10,18 +10,22 @@
 # several thermometers lists them all, and is counted by their mean:
 #
 #   { name = "Living room", sensors = ["sensor.sofa_temperature", "sensor.desk_temperature"] },
+#
+# A room's area is its floor area in square metres. With --energy-entity, the rooms'
+# temperatures weighted by it make the house's temperature, which the heat loss coefficient
+# is worked out from; a room without one is left out of it, and nothing else needs it.
 
 [[floor]]
 name = "Ground floor"
 rooms = [
-  { name = "Living room", sensor = "sensor.living_room_temperature" },
-  { name = "Kitchen", sensor = "sensor.kitchen_temperature" },
-  { name = "Office", sensor = "sensor.office_temperature" },
+  { name = "Living room", sensor = "sensor.living_room_temperature", area = 32 },
+  { name = "Kitchen", sensor = "sensor.kitchen_temperature", area = 14 },
+  { name = "Office", sensor = "sensor.office_temperature", area = 12 },
 ]
 
 [[floor]]
 name = "First floor"
 rooms = [
-  { name = "Bedroom", sensor = "sensor.bedroom_temperature" },
-  { name = "Bathroom", sensor = "sensor.bathroom_temperature" },
+  { name = "Bedroom", sensor = "sensor.bedroom_temperature", area = 18 },
+  { name = "Bathroom", sensor = "sensor.bathroom_temperature", area = 8 },
 ]
