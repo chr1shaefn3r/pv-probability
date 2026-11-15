@@ -241,6 +241,33 @@ heat loss: 61 W/K over 16 heating months, the house kept at 20.5 °C - its 5 roo
 The report shows the same under Heating energy, with the house's temperature, degree-hours
 and heat loss of every month in the month table.
 
+### A degree warmer
+
+From the same hours, the run works out what keeping the house a degree warmer costs, and
+the report gives it a section of its own - the rule of thumb says about 6% more heating
+energy, and the house's own number is more convincing:
+
+```
+a degree warmer: 713 kWh more heating energy in a season like 2023/24, with its 9 heating months: 11.6% of its heating energy - the rule of thumb says 6%; each degree-hour costs 108 Wh
+  2022/23: 309 kWh over 4 heating months, 13.2% of its heating energy
+  2023/24: 729 kWh over 9 heating months, 11.9% of its heating energy
+  2024/25: 195 kWh over 3 heating months, 17.0% of its heating energy
+```
+
+* **A degree warmer adds a degree-hour to every hour** of the heating months, and the
+  heating has to make up all of it: the sun and the household give no more for it. So
+  what counts is what one more degree-hour costs - the slope of a line through the heating
+  months' heating energy against their degree-hours - not the heat loss coefficient above,
+  which is heating energy over all the degree-hours. Part of those the free heat covers,
+  so that average reads lower, and would make a degree look cheaper than it is: on the
+  demo, 61 W/K on average, 108 W/K at the margin.
+* **A season's cost** is that slope times the hours of its heating months, and its share
+  is of the season's heating energy. The headline takes the line through every heating
+  month on record, applied to the season with the most heating months; the table gives
+  every season's own line, which needs three heating months, milder and colder ones.
+* **It is if anything a little more**: a warmer house would also want heating on a few
+  more days at either end of the season, which the heating months leave out.
+
 ### Keeping the readings
 
 A sensor with a state class - `total_increasing` for a meter - is kept by Home Assistant

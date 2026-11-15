@@ -254,6 +254,12 @@ pub struct Fit {
 /// The least-squares line through `(heating degree days, kWh)` points, if there are
 /// enough of them spread out enough to carry one.
 pub fn fit(points: &[(f64, f64)]) -> Option<Fit> {
+    fit_spread(points, MIN_SPREAD)
+}
+
+/// The least-squares line through `(x, y)` points, if there are enough of them and their
+/// x spread at least `min_spread` apart.
+pub fn fit_spread(points: &[(f64, f64)], min_spread: f64) -> Option<Fit> {
     if points.len() < MIN_FIT_MONTHS {
         return None;
     }
@@ -263,7 +269,7 @@ pub fn fit(points: &[(f64, f64)]) -> Option<Fit> {
         .fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), (x, _)| {
             (low.min(*x), high.max(*x))
         });
-    if highest - lowest < MIN_SPREAD {
+    if highest - lowest < min_spread {
         return None;
     }
     let mean_x = points.iter().map(|(x, _)| x).sum::<f64>() / n;

@@ -1047,6 +1047,27 @@ fn rooms_with_a_floor_area_give_the_houses_heat_loss_coefficient() {
         "{html}"
     );
     assert!(html.contains("<td>- (a mild month)</td>"));
+
+    // No free heat in this house: every degree-hour costs the whole 150 W/K. January to May
+    // are 3,648 hours, and their heating 7,754 kWh.
+    assert!(
+        stdout.contains(
+            "a degree warmer: 547 kWh more heating energy in a season like 2023/24, with its 5 \
+             heating months: 7.1% of its heating energy - the rule of thumb says 6%; each \
+             degree-hour costs 150 Wh"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("  2024/25: 331 kWh over 3 heating months, 6.8% of its heating energy"),
+        "{stdout}"
+    );
+    assert!(html.contains("<h2>A degree warmer</h2>"));
+    assert!(html.contains(
+        "<strong>547 kWh</strong> more heating energy for every degree warmer in a season like \
+         2023/24, with its 5 heating months: <strong>7.1%</strong> of its heating energy - \
+         against the rule of thumb's 6%."
+    ));
 }
 
 #[test]
@@ -1087,4 +1108,6 @@ fn rooms_without_a_floor_area_say_how_to_get_the_heat_loss() {
         "{stdout}"
     );
     assert!(!stdout.contains("heat loss:"));
+    let html = std::fs::read_to_string(scratch.path("report.html")).unwrap();
+    assert!(!html.contains("A degree warmer"));
 }

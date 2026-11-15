@@ -13,7 +13,8 @@ use crate::energy::{
     format_slope, format_whole, month_list, season_label,
 };
 use crate::heatloss::{
-    HeatLoss, MIN_HOUR_COVERAGE, NotCounted, format_coefficient, format_share, format_warmer,
+    HeatLoss, MIN_HOUR_COVERAGE, NotCounted, RULE_OF_THUMB, Warmer, format_coefficient,
+    format_share, format_warmer,
 };
 
 /// What the report needs to say about heating energy.
@@ -786,6 +787,118 @@ fn building_or_behaviour(heat_loss: &HeatLoss) -> String {
     }
     let _ = write!(html, "<p class=\"note\">{}</p>", escape(&note));
     html
+}
+
+/// The section on what a degree warmer costs, when the rooms give their floor area: empty
+/// otherwise.
+pub fn warmer_section(section: &EnergySection) -> String {
+    let Some(heat_loss) = &section.heat_loss else {
+        return String::new();
+    };
+    let mut html = String::from(
+        "<section class=\"panel energy\"><h2>A degree warmer</h2><p>Keeping the house a \
+         degree warmer adds a degree to its difference with the outside in every hour of the \
+         heating season, and the heating has to make up all of it: the sun and the household \
+         give no more for it. A line through the heating months' heating energy against their \
+         degree-hours says what one more degree-hour costs; times the hours of a season's \
+         heating months, that is what a degree warmer costs the season.</p>",
+    );
+    let Some(warmer) = heat_loss.warmer else {
+        let _ = write!(
+            html,
+            "<p class=\"empty\">There is no line through the heating months yet: {} of them, \
+             and it needs {MIN_FIT_MONTHS}, milder and colder ones.</p></section>",
+            heat_loss.counted().count()
+        );
+        return html;
+    };
+    if let Some(season) = heat_loss.fullest_season() {
+        let (kwh, share) = season.cost(&warmer);
+        let _ = write!(
+            html,
+            "<p class=\"headline\"><strong>{}</strong> more heating energy for every degree \
+             warmer in a season like {}, with its {} heating month{}{} - against the rule of \
+             thumb's {}.</p>",
+            escape(&format_energy(kwh)),
+            escape(&season_label(season.start_year)),
+            season.heating_months,
+            if season.heating_months == 1 { "" } else { "s" },
+            share.map_or_else(String::new, |share| format!(
+                ": <strong>{}</strong> of its heating energy",
+                escape(&percent_of(share))
+            )),
+            escape(&percent(RULE_OF_THUMB))
+        );
+    }
+
+    html.push_str(
+        "<div class=\"table-scroll\"><table><caption>Per heating season, from its own \
+         heating months; a season needs three of them, milder and colder ones, for a line of \
+         its own.</caption><thead><tr><th scope=\"col\">Season</th><th scope=\"col\">\
+         Heating months</th><th scope=\"col\">Heating energy</th><th scope=\"col\">Each \
+         degree-hour</th><th scope=\"col\">A degree warmer</th><th scope=\"col\">Of the \
+         heating energy</th></tr></thead><tbody>",
+    );
+    let cells = |warmer: Option<&Warmer>| match warmer {
+        Some(warmer) => format!(
+            "<td>{}</td><td>{}</td><td>{}</td>",
+            escape(&format_watt_hours(warmer.marginal())),
+            escape(&format_energy(warmer.kwh())),
+            escape(&warmer.share().map_or_else(|| "-".to_string(), percent_of))
+        ),
+        None => "<td>-</td><td>-</td><td>-</td>".to_string(),
+    };
+    for (season, energy_season) in heat_loss.seasons.iter().zip(&section.energy.seasons) {
+        let _ = write!(
+            html,
+            "<tr><th scope=\"row\">{}</th><td>{}</td><td>{}</td>{}</tr>",
+            escape(&season_label(season.start_year)),
+            season.heating_months,
+            escape(&format_energy(energy_season.kwh)),
+            cells(season.warmer.as_ref())
+        );
+    }
+    let _ = write!(
+        html,
+        "</tbody><tfoot><tr><th scope=\"row\">All</th><td>{}</td><td>{}</td>{}</tr></tfoot>\
+         </table></div>",
+        warmer.fit.months,
+        escape(&format_energy(warmer.heating_kwh)),
+        cells(Some(&warmer))
+    );
+
+    let mut note = format!(
+        "Each degree-hour costs {} at the margin - {} for every kelvin the house is kept above \
+         the outside",
+        format_watt_hours(warmer.marginal()),
+        format_coefficient(warmer.marginal())
+    );
+    if let Some(overall) = heat_loss.overall {
+        let _ = write!(
+            note,
+            ", against the {} the heating made up for on average: the sun and the household \
+             cover part of what the building loses, and that part does not grow when the house \
+             is kept warmer, so the average would make a degree look cheaper than it is",
+            format_coefficient(overall.coefficient)
+        );
+    }
+    note.push_str(
+        ". Only the heating months count, as for the heat loss coefficient. A warmer house \
+         would also want heating on a few more days at either end of the season, which this \
+         leaves out, so a degree costs if anything a little more.",
+    );
+    let _ = write!(html, "<p class=\"note\">{}</p></section>", escape(&note));
+    html
+}
+
+/// A share as a percentage to a tenth: `9.8%`, `17.0%`.
+fn percent_of(share: f64) -> String {
+    format!("{:.1}%", share * 100.0)
+}
+
+/// Energy an hour, in whole Wh: `113 Wh`.
+fn format_watt_hours(watt_hours: f64) -> String {
+    format!("{} Wh", format_whole(watt_hours))
 }
 
 /// A floor area: `142`, `18.5`.

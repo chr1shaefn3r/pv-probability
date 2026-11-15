@@ -695,6 +695,37 @@ fn heat_loss_lines(heat_loss: &HeatLoss) -> Vec<String> {
             ));
         }
     }
+    if let (Some(warmer), Some(season)) = (heat_loss.warmer, heat_loss.fullest_season()) {
+        let (kwh, share) = season.cost(&warmer);
+        lines.push(format!(
+            "a degree warmer: {} more heating energy in a season like {}, with its {} heating \
+             months{} - the rule of thumb says {:.0}%; each degree-hour costs {:.0} Wh",
+            format_energy(kwh),
+            season_label(season.start_year),
+            season.heating_months,
+            share.map_or_else(String::new, |share| format!(
+                ": {:.1}% of its heating energy",
+                share * 100.0
+            )),
+            heatloss::RULE_OF_THUMB * 100.0,
+            warmer.marginal()
+        ));
+        for season in &heat_loss.seasons {
+            let Some(warmer) = season.warmer else {
+                continue;
+            };
+            lines.push(format!(
+                "  {}: {} over {} heating months{}",
+                season_label(season.start_year),
+                format_energy(warmer.kwh()),
+                season.heating_months,
+                warmer.share().map_or_else(String::new, |share| format!(
+                    ", {:.1}% of its heating energy",
+                    share * 100.0
+                ))
+            ));
+        }
+    }
     if !heat_loss.without_area.is_empty() {
         lines.push(format!(
             "note: {} {} no area in the rooms file, so the house's temperature leaves {} out",
