@@ -25,6 +25,9 @@ pub struct ReportOptions {
     pub metadata: Vec<(String, String)>,
     pub coverage: Option<Coverage>,
     pub tz: Tz,
+    /// `(room, what was taken out)` for every room whose thermostat offset was taken back
+    /// out of its readings.
+    pub room_notes: Vec<(String, String)>,
 }
 
 impl Default for ReportOptions {
@@ -35,6 +38,7 @@ impl Default for ReportOptions {
             metadata: Vec::new(),
             coverage: None,
             tz: Tz::UTC,
+            room_notes: Vec::new(),
         }
     }
 }
@@ -47,7 +51,7 @@ pub fn page(analysis: &Analysis, options: &ReportOptions) -> String {
     body.push_str(&metadata_list(&metadata_entries(analysis, options)));
     body.push_str(&degree_day_section(analysis, options));
     if let Some(house) = &options.house {
-        body.push_str(&rooms_section(analysis, house));
+        body.push_str(&rooms_section(analysis, house, &options.room_notes));
     }
     body.push_str(&years_section(analysis, options));
     body.push_str(&method_section(analysis));
@@ -438,13 +442,22 @@ fn summary_row(summary: &Summary, with_floors: bool) -> String {
 }
 
 /// Every room, a floor at a time, over the same days the degree days were counted on.
-fn rooms_section(analysis: &Analysis, house: &House) -> String {
+fn rooms_section(analysis: &Analysis, house: &House, notes: &[(String, String)]) -> String {
     let mut html = String::from(
         "<section class=\"panel rooms\"><h2>Indoor temperatures</h2><p>Each room's mean over \
          the days the degree days were counted on, wherever its own thermometer covered the day \
          as well. A floor's figure is the plain mean of its rooms, every room counting alike.\
          </p>",
     );
+    for (room, note) in notes {
+        let _ = write!(
+            html,
+            "<p class=\"note\"><strong>{}</strong> is shown with its thermostat's offset taken \
+             back out, as it measured rather than as it reported: {}.</p>",
+            escape(room),
+            escape(note)
+        );
+    }
     let mut first = 0;
     for (index, floor) in house.floors.iter().enumerate() {
         let rooms = first..first + floor.rooms.len();

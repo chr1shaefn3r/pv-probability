@@ -81,8 +81,49 @@ rooms = [
 Floors and rooms appear in the report in the file's order. Room names only have to be
 unique on their floor - a bathroom upstairs and one downstairs are fine - but a
 thermometer belongs to one room. Mistakes are named rather than guessed around: an
-unknown key, a floor without rooms, a sensor listed twice, and a room whose sensor is not
-a thermometer all stop the run with the room's name in the message.
+unknown key, a floor without rooms, a sensor listed twice, a room whose sensor is not
+a thermometer and an offset that is not an entity id or a number all stop the run with
+the room's name in the message.
+
+### Thermostats with an offset
+
+A thermostat on a radiator measures the air right beside it, which is warmer than the
+rest of the room while it heats, so it is often given an offset: set to -2, it reports
+two degrees less than it measures, and keeps heating until the far side of the room is
+warm enough. Home Assistant records the reading with the offset in it, which is not what
+a plain thermometer in the same room would show. Name the thermostat's offset setting and
+the tool takes it back out again:
+
+```toml
+rooms = [
+  { name = "Bathroom", sensor = "sensor.bathroom_radiator_temperature",
+    offset = "number.bathroom_radiator_temperature_offset" },
+]
+```
+
+* **It follows the setting over time.** Every reading has the offset that was set at that
+  moment taken out; an hour in which it changed has each value taken out of its part of
+  the hour.
+* **Only the recent past is on record.** Home Assistant keeps a setting only in its raw
+  states - ten days by default - while the thermometer's hourly statistics go back years.
+  Readings from before the first recorded value are taken to have had that value too,
+  which holds for an offset set once, when the thermostat went in. The run says from when
+  the setting is on record.
+* **Which way it is applied is checked.** Zigbee and Matter thermostats report what they
+  measure *plus* the offset, and that is what the tool assumes. When the offset changed
+  while the raw readings were still kept, the reading should have jumped by the same
+  amount at the same moment: the run says it did, or warns that it moved the other way.
+  A thermostat that subtracts its offset takes `offset_applied = "subtracted"`.
+* **A fixed value works too.** `offset = -2`, in the thermostat's own unit, for an offset
+  the recorder never saw.
+* **A room that names none is only given a hint.** When a `number` entity looks like a
+  room's thermostat offset - its id shares most of its words with the room's sensor's -
+  the run points it out, but nothing changes until the rooms file names it. The two ids
+  rarely match exactly: rename a device and only some of its entities follow.
+  `offset = false` keeps the reading as reported and stops the hint.
+
+To find the setting, look among the thermostat's entities in Home Assistant for one
+called something like *Temperature offset* or *Local temperature calibration*.
 
 ## How it is counted
 

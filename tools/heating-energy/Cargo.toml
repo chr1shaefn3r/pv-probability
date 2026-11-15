@@ -18,9 +18,9 @@ clap.workspace = true
 ha-recorder.workspace = true
 ha-report.workspace = true
 rayon.workspace = true
+rusqlite.workspace = true
 serde.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
 ha-testdb.workspace = true
-rusqlite.workspace = true

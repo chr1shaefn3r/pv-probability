@@ -7,6 +7,12 @@
 #
 # Floors and rooms appear in the report in the order they are listed here. Room names
 # only have to be unique on their floor; a thermometer belongs to one room.
+#
+# A thermostat that reports its reading with an offset of its own applied can have it
+# taken back out (see "Thermostats with an offset" in the README):
+#
+#   { name = "Bathroom", sensor = "sensor.bathroom_radiator_temperature",
+#     offset = "number.bathroom_radiator_temperature_offset" },
 
 [[floor]]
 name = "Ground floor"

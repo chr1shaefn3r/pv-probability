@@ -55,6 +55,89 @@ pub fn entity_exists(conn: &Connection, entity_id: &str) -> Result<bool> {
     }
 }
 
+/// Every value an entity's state took that reads as a number, with when it took it, in
+/// time order.
+///
+/// For a setting rather than a measurement - a thermostat's temperature offset - what
+/// matters is when it changed and to what, not how long each value was in effect. States
+/// that are not a number (`unavailable`, `unknown`) are left out: a setting stays as it was
+/// while its device is off the network. So are rows without a time. An entity the table
+/// does not know at all is an error naming the ids that come close.
+///
+/// Raw states are purged after `purge_keep_days` (ten days by default), so this is only
+/// the recent past; Home Assistant keeps no long-term statistics for a setting.
+pub fn history(conn: &Connection, entity_id: &str) -> Result<Vec<(i64, f64)>> {
+    let layout = states_layout(conn)?;
+    let time_column = layout.time().name();
+    let (key_column, key, meta_table) = match layout {
+        StatesLayout::MetadataId { .. } => (
+            "metadata_id",
+            find_state_metadata_id(conn, entity_id)?.map(Value::Integer),
+            "states_meta",
+        ),
+        StatesLayout::InlineEntityId { .. } => (
+            "entity_id",
+            entity_exists(conn, entity_id)?.then(|| Value::Text(entity_id.to_string())),
+            "states",
+        ),
+    };
+    let Some(key) = key else {
+        return Err(not_found_error(
+            "entity",
+            entity_id,
+            &schema::suggest_ids(conn, meta_table, "entity_id", entity_id),
+        ));
+    };
+
+    let sql = format!(
+        "SELECT \"{time_column}\", state FROM states WHERE {key_column} = ?1 \
+         ORDER BY \"{time_column}\""
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([key], |row| {
+        Ok((row.get::<_, Value>(0)?, row.get::<_, Value>(1)?))
+    })?;
+    let mut history = Vec::new();
+    for row in rows {
+        let (raw_time, raw_state) = row?;
+        if let (Some(ts), Some(value)) = (value_to_timestamp(&raw_time), value_to_f64(&raw_state)) {
+            history.push((ts, value));
+        }
+    }
+    // Text timestamps sort as text in SQL; the stable sort keeps ties in the order read.
+    history.sort_by_key(|(ts, _)| *ts);
+    Ok(history)
+}
+
+/// The entities of `domain` (`number`, `sensor`, ...) the states table knows whose id
+/// contains any of `words`, in id order.
+pub fn entities_matching(conn: &Connection, domain: &str, words: &[&str]) -> Result<Vec<String>> {
+    let (table, distinct) = match states_layout(conn) {
+        Ok(StatesLayout::MetadataId { .. }) => ("states_meta", ""),
+        Ok(StatesLayout::InlineEntityId { .. }) => ("states", "DISTINCT "),
+        Err(_) => return Ok(Vec::new()),
+    };
+    if words.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut params = vec![format!("{domain}.%")];
+    let mut alternatives = Vec::with_capacity(words.len());
+    for word in words {
+        params.push(format!("%{word}%"));
+        alternatives.push(format!("entity_id LIKE ?{}", params.len()));
+    }
+    let sql = format!(
+        "SELECT {distinct}entity_id FROM {table} WHERE entity_id LIKE ?1 AND ({}) \
+         ORDER BY entity_id",
+        alternatives.join(" OR ")
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let ids = stmt
+        .query_map(rusqlite::params_from_iter(params), |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    Ok(ids)
+}
+
 /// How far apart raw states are guessed to be, in seconds, to decide how many slices a
 /// read is worth. They arrive whenever the value changes - every few seconds for a busy
 /// power sensor, every few minutes for a thermometer - and guessing on the busy side
@@ -356,6 +439,84 @@ mod tests {
             .to_string();
         assert!(error.contains("sensor.solar_powr"), "{error}");
         assert!(error.contains(ENTITY), "{error}");
+    }
+
+    #[test]
+    fn a_settings_history_keeps_its_numbers_in_time_order() {
+        for flavour in [Flavour::Modern, Flavour::Legacy] {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            testdb::create_schema(&conn, flavour);
+            let offset = "number.bath_temperature_offset";
+            let id = match flavour {
+                Flavour::Modern => testdb::insert_states_meta(&conn, offset),
+                Flavour::Legacy => 0,
+            };
+            let base = ts("2024-11-01 08:00:00");
+            // Written out of order, with the device dropping off once.
+            for (at, state) in [
+                (base + 7_200, "-2"),
+                (base, "-1.5"),
+                (base + 3_600, "unavailable"),
+                (base + 10_800, "-2.0"),
+            ] {
+                testdb::insert_state(&conn, flavour, offset, id, at, state);
+            }
+            assert_eq!(
+                history(&conn, offset).unwrap(),
+                [(base, -1.5), (base + 7_200, -2.0), (base + 10_800, -2.0)],
+                "{flavour:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_setting_is_an_error_that_suggests_the_close_ones() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        testdb::create_schema(&conn, Flavour::Modern);
+        testdb::insert_states_meta(&conn, "number.bad_heizkorper_temperature_offset");
+        let error = history(&conn, "number.bad_og_heizkorper_temperature_offset")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no entity named"), "{error}");
+        assert!(
+            error.contains("number.bad_heizkorper_temperature_offset"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn entities_are_found_by_domain_and_words() {
+        for flavour in [Flavour::Modern, Flavour::Legacy] {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            testdb::create_schema(&conn, flavour);
+            for entity in [
+                "number.bad_heizkorper_temperature_offset",
+                "number.kitchen_local_temperature_calibration",
+                "number.boiler_flow_setpoint",
+                "sensor.bad_offset_check",
+            ] {
+                let id = match flavour {
+                    Flavour::Modern => testdb::insert_states_meta(&conn, entity),
+                    Flavour::Legacy => 0,
+                };
+                testdb::insert_state(&conn, flavour, entity, id, 1_700_000_000, "1");
+            }
+            assert_eq!(
+                entities_matching(&conn, "number", &["offset", "calibration"]).unwrap(),
+                [
+                    "number.bad_heizkorper_temperature_offset",
+                    "number.kitchen_local_temperature_calibration"
+                ],
+                "{flavour:?}"
+            );
+            assert!(entities_matching(&conn, "number", &[]).unwrap().is_empty());
+        }
+        let empty = rusqlite::Connection::open_in_memory().unwrap();
+        assert!(
+            entities_matching(&empty, "number", &["offset"])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

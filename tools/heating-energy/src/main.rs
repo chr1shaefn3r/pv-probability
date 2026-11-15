@@ -19,8 +19,9 @@ use ha_report::{format_duration, open_command};
 use heating_energy::cli::{Args, Config};
 use heating_energy::daily::{DayMean, daily_means};
 use heating_energy::degree::{Analysis, analyse};
+use heating_energy::offset::{self, Check, Correction, Finding, format_offset, local_stamp};
 use heating_energy::report::{ReportOptions, format_celsius, format_degree_days, page};
-use heating_energy::rooms::House;
+use heating_energy::rooms::{Applied, House, Offset, Room};
 
 fn main() {
     if let Err(error) = run() {
@@ -66,23 +67,53 @@ fn run() -> Result<()> {
                 .map(|(floor, room)| (room.sensor.as_str(), Some((floor, room)))),
         );
     }
-    let read_all: Vec<Result<(LoadedSamples, Vec<DayMean>)>> = thermometers
+    // A room's thermostat offset is taken back out in the room's own task, before its
+    // days are counted.
+    let named_offsets: Vec<&str> = house
+        .iter()
+        .flat_map(House::rooms)
+        .filter_map(|(_, room)| match &room.offset {
+            Offset::Entity { entity, .. } => Some(entity.as_str()),
+            _ => None,
+        })
+        .collect();
+    let read_all: Vec<Result<Thermometer>> = thermometers
         .par_iter()
         .map(|(entity, room)| {
-            let loaded = match room {
-                Some((floor, room)) => read(&args, &config, entity).with_context(|| {
-                    format!("reading the thermometer of {} / {}", floor.name, room.name)
-                })?,
-                None => read(&args, &config, entity)?,
+            let (loaded, finding) = match room {
+                Some((floor, room)) => read_room(&args, &config, room, &named_offsets)
+                    .with_context(|| {
+                        format!("reading the thermometer of {} / {}", floor.name, room.name)
+                    })?,
+                None => (read(&args, &config, entity)?, None),
             };
             let days = daily_means(&loaded.samples, tz);
-            Ok((loaded, days))
+            Ok(Thermometer {
+                loaded,
+                days,
+                finding,
+            })
         })
         .collect();
     // The first thermometer that failed, in the file's order, is the one reported.
     let mut read_all = read_all.into_iter().collect::<Result<Vec<_>>>()?;
-    let (outside, outside_days) = read_all.remove(0);
-    let (rooms, room_days): (Vec<LoadedSamples>, Vec<Vec<DayMean>>) = read_all.into_iter().unzip();
+    let outside = read_all.remove(0);
+    let (outside, outside_days) = (outside.loaded, outside.days);
+    let labels: Vec<String> = house
+        .iter()
+        .flat_map(House::rooms)
+        .map(|(floor, room)| format!("{} / {}", floor.name, room.name))
+        .collect();
+    let mut rooms = Vec::with_capacity(read_all.len());
+    let mut room_days = Vec::with_capacity(read_all.len());
+    let mut findings: Vec<(String, Finding)> = Vec::new();
+    for (thermometer, label) in read_all.into_iter().zip(&labels) {
+        rooms.push(thermometer.loaded);
+        room_days.push(thermometer.days);
+        if let Some(finding) = thermometer.finding {
+            findings.push((label.clone(), finding));
+        }
+    }
     if args.verbose > 0 {
         eprintln!(
             "read {} outside rows from `{}` and {} rows for {} rooms in {:.2?} on {} threads",
@@ -141,12 +172,24 @@ fn run() -> Result<()> {
             metadata: metadata(&args, &outside, tz),
             coverage: coverage.clone(),
             tz,
+            room_notes: findings
+                .iter()
+                .filter_map(|(label, finding)| match finding {
+                    Finding::Corrected(correction) => {
+                        Some((label.clone(), correction.sentence(tz)))
+                    }
+                    Finding::Suggested(_) => None,
+                })
+                .collect(),
         },
     );
     fs::write(&args.out, &html)
         .with_context(|| format!("failed to write {}", args.out.display()))?;
 
     report(&args, &analysis, house.as_ref(), html.len(), started);
+    for line in finding_lines(&findings, tz) {
+        println!("{line}");
+    }
     if let Some(coverage) = &coverage {
         println!("{}", coverage_line(coverage, tz));
     }
@@ -156,17 +199,46 @@ fn run() -> Result<()> {
     Ok(())
 }
 
+/// One thermometer read, its days counted, and what became of its offset.
+struct Thermometer {
+    loaded: LoadedSamples,
+    days: Vec<DayMean>,
+    finding: Option<Finding>,
+}
+
 /// Load one thermometer on its own read-only connection, explaining an empty result.
 fn read(args: &Args, config: &Config, entity: &str) -> Result<LoadedSamples> {
     let conn = source::open_database(&args.recorder.db)?;
+    load_thermometer(&conn, args, config, entity)
+}
+
+/// Load a room's thermometer and take its offset back out, if the rooms file says to.
+fn read_room(
+    args: &Args,
+    config: &Config,
+    room: &Room,
+    named_offsets: &[&str],
+) -> Result<(LoadedSamples, Option<Finding>)> {
+    let conn = source::open_database(&args.recorder.db)?;
+    let mut loaded = load_thermometer(&conn, args, config, &room.sensor)?;
+    let finding = offset::resolve(&conn, room, &mut loaded, named_offsets)?;
+    Ok((loaded, finding))
+}
+
+fn load_thermometer(
+    conn: &rusqlite::Connection,
+    args: &Args,
+    config: &Config,
+    entity: &str,
+) -> Result<LoadedSamples> {
     // Temperatures below zero are the whole point in winter: never clamp them.
     let options =
         args.recorder
             .load_options(entity, Quantity::Temperature, &config.recorder, false);
-    let loaded = source::load(&conn, &options)?;
+    let loaded = source::load(conn, &options)?;
     if loaded.samples.is_empty() {
         return Err(source::explain_no_samples(
-            &conn,
+            conn,
             &options,
             &loaded,
             config.recorder.tz,
@@ -236,6 +308,80 @@ fn report(args: &Args, analysis: &Analysis, house: Option<&House>, bytes: usize,
             },
             args.min_day_coverage * 100.0
         );
+    }
+}
+
+/// What became of every room's offset, as lines for the terminal: what was taken out,
+/// what the readings say about it, and what looks like an offset nobody named.
+fn finding_lines(findings: &[(String, Finding)], tz: Tz) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (label, finding) in findings {
+        match finding {
+            Finding::Corrected(correction) => {
+                lines.push(format!(
+                    "offset: {label}: {} taken back out, {}",
+                    correction.values(),
+                    correction.source(tz)
+                ));
+                if let Some(line) = check_line(label, correction, tz) {
+                    lines.push(line);
+                }
+            }
+            Finding::Suggested(entity) => lines.push(format!(
+                "note: {label}: {entity} looks like its thermostat's offset; add offset = \
+                 \"{entity}\" to the room to take it back out, or offset = false to keep the \
+                 reading as it is"
+            )),
+        }
+    }
+    lines
+}
+
+/// What the raw readings say about which way a room's offset is applied.
+fn check_line(label: &str, correction: &Correction, tz: Tz) -> Option<String> {
+    let unit = &correction.unit;
+    let change = |(at, from, to): (i64, f64, f64)| {
+        format!(
+            "went from {} to {} at {}",
+            format_offset(from, unit),
+            format_offset(to, unit),
+            local_stamp(at, tz)
+        )
+    };
+    let other = match correction.applied {
+        Applied::Added => Applied::Subtracted,
+        Applied::Subtracted => Applied::Added,
+    };
+    match &correction.check {
+        Check::Agrees { changes } => Some(format!(
+            "  checked: the reading moved with the offset at {changes} recorded change{}, as an \
+             offset that is {} should",
+            if *changes == 1 { "" } else { "s" },
+            correction.applied.name()
+        )),
+        Check::Untested if correction.entity.is_some() => Some(format!(
+            "  not checked: no change of the offset is on record with readings around it, so \
+             it is taken to be {} (offset_applied)",
+            correction.applied.name()
+        )),
+        Check::Untested => None,
+        Check::Disagrees { change: at, moved } => Some(format!(
+            "warning: {label}: when its offset {}, the reading moved by {} - the other way: \
+             this thermostat seems to have it {}; set offset_applied = \"{}\" for the room",
+            change(*at),
+            format_offset(*moved, unit),
+            other.name(),
+            other.name()
+        )),
+        Check::Unmoved { change: at } => Some(format!(
+            "warning: {label}: the reading did not move when its offset {}: it may be recorded \
+             without the offset, in which case the room wants offset = false",
+            change(*at)
+        )),
+        Check::Mixed { with, against } => Some(format!(
+            "warning: {label}: the reading moved with the offset at {with} of its changes and \
+             against it at {against}; check offset_applied"
+        )),
     }
 }
 
