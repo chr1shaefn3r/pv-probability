@@ -484,7 +484,7 @@ fn another_devices_offset_is_left_alone() {
     let (stdout, html) = bathroom(&scratch, &db);
     assert!(stdout.contains("indoors: Upstairs 19 °C"), "{stdout}");
     assert!(!stdout.contains("offset:"), "{stdout}");
-    assert!(!stdout.contains("note:"), "{stdout}");
+    assert_eq!(notes(&stdout), [WAITING_WITHOUT_ENERGY], "{stdout}");
     assert!(!html.contains("as its thermostat measured"));
 }
 
@@ -596,7 +596,7 @@ fn a_room_with_several_thermometers_is_their_mean() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "{stdout}");
     assert!(stdout.contains("indoors: Ground floor 21 °C"), "{stdout}");
-    assert!(!stdout.contains("note:"), "{stdout}");
+    assert_eq!(notes(&stdout), [WAITING_WITHOUT_ENERGY], "{stdout}");
     let html = std::fs::read_to_string(scratch.path("report.html")).unwrap();
     assert!(
         html.contains(
@@ -1122,12 +1122,40 @@ fn rooms_without_a_floor_area_say_how_to_get_the_heat_loss() {
     assert!(output.status.success(), "{stdout}");
     assert!(
         stdout.contains(
-            "note: give the rooms their floor area in the rooms file - area = ..., in m² - and \
-             the run works out the house's heat loss coefficient and its annual benchmark too"
+            "note: Building or behaviour, A degree warmer and Annual benchmark wait for data - \
+             the rooms' floor areas in the rooms file; the report says what each needs"
         ),
         "{stdout}"
     );
     assert!(!stdout.contains("heat loss:"));
     let html = std::fs::read_to_string(scratch.path("report.html")).unwrap();
-    assert!(!html.contains("A degree warmer"));
+    // Every heading is there, those without their data saying what they need.
+    for heading in [
+        "<h3>Building or behaviour</h3>",
+        "<h2>A degree warmer</h2>",
+        "<h2>Annual benchmark</h2>",
+    ] {
+        assert!(
+            html.contains(&format!("{heading}<p class=\"waiting\">")),
+            "{heading}"
+        );
+    }
+    assert!(html.contains("It needs every room's floor area in the rooms file"));
+    assert!(
+        html.contains("<h2>Heating energy</h2><p>"),
+        "drawn, not waiting"
+    );
+}
+
+/// The note a run with rooms but no heating energy ends on.
+const WAITING_WITHOUT_ENERGY: &str = "note: Heating energy, Building or behaviour, A degree \
+     warmer and Annual benchmark wait for data - --energy-entity and the rooms' floor areas in \
+     the rooms file; the report says what each needs";
+
+/// The lines of a run that are notes.
+fn notes(stdout: &str) -> Vec<&str> {
+    stdout
+        .lines()
+        .filter(|line| line.starts_with("note:"))
+        .collect()
 }

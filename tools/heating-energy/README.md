@@ -39,11 +39,12 @@ heating-energy --db ha.db --outside-entity sensor.outdoor_temperature \
 ```
 
 ```
-wrote heating-energy.html: 24 months from 730 days, 30 kB, 24.35ms
+wrote heating-energy.html: 24 months from 730 days, 32 kB, 22.04ms
 degree days: 4,716 heating and 7.4 cooling over 730 days (bases 15 °C and 21 °C)
 coldest: January 2024 with 449 heating degree days at 0.5 °C on average
 indoors: Ground floor 21.2 °C, First floor 21 °C on the same days
 note: 1 day was recorded too thinly to count (under 90% of the day)
+note: Heating energy, Building or behaviour, A degree warmer and Annual benchmark wait for data - --energy-entity; the report says what each needs
 covers 2023-01-01 to 2024-12-31 (731 days): 731 days observed (730 of them full days), no outage over 24 h
 
 open /home/you/heating-energy.html
@@ -54,6 +55,18 @@ per month or week, with a table of every period beside it: the days counted, the
 outside temperature, both sums, and each floor's mean indoor temperature. Each floor
 opens to its rooms, a table per year follows, and the History block at the foot says
 what the thermometer really covered.
+
+Every section of the report is always there. One the run was not given enough for keeps
+its heading and says what it would show, what it needs and where this README tells of it,
+and the run names them all in one note:
+
+| Section | Needs |
+|---|---|
+| Degree days, Per year, How it is counted | `--outside-entity` |
+| [Heating energy](#heating-energy-and-efficiency) | `--energy-entity` |
+| [Building or behaviour](#building-or-behaviour-the-heat-loss-coefficient), [A degree warmer](#a-degree-warmer) | `--energy-entity`, and `--rooms` with every room's `area` |
+| [Annual benchmark](#annual-benchmark) | `--energy-entity`, and `--rooms` with every room's `area` or the house's `heated_area` |
+| [Indoor temperatures](#the-rooms-file) | `--rooms` |
 
 `--list-entities` prints the database's thermometers in their own section, after the
 power sensors.

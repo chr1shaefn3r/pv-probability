@@ -30,7 +30,7 @@ use heating_energy::heatloss::{
 };
 use heating_energy::offset::{self, Check, Correction, Finding, format_offset, local_stamp};
 use heating_energy::report::{
-    EnergySection, ReportOptions, format_celsius, format_degree_days, page,
+    self as report, EnergySection, ReportOptions, format_celsius, format_degree_days, page,
 };
 use heating_energy::rooms::{Floor, House, Room};
 
@@ -278,18 +278,16 @@ fn run() -> Result<()> {
         );
     }
 
-    let html = page(
-        &analysis,
-        &ReportOptions {
-            outside_entity: args.outside_entity().to_string(),
-            house: house.clone(),
-            metadata: metadata(&args, &outside, tz),
-            coverage: coverage.clone(),
-            tz,
-            room_notes,
-            energy: energy.clone(),
-        },
-    );
+    let options = ReportOptions {
+        outside_entity: args.outside_entity().to_string(),
+        house: house.clone(),
+        metadata: metadata(&args, &outside, tz),
+        coverage: coverage.clone(),
+        tz,
+        room_notes,
+        energy: energy.clone(),
+    };
+    let html = page(&analysis, &options);
     fs::write(&args.out, &html)
         .with_context(|| format!("failed to write {}", args.out.display()))?;
 
@@ -298,22 +296,10 @@ fn run() -> Result<()> {
         for line in energy_lines(section) {
             println!("{line}");
         }
-        match &section.heat_loss {
-            Some(heat_loss) => {
-                for line in heat_loss_lines(heat_loss) {
-                    println!("{line}");
-                }
+        if let Some(heat_loss) = &section.heat_loss {
+            for line in heat_loss_lines(heat_loss) {
+                println!("{line}");
             }
-            None if house.is_some() => println!(
-                "note: give the rooms their floor area in the rooms file - area = ..., in m² - \
-                 and the run works out the house's heat loss coefficient{} too",
-                if section.benchmark.is_none() {
-                    " and its annual benchmark"
-                } else {
-                    ""
-                }
-            ),
-            None => {}
         }
         if let Some(benchmark) = &section.benchmark {
             for line in benchmark_lines(benchmark) {
@@ -330,6 +316,20 @@ fn run() -> Result<()> {
              covered enough of the day; {} the mean of those that did",
             if *days == 1 { "" } else { "s" },
             if *days == 1 { "it is" } else { "they are" }
+        );
+    }
+    // The sections the report could not draw, and what they wait for.
+    let waiting = report::waiting(&options);
+    if !waiting.is_empty() {
+        let titles: Vec<String> = waiting
+            .iter()
+            .map(|waiting| waiting.section.title().to_string())
+            .collect();
+        println!(
+            "note: {} wait{} for data - {}; the report says what each needs",
+            joined(&titles),
+            if titles.len() == 1 { "s" } else { "" },
+            report::needs_in_short(&waiting)
         );
     }
     if let Some(coverage) = &coverage {

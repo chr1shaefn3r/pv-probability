@@ -18,8 +18,10 @@ use crate::rooms::House;
 
 mod benchmark;
 mod energy;
+mod waiting;
 
 pub use energy::EnergySection;
+pub use waiting::{README, Section, Waiting, needs_in_short, waiting};
 
 /// Everything the page needs beyond the analysis itself.
 #[derive(Debug, Clone, PartialEq)]
@@ -59,13 +61,38 @@ pub fn page(analysis: &Analysis, options: &ReportOptions) -> String {
 
     body.push_str(&metadata_list(&metadata_entries(analysis, options)));
     body.push_str(&degree_day_section(analysis, options));
-    if let Some(section) = &options.energy {
-        body.push_str(&energy::section(section));
-        body.push_str(&energy::warmer_section(section));
-        body.push_str(&benchmark::section(section));
+    // A section not given what it needs keeps its heading, and says what that is.
+    let waiting = waiting(options);
+    let hint = |section: Section, inner: &str| {
+        waiting
+            .iter()
+            .find(|waiting| waiting.section == section)
+            .map_or_else(String::new, |waiting| waiting::placeholder(waiting, inner))
+    };
+    let behaviour = hint(Section::BuildingOrBehaviour, "");
+    match &options.energy {
+        Some(section) => {
+            body.push_str(&energy::section(section, &behaviour));
+            body.push_str(&if section.heat_loss.is_some() {
+                energy::warmer_section(section)
+            } else {
+                hint(Section::DegreeWarmer, "")
+            });
+            body.push_str(&if section.benchmark.is_some() {
+                benchmark::section(section)
+            } else {
+                hint(Section::Benchmark, "")
+            });
+        }
+        None => {
+            body.push_str(&hint(Section::HeatingEnergy, &behaviour));
+            body.push_str(&hint(Section::DegreeWarmer, ""));
+            body.push_str(&hint(Section::Benchmark, ""));
+        }
     }
-    if let Some(house) = &options.house {
-        body.push_str(&rooms_section(analysis, house, &options.room_notes));
+    match &options.house {
+        Some(house) => body.push_str(&rooms_section(analysis, house, &options.room_notes)),
+        None => body.push_str(&hint(Section::IndoorTemperatures, "")),
     }
     body.push_str(&years_section(analysis, options));
     body.push_str(&method_section(analysis));
@@ -664,6 +691,7 @@ fn stylesheet(with_energy: bool) -> String {
     );
     css.push_str(CHROME_CSS);
     css.push_str(DEGREE_CSS);
+    css.push_str(waiting::CSS);
     if with_energy {
         css.push_str(energy::CSS);
         css.push_str(benchmark::CSS);
@@ -800,7 +828,10 @@ mod tests {
         assert!(html.contains("<title>Heating and cooling degree days</title>"));
         assert!(html.contains("sensor.outdoor_temperature"));
         assert!(!html.contains("<script"));
-        assert!(!html.contains("http://") && !html.contains("https://"));
+        // Nothing is loaded from elsewhere: the one address is a link to the README.
+        let without_readme = html.replace(&format!("href=\"{README}#"), "");
+        assert!(!without_readme.contains("http://") && !without_readme.contains("https://"));
+        assert!(!html.contains("src=\"http") && !html.contains("url(http"));
     }
 
     #[test]
@@ -870,9 +901,17 @@ mod tests {
         assert_eq!(html.matches("<details class=\"floor\">").count(), 2);
         assert!(html.contains("Living &amp; dining"));
         assert!(html.contains("<summary>Attic: 18 °C on average, over 1 room</summary>"));
-        // Without a house there is no rooms section at all.
+        // Without a house the rooms section says what it needs instead.
         let bare = page(&analysis(), &ReportOptions::default());
-        assert!(!bare.contains("Indoor temperatures"));
+        assert!(bare.contains("<h2>Indoor temperatures</h2><p class=\"waiting\">"));
+        assert!(!bare.contains("<details class=\"floor\">"));
+        for title in ["Heating energy", "A degree warmer", "Annual benchmark"] {
+            assert!(
+                bare.contains(&format!("<h2>{title}</h2><p class=\"waiting\">")),
+                "{title}"
+            );
+        }
+        assert!(bare.contains("<h3>Building or behaviour</h3><p class=\"waiting\">"));
     }
 
     #[test]

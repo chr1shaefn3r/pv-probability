@@ -52,7 +52,9 @@ const MAX_BAR: f64 = 48.0;
 /// Room the line's label takes beside it, at 10px.
 const LINE_LABEL_WIDTH: f64 = 130.0;
 
-pub fn section(section: &EnergySection) -> String {
+/// The section; `behaviour` stands in for the Building or behaviour part when there is
+/// no heat loss coefficient to give, saying what it needs.
+pub fn section(section: &EnergySection, behaviour: &str) -> String {
     let energy = &section.energy;
     let mut html = String::from("<section class=\"panel energy\"><h2>Heating energy</h2>");
     let _ = write!(
@@ -71,7 +73,7 @@ pub fn section(section: &EnergySection) -> String {
         let _ = write!(
             html,
             "<p class=\"empty\">There is no line to draw yet: {} - a line needs {} months, \
-             spread over milder and colder ones.{}</p></section>",
+             spread over milder and colder ones.{}</p>{behaviour}</section>",
             escape(&months_on_record(energy)),
             MIN_FIT_MONTHS,
             if section.from_raw_states {
@@ -133,8 +135,9 @@ pub fn section(section: &EnergySection) -> String {
         html.push_str(&season_bars(&fitted));
     }
     html.push_str(&season_table(energy, &overall));
-    if let Some(heat_loss) = &section.heat_loss {
-        html.push_str(&building_or_behaviour(heat_loss));
+    match &section.heat_loss {
+        Some(heat_loss) => html.push_str(&building_or_behaviour(heat_loss)),
+        None => html.push_str(behaviour),
     }
     html.push_str(&month_table(energy, section.heat_loss.as_ref()));
 
@@ -1028,13 +1031,16 @@ mod tests {
     }
 
     fn section_of(energy: Energy) -> String {
-        section(&EnergySection {
-            entity: "number.heizol_energy".to_string(),
-            energy,
-            from_raw_states: true,
-            heat_loss: None,
-            benchmark: None,
-        })
+        section(
+            &EnergySection {
+                entity: "number.heizol_energy".to_string(),
+                energy,
+                from_raw_states: true,
+                heat_loss: None,
+                benchmark: None,
+            },
+            "<h3>Building or behaviour</h3><p class=\"waiting\">It needs rooms.</p>",
+        )
     }
 
     #[test]
