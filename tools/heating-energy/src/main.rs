@@ -1,6 +1,7 @@
 //! Heating and cooling degree days from a Home Assistant outdoor thermometer, beside the
 //! indoor temperature of every room.
 
+use std::fmt::Write as _;
 use std::fs;
 use std::time::Instant;
 
@@ -16,6 +17,7 @@ use ha_recorder::source::{self, LoadedSamples, SourceKind, states, statistics};
 use ha_recorder::{Quantity, Sample};
 use ha_report::{format_duration, open_command};
 
+use heating_energy::benchmark::{self, Benchmark, Year, format_per_square_metre};
 use heating_energy::cli::{Args, Config};
 use heating_energy::daily::{DayMean, daily_means, room_days};
 use heating_energy::degree::{Analysis, analyse};
@@ -245,11 +247,23 @@ fn run() -> Result<()> {
                     },
                 )
             });
+            // A year's heating energy over the floor, if the rooms file gives a floor area.
+            let benchmark = house.as_ref().and_then(|house| {
+                house.heated_area().map(|heated_area| {
+                    benchmark::analyse(
+                        &energy,
+                        heated_area,
+                        house.heated_area.is_none(),
+                        house.total_area,
+                    )
+                })
+            });
             Some(EnergySection {
                 entity: entity.clone(),
                 energy,
                 from_raw_states: read.from_raw_states,
                 heat_loss,
+                benchmark,
             })
         }
         _ => None,
@@ -292,9 +306,19 @@ fn run() -> Result<()> {
             }
             None if house.is_some() => println!(
                 "note: give the rooms their floor area in the rooms file - area = ..., in m² - \
-                 and the run works out the house's heat loss coefficient too"
+                 and the run works out the house's heat loss coefficient{} too",
+                if section.benchmark.is_none() {
+                    " and its annual benchmark"
+                } else {
+                    ""
+                }
             ),
             None => {}
+        }
+        if let Some(benchmark) = &section.benchmark {
+            for line in benchmark_lines(benchmark) {
+                println!("{line}");
+            }
         }
     }
     for line in finding_lines(&findings, tz) {
@@ -745,6 +769,53 @@ fn heat_loss_lines(heat_loss: &HeatLoss) -> Vec<String> {
                 "them"
             }
         ));
+    }
+    lines
+}
+
+/// The annual benchmark, as lines for the terminal.
+fn benchmark_lines(benchmark: &Benchmark) -> Vec<String> {
+    let figures = |year: &Year| {
+        let heated = year.per_square_metre(benchmark.heated_area);
+        let mut text = format!(
+            "{} over the {} m² heated, class {}",
+            format_per_square_metre(heated),
+            format_area(benchmark.heated_area),
+            benchmark::class(heated)
+        );
+        if let Some(area) = benchmark.total_area {
+            let total = year.per_square_metre(area);
+            let _ = write!(
+                text,
+                ", and {} over all {} m², class {}",
+                format_per_square_metre(total),
+                format_area(area),
+                benchmark::class(total)
+            );
+        }
+        text
+    };
+    let Some(latest) = &benchmark.latest else {
+        return vec![
+            "benchmark: no whole year yet - it needs twelve months in a row whose energy is \
+             sound"
+                .to_string(),
+        ];
+    };
+    let mut lines = vec![format!(
+        "benchmark: {} - the latest twelve whole months, {}",
+        figures(latest),
+        latest.label()
+    )];
+    let others: Vec<&Year> = benchmark
+        .seasons
+        .iter()
+        .filter(|season| *season != latest)
+        .collect();
+    if !others.is_empty() {
+        for season in &benchmark.seasons {
+            lines.push(format!("  {}: {}", season.label(), figures(season)));
+        }
     }
     lines
 }

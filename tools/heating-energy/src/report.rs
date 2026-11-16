@@ -16,6 +16,7 @@ use ha_report::{escape, format_percent};
 use crate::degree::{Analysis, Summary};
 use crate::rooms::House;
 
+mod benchmark;
 mod energy;
 
 pub use energy::EnergySection;
@@ -61,6 +62,7 @@ pub fn page(analysis: &Analysis, options: &ReportOptions) -> String {
     if let Some(section) = &options.energy {
         body.push_str(&energy::section(section));
         body.push_str(&energy::warmer_section(section));
+        body.push_str(&benchmark::section(section));
     }
     if let Some(house) = &options.house {
         body.push_str(&rooms_section(analysis, house, &options.room_notes));
@@ -664,6 +666,7 @@ fn stylesheet(with_energy: bool) -> String {
     css.push_str(DEGREE_CSS);
     if with_energy {
         css.push_str(energy::CSS);
+        css.push_str(benchmark::CSS);
     }
     css
 }

@@ -103,13 +103,25 @@ rooms = [
 ]
 ```
 
+The [annual benchmark](#annual-benchmark) sets a year's heating energy against the floor
+area it heats - the rooms' areas added up - and against all the floor, heated or not. A
+`[house]` table gives the latter, and the former too where some heated rooms have no
+thermometer and so are not listed:
+
+```toml
+[house]
+heated_area = 140   # optional: the rooms' areas added up otherwise
+total_area = 190    # all the floor, heated or not
+```
+
 [`rooms.example.toml`](rooms.example.toml) is a complete one, matching the demo database.
 Floors and rooms appear in the report in the file's order. Room names only have to be
 unique on their floor - a bathroom upstairs and one downstairs are fine - but a
 thermometer belongs to one room. Mistakes are named rather than guessed around: an
 unknown key, a floor without rooms, a room with both `sensor` and `sensors` or neither, a
 sensor listed twice, an area of nothing or less, and a sensor that is not a thermometer
-all stop the run with the room's name in the message.
+all stop the run with the room's name in the message - as does a house whose
+`total_area` is less than the floor it heats.
 
 ### Thermostats with an offset
 
@@ -271,6 +283,31 @@ a degree warmer: 713 kWh more heating energy in a season like 2023/24, with its 
   season's own.
 * **It is if anything a little more**: a warmer house would also want heating on a few
   more days at either end of the season, which the heating months leave out.
+
+### Annual benchmark
+
+Twelve whole months of heating energy - water heating taken off - over the floor area,
+in kWh per m² and year, on the scale an Energieausweis uses:
+
+```
+benchmark: 68 kWh/(m²·a) over the 84 m² heated, class B, and 48 kWh/(m²·a) over all 120 m², class A - the latest twelve whole months, December 2023 to November 2024
+  2023/24: 73 kWh/(m²·a) over the 84 m² heated, class B, and 51 kWh/(m²·a) over all 120 m², class B
+```
+
+![The Energieausweis scale from A+ to H, the house marked on it over the floor heated and over all the floor](docs/benchmark-light.png)
+
+* **A year** is twelve whole months in a row whose energy is sound - none left out for a
+  missed reading or a total that went down. The headline and the scale take the latest
+  such twelve months; the table gives every whole heating season, July to June, beside
+  them.
+* **Two floor areas**: the floor the heating heats - the rooms' areas added up, or the
+  house's `heated_area` - marked above the scale, and all the floor, heated or not, the
+  house's `total_area`, marked below it. Without `total_area` there is only the first.
+* **The classes** are the Energieausweis's for homes: A+ under 30 kWh/(m²·a), A under 50,
+  B under 75, C under 100, D under 130, E under 160, F under 200, G under 250, H from 250.
+  An Energieausweis counts water heating in, and evens the year out for its weather; the
+  report gives the figure with water heating too, but leaves the year's own weather
+  standing, so a cold year reads higher.
 
 ### Keeping the readings
 

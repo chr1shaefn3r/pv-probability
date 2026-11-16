@@ -13,6 +13,7 @@
 //! Where a room's thermometer is a thermostat with an offset setting beside it,
 //! [`offset`] takes that offset back out of its readings.
 
+pub mod benchmark;
 pub mod cli;
 pub mod daily;
 pub mod degree;

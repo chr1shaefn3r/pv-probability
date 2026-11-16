@@ -13,7 +13,14 @@
 #
 # A room's area is its floor area in square metres. With --energy-entity, the rooms'
 # temperatures weighted by it make the house's temperature, which the heat loss coefficient
-# is worked out from; a room without one is left out of it, and nothing else needs it.
+# is worked out from; a room without one is left out of it.
+#
+# The annual benchmark sets a year's heating energy against the floor area it heats - the
+# rooms' areas added up, unless [house] gives heated_area, for rooms not listed here - and
+# against all the floor, heated or not, if [house] gives total_area.
+
+[house]
+total_area = 120
 
 [[floor]]
 name = "Ground floor"

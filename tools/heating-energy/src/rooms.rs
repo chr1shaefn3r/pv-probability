@@ -34,6 +34,16 @@
 //! ]
 //! ```
 //!
+//! The annual benchmark divides a year's heating energy by the floor area it heats - the
+//! rooms' areas added up, unless the house says otherwise - and by all the floor, heated
+//! or not, if the house gives it:
+//!
+//! ```toml
+//! [house]
+//! heated_area = 140
+//! total_area = 190
+//! ```
+//!
 //! Floors and rooms keep the order the file gives them, which is the order the report
 //! shows them in.
 
@@ -47,6 +57,11 @@ use serde::Deserialize;
 #[derive(Debug, Clone, PartialEq)]
 pub struct House {
     pub floors: Vec<Floor>,
+    /// The floor area the heating heats, in m², if the file gives it rather than leaving it
+    /// to the rooms' areas.
+    pub heated_area: Option<f64>,
+    /// All the floor area, heated or not, in m², if the file gives it.
+    pub total_area: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -69,8 +84,16 @@ pub struct Room {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct File {
+    house: Option<HouseEntry>,
     #[serde(default)]
     floor: Vec<FloorEntry>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HouseEntry {
+    heated_area: Option<f64>,
+    total_area: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -189,7 +212,36 @@ impl House {
                 rooms,
             });
         }
-        Ok(House { floors })
+        let house = file.house.unwrap_or_default();
+        for (key, area) in [
+            ("heated_area", house.heated_area),
+            ("total_area", house.total_area),
+        ] {
+            if let Some(area) = area {
+                ensure!(
+                    area.is_finite() && area > 0.0,
+                    "the house has a {key} of {area}; give it in square metres, above zero"
+                );
+            }
+        }
+        let house = House {
+            floors,
+            heated_area: house.heated_area,
+            total_area: house.total_area,
+        };
+        if let (Some(total), Some(heated)) = (house.total_area, house.heated_area()) {
+            ensure!(
+                total >= heated,
+                "the house's total_area of {total} m² is less than the {heated} m² it heats{}; \
+                 total_area is all the floor, heated or not",
+                if house.heated_area.is_none() {
+                    ", the rooms' areas added up"
+                } else {
+                    ""
+                }
+            );
+        }
+        Ok(house)
     }
 
     /// Every room with its floor, in the file's order.
@@ -206,6 +258,15 @@ impl House {
     /// The floor area of the rooms that give one, in m².
     pub fn area(&self) -> f64 {
         self.rooms().filter_map(|(_, room)| room.area).sum()
+    }
+
+    /// The floor area the heating heats, in m²: the house's own heated_area, or else the
+    /// rooms' areas added up, if any give one.
+    pub fn heated_area(&self) -> Option<f64> {
+        self.heated_area.or_else(|| {
+            let rooms = self.area();
+            (rooms > 0.0).then_some(rooms)
+        })
     }
 
     /// Every thermometer of every room, with its room, in the file's order.
@@ -302,6 +363,42 @@ mod tests {
                 format!("{error:#}").contains("give its floor area in square metres"),
                 "{error:#}"
             );
+        }
+    }
+
+    #[test]
+    fn the_house_may_give_its_heated_and_its_total_floor_area() {
+        let rooms = r#"
+            [[floor]]
+            name = "Ground floor"
+            rooms = [{ name = "Living room", sensor = "sensor.a", area = 30 }]
+        "#;
+        let house = House::parse(rooms).unwrap();
+        assert_eq!((house.heated_area(), house.total_area), (Some(30.0), None));
+        let house = House::parse(&format!("[house]\ntotal_area = 120\n{rooms}")).unwrap();
+        assert_eq!(
+            (house.heated_area(), house.total_area),
+            (Some(30.0), Some(120.0))
+        );
+        let house = House::parse(&format!(
+            "[house]\nheated_area = 95\ntotal_area = 120\n{rooms}"
+        ))
+        .unwrap();
+        assert_eq!(
+            house.heated_area(),
+            Some(95.0),
+            "the house's own over the rooms'"
+        );
+        for (house, message) in [
+            (
+                "total_area = 20",
+                "less than the 30 m² it heats, the rooms' areas added up",
+            ),
+            ("heated_area = 0", "give it in square metres, above zero"),
+            ("floor_area = 90", "unknown field"),
+        ] {
+            let error = House::parse(&format!("[house]\n{house}\n{rooms}")).unwrap_err();
+            assert!(format!("{error:#}").contains(message), "{error:#}");
         }
     }
 

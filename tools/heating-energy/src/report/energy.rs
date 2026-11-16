@@ -8,6 +8,7 @@ use ha_report::axis::nice_ticks;
 use ha_report::escape;
 
 use super::{column, format_celsius, format_degree_days};
+use crate::benchmark::Benchmark;
 use crate::energy::{
     Energy, Fit, LeftOut, MIN_FIT_MONTHS, Month, MonthPoint, Season, format_energy, format_monthly,
     format_slope, format_whole, month_list, season_label,
@@ -28,6 +29,8 @@ pub struct EnergySection {
     pub from_raw_states: bool,
     /// The heat loss coefficient, when the rooms give their floor area.
     pub heat_loss: Option<HeatLoss>,
+    /// The annual benchmark, when the rooms file gives a floor area.
+    pub benchmark: Option<Benchmark>,
 }
 
 // Geometry, in user units, matching the degree day chart above it.
@@ -1030,6 +1033,7 @@ mod tests {
             energy,
             from_raw_states: true,
             heat_loss: None,
+            benchmark: None,
         })
     }
 

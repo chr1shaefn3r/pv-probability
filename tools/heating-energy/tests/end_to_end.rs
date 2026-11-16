@@ -988,8 +988,8 @@ fn rooms_with_a_floor_area_give_the_houses_heat_loss_coefficient() {
     std::fs::write(
         &rooms,
         format!(
-            "[[floor]]\nname = \"Ground floor\"\nrooms = [{}, {{ name = \"Hall\", sensor = \
-             \"{OUTSIDE_ENTITY}\" }}]\n",
+            "[house]\ntotal_area = 80\n\n[[floor]]\nname = \"Ground floor\"\nrooms = [{}, {{ name = \
+             \"Hall\", sensor = \"{OUTSIDE_ENTITY}\" }}]\n",
             entries.join(", ")
         ),
     )
@@ -1067,6 +1067,19 @@ fn rooms_with_a_floor_area_give_the_houses_heat_loss_coefficient() {
         "{stdout}"
     );
     assert!(html.contains("<h2>A degree warmer</h2>"));
+
+    // 2024's heating, 12,611 kWh, over the 40 m² of the rooms and the 80 m² of the house.
+    assert!(
+        stdout.contains(
+            "benchmark: 315 kWh/(m²·a) over the 40 m² heated, class H, and 158 kWh/(m²·a) over \
+             all 80 m², class E - the latest twelve whole months, January 2024 to December 2024"
+        ),
+        "{stdout}"
+    );
+    assert!(html.contains("<h2>Annual benchmark</h2>"));
+    assert!(html.contains(
+        "<th scope=\"row\">January 2024 to December 2024 (the latest)</th><td>12,611 kWh</td>"
+    ));
     assert!(html.contains(
         "<strong>547 kWh</strong> more heating energy for every degree warmer in a season like \
          2023/24, with its 5 heating months: <strong>7.1%</strong> of its heating energy - \
@@ -1108,7 +1121,10 @@ fn rooms_without_a_floor_area_say_how_to_get_the_heat_loss() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "{stdout}");
     assert!(
-        stdout.contains("note: give the rooms their floor area in the rooms file"),
+        stdout.contains(
+            "note: give the rooms their floor area in the rooms file - area = ..., in m² - and \
+             the run works out the house's heat loss coefficient and its annual benchmark too"
+        ),
         "{stdout}"
     );
     assert!(!stdout.contains("heat loss:"));
