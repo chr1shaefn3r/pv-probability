@@ -1,5 +1,5 @@
-//! Heating and cooling degree days from a Home Assistant outdoor thermometer, beside the
-//! indoor temperature of every room.
+//! Heating energy from a Home Assistant recorder database: degree days, every room's
+//! temperature, what a degree day costs the house, its heat loss and an annual benchmark.
 
 use std::fmt::Write as _;
 use std::fs;

@@ -56,7 +56,7 @@ impl Default for ReportOptions {
 
 /// Render the complete HTML document.
 pub fn page(analysis: &Analysis, options: &ReportOptions) -> String {
-    let title = "Heating and cooling degree days".to_string();
+    let title = "Heating energy".to_string();
     let mut body = String::with_capacity(32 * 1024);
 
     body.push_str(&metadata_list(&metadata_entries(analysis, options)));
@@ -825,7 +825,7 @@ mod tests {
     fn renders_a_complete_self_contained_document() {
         let html = page(&analysis(), &options());
         assert!(html.starts_with("<!doctype html>"));
-        assert!(html.contains("<title>Heating and cooling degree days</title>"));
+        assert!(html.contains("<title>Heating energy</title>"));
         assert!(html.contains("sensor.outdoor_temperature"));
         assert!(!html.contains("<script"));
         // Nothing is loaded from elsewhere: the one address is a link to the README.

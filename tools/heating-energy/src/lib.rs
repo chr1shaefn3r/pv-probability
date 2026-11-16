@@ -1,5 +1,6 @@
-//! Heating and cooling degree days from a Home Assistant recorder database, beside the
-//! indoor temperature of every room.
+//! Heating energy from a Home Assistant recorder database: heating and cooling degree
+//! days, the indoor temperature of every room, and - given the heating's energy - what a
+//! degree day costs the house, its heat loss and an annual benchmark.
 //!
 //! 1. [`ha_recorder::source`] loads the outdoor thermometer and every room's, in °C.
 //! 2. [`daily`] turns each into one time-weighted mean per local day, and says how much
