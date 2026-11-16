@@ -795,7 +795,7 @@ fn a_monthly_meter_gives_the_houses_kwh_per_degree_day() {
         stderr.contains("read 13 readings of number.heizol_energy from its raw states"),
         "{stderr}"
     );
-    assert!(html.contains("<h2>Heating energy</h2>"));
+    assert!(html.contains("<h2>What a degree day costs</h2>"));
     assert!(html.contains("<strong>2.00 kWh</strong> per heating degree day"));
     assert_eq!(html.matches("class=\"dot\"").count(), 12);
     assert!(html.contains("once water heating of <strong>307 kWh a month</strong> is taken off"));
@@ -1142,13 +1142,13 @@ fn rooms_without_a_floor_area_say_how_to_get_the_heat_loss() {
     }
     assert!(html.contains("It needs every room's floor area in the rooms file"));
     assert!(
-        html.contains("<h2>Heating energy</h2><p>"),
+        html.contains("<h2>What a degree day costs</h2><p>"),
         "drawn, not waiting"
     );
 }
 
 /// The note a run with rooms but no heating energy ends on.
-const WAITING_WITHOUT_ENERGY: &str = "note: Heating energy, Building or behaviour, A degree \
+const WAITING_WITHOUT_ENERGY: &str = "note: What a degree day costs, Building or behaviour, A degree \
      warmer and Annual benchmark wait for data - --energy-entity and the rooms' floor areas in \
      the rooms file; the report says what each needs";
 

@@ -16,8 +16,8 @@ pub const README: &str = concat!(
 /// A section the report draws only when it is given what it needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
-    HeatingEnergy,
-    /// A part of the Heating energy section.
+    DegreeDayCost,
+    /// A part of the What a degree day costs section.
     BuildingOrBehaviour,
     DegreeWarmer,
     Benchmark,
@@ -27,7 +27,7 @@ pub enum Section {
 impl Section {
     pub fn title(self) -> &'static str {
         match self {
-            Section::HeatingEnergy => "Heating energy",
+            Section::DegreeDayCost => "What a degree day costs",
             Section::BuildingOrBehaviour => "Building or behaviour",
             Section::DegreeWarmer => "A degree warmer",
             Section::Benchmark => "Annual benchmark",
@@ -38,7 +38,7 @@ impl Section {
     /// What it would show, in a sentence.
     fn shows(self) -> &'static str {
         match self {
-            Section::HeatingEnergy => {
+            Section::DegreeDayCost => {
                 "What one more heating degree day costs the house, season by season: every \
                  month's heating energy, water heating taken off, against its degree days."
             }
@@ -64,7 +64,7 @@ impl Section {
     /// Where the README tells of it.
     fn anchor(self) -> &'static str {
         match self {
-            Section::HeatingEnergy => "heating-energy-and-efficiency",
+            Section::DegreeDayCost => "heating-energy-and-efficiency",
             Section::BuildingOrBehaviour => "building-or-behaviour-the-heat-loss-coefficient",
             Section::DegreeWarmer => "a-degree-warmer",
             Section::Benchmark => "annual-benchmark",
@@ -114,7 +114,7 @@ pub fn waiting(options: &ReportOptions) -> Vec<Waiting> {
     ]);
     [
         (
-            Section::HeatingEnergy,
+            Section::DegreeDayCost,
             needs(&[(energy, Need::EnergyEntity)]),
         ),
         (Section::BuildingOrBehaviour, heat_loss.clone()),
@@ -254,7 +254,7 @@ mod tests {
         assert_eq!(
             sections(&waiting),
             [
-                ("Heating energy", vec![Need::EnergyEntity]),
+                ("What a degree day costs", vec![Need::EnergyEntity]),
                 (
                     "Building or behaviour",
                     vec![Need::EnergyEntity, Need::Rooms, Need::RoomAreas]

@@ -85,7 +85,7 @@ pub fn page(analysis: &Analysis, options: &ReportOptions) -> String {
             });
         }
         None => {
-            body.push_str(&hint(Section::HeatingEnergy, &behaviour));
+            body.push_str(&hint(Section::DegreeDayCost, &behaviour));
             body.push_str(&hint(Section::DegreeWarmer, ""));
             body.push_str(&hint(Section::Benchmark, ""));
         }
@@ -905,7 +905,11 @@ mod tests {
         let bare = page(&analysis(), &ReportOptions::default());
         assert!(bare.contains("<h2>Indoor temperatures</h2><p class=\"waiting\">"));
         assert!(!bare.contains("<details class=\"floor\">"));
-        for title in ["Heating energy", "A degree warmer", "Annual benchmark"] {
+        for title in [
+            "What a degree day costs",
+            "A degree warmer",
+            "Annual benchmark",
+        ] {
             assert!(
                 bare.contains(&format!("<h2>{title}</h2><p class=\"waiting\">")),
                 "{title}"

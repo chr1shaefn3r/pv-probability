@@ -1,4 +1,4 @@
-//! The Heating energy section: every month's heating energy - what the running total grew
+//! The What a degree day costs section: every month's heating energy - what the running total grew
 //! by over it, less the water heating its season's warmest months tell - against its
 //! heating degree days, the line through them, and its slope season by season.
 
@@ -56,7 +56,7 @@ const LINE_LABEL_WIDTH: f64 = 130.0;
 /// no heat loss coefficient to give, saying what it needs.
 pub fn section(section: &EnergySection, behaviour: &str) -> String {
     let energy = &section.energy;
-    let mut html = String::from("<section class=\"panel energy\"><h2>Heating energy</h2>");
+    let mut html = String::from("<section class=\"panel energy\"><h2>What a degree day costs</h2>");
     let _ = write!(
         html,
         "<p>Each month's heating energy - what the running total {} grew by from the month's \
@@ -1053,7 +1053,7 @@ mod tests {
             months.push(point(year, month, hdd, 2.4 * hdd + 400.0));
         }
         let html = section_of(energy(months, None));
-        assert!(html.contains("<h2>Heating energy</h2>"));
+        assert!(html.contains("<h2>What a degree day costs</h2>"));
         assert!(html.contains("number.heizol_energy"));
         assert!(html.contains(" kWh a month</strong> without heating"));
         assert_eq!(html.matches("class=\"dot\"").count(), 6, "one dot a month");

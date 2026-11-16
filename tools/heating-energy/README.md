@@ -44,7 +44,7 @@ degree days: 4,716 heating and 7.4 cooling over 730 days (bases 15 °C and 21 °
 coldest: January 2024 with 449 heating degree days at 0.5 °C on average
 indoors: Ground floor 21.2 °C, First floor 21 °C on the same days
 note: 1 day was recorded too thinly to count (under 90% of the day)
-note: Heating energy, Building or behaviour, A degree warmer and Annual benchmark wait for data - --energy-entity; the report says what each needs
+note: What a degree day costs, Building or behaviour, A degree warmer and Annual benchmark wait for data - --energy-entity; the report says what each needs
 covers 2023-01-01 to 2024-12-31 (731 days): 731 days observed (730 of them full days), no outage over 24 h
 
 open /home/you/heating-energy.html
@@ -63,7 +63,7 @@ and the run names them all in one note:
 | Section | Needs |
 |---|---|
 | Degree days, Per year, How it is counted | `--outside-entity` |
-| [Heating energy](#heating-energy-and-efficiency) | `--energy-entity` |
+| [What a degree day costs](#heating-energy-and-efficiency) | `--energy-entity` |
 | [Building or behaviour](#building-or-behaviour-the-heat-loss-coefficient), [A degree warmer](#a-degree-warmer) | `--energy-entity`, and `--rooms` with every room's `area` |
 | [Annual benchmark](#annual-benchmark) | `--energy-entity`, and `--rooms` with every room's `area` or the house's `heated_area` |
 | [Indoor temperatures](#the-rooms-file) | `--rooms` |
@@ -269,7 +269,7 @@ heat loss: 108 W/K over 16 heating months, the house kept at 20.5 °C - its 5 ro
   loss coefficient's, it was mostly the building; a third or less, mostly how warm the
   house was kept. A change in kWh per degree day under 3% is none.
 
-The report shows the same under Heating energy, with the house's temperature and
+The report shows the same under What a degree day costs, with the house's temperature and
 degree-hours of every month in the month table, and whether it is one of the heating
 months the line runs through.
 
